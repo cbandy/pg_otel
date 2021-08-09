@@ -1,0 +1,22 @@
+dist:
+  module: github.com/cbandy/pg_otel/logs/exporter
+  include_core: false
+
+replaces:
+  - github.com/cbandy/pg_otel => ../../
+
+receivers:
+  - import: github.com/cbandy/pg_otel/logs/exporter/stdin
+    gomod:  github.com/cbandy/pg_otel v0.0.0
+
+processors:
+  - import: go.opentelemetry.io/collector/processor/batchprocessor
+    gomod:  go.opentelemetry.io/collector v0.31.0
+
+exporters:
+  - import: go.opentelemetry.io/collector/exporter/fileexporter
+    gomod:  go.opentelemetry.io/collector v0.31.0
+  - import: go.opentelemetry.io/collector/exporter/otlpexporter
+    gomod:  go.opentelemetry.io/collector v0.31.0
+  - import: go.opentelemetry.io/collector/exporter/otlphttpexporter
+    gomod:  go.opentelemetry.io/collector v0.31.0

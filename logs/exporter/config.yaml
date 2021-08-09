@@ -1,0 +1,15 @@
+receivers:
+  pg_otel_logs:
+
+processors:
+  batch:
+
+exporters:
+  file: { path: /tmp/pg-otel.ndjson }
+
+service:
+  pipelines:
+    logs:
+      receivers: [pg_otel_logs]
+      processors: [batch]
+      exporters: [file]
