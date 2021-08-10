@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
-	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -21,10 +19,7 @@ type receiver struct {
 	source io.ReadCloser
 	sink   consumer.Logs
 
-	library  pdata.InstrumentationLibrary
-	resource pdata.Resource
-
-	group sync.WaitGroup
+	finished chan struct{}
 }
 
 func (r *receiver) Start(ctx context.Context, host component.Host) error {
@@ -40,26 +35,39 @@ func (r *receiver) Start(ctx context.Context, host component.Host) error {
 	// to Start() function since that context will be cancelled soon and can abort the long-running
 	// operation. Create a new context from the context.Background() for long-running operations.
 
-	records := make(chan pdata.LogRecord)
+	scanner := bufio.NewScanner(r.source)
+	started := make(chan struct{})
+	defer close(started)
 
-	r.group.Add(1)
+	r.finished = make(chan struct{})
 	go func() {
-		defer r.group.Done()
-		defer close(records) // signal the other goroutine
+		defer close(r.finished)
+		<-started
 
-		err := readAll(r.source, records)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
-			host.ReportFatalError(err)
+		for scanner.Scan() {
+			b := scanner.Bytes()
+			if len(b) == 0 {
+				continue
+			}
+
+			record, err := parseLine(b)
+			if err != nil {
+				panic(err) // FIXME should not be fatal; report the bad line.
+			}
+
+			message := pdata.NewLogs()
+			record.CopyTo(message.
+				ResourceLogs().AppendEmpty().
+				InstrumentationLibraryLogs().AppendEmpty().
+				Logs().AppendEmpty())
+
+			if err := r.sink.ConsumeLogs(context.TODO(), message); err != nil {
+				panic(err) // FIXME ...
+			}
 		}
-	}()
 
-	r.group.Add(1)
-	go func() {
-		defer r.group.Done()
-		defer r.source.Close() // signal the other goroutine
-
-		err := emitBatches(records, r.sink)
-		if err != nil {
+		err := scanner.Err()
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
 			host.ReportFatalError(err)
 		}
 	}()
@@ -82,43 +90,16 @@ func (r *receiver) Shutdown(ctx context.Context) error {
 	// for example if we want to restart the component).
 
 	err := r.source.Close()
-	flushed := make(chan struct{})
-
 	if errors.Is(err, os.ErrClosed) {
 		err = nil
 	}
 
-	go func() {
-		defer close(flushed)
-		r.group.Wait()
-	}()
-
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-flushed:
+	case <-r.finished:
 		return err
 	}
-}
-
-func readAll(source io.Reader, sink chan<- pdata.LogRecord) error {
-	scanner := bufio.NewScanner(source)
-
-	for scanner.Scan() {
-		b := scanner.Bytes()
-		if len(b) == 0 {
-			continue
-		}
-
-		record, err := parseLine(scanner.Bytes())
-		if err == nil {
-			sink <- record
-		} else {
-			panic(err) // FIXME should not be fatal; report the bad line.
-		}
-	}
-
-	return scanner.Err()
 }
 
 func parseLine(line []byte) (pdata.LogRecord, error) {
@@ -173,50 +154,4 @@ func parseV1(array []byte) (pdata.LogRecord, error) {
 	}
 
 	return record, err
-}
-
-func emitBatches(source <-chan pdata.LogRecord, sink consumer.Logs) error {
-	logSlice := func(batch pdata.Logs) pdata.LogSlice {
-		return batch.
-			ResourceLogs().At(0).
-			InstrumentationLibraryLogs().At(0).
-			Logs()
-	}
-
-	flush := func(batch pdata.Logs) {
-		if logSlice(batch).Len() > 0 {
-			err := sink.ConsumeLogs(context.TODO(), batch)
-			if err != nil {
-				panic(err) // FIXME ...
-			}
-		}
-	}
-
-	newBatch := func() pdata.Logs {
-		batch := pdata.NewLogs()
-		pair := batch.ResourceLogs().AppendEmpty()
-		pair.InstrumentationLibraryLogs().AppendEmpty()
-		// TODO pair.Resource()
-
-		return batch
-	}
-
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	batch := newBatch()
-	for {
-		select {
-		case <-ticker.C:
-			flush(batch)
-			batch = newBatch()
-
-		case record, ok := <-source:
-			if !ok {
-				flush(batch)
-				return nil
-			}
-			record.CopyTo(logSlice(batch).AppendEmpty())
-		}
-	}
 }
