@@ -20,10 +20,13 @@ func NewFactory() component.ReceiverFactory {
 			return &settings
 		},
 		receiverhelper.WithLogs(func(
-			_ context.Context, _ component.ReceiverCreateSettings, _ config.Receiver,
-			next consumer.Logs) (component.LogsReceiver, error,
-		) {
-			return &receiver{source: os.Stdin, sink: next}, nil
+			_ context.Context, settings component.ReceiverCreateSettings,
+			_ config.Receiver, next consumer.Logs,
+		) (component.LogsReceiver, error) {
+			return &receiver{
+				source: os.Stdin, sink: next,
+				ReceiverCreateSettings: settings,
+			}, nil
 		}),
 	)
 }

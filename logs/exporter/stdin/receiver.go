@@ -13,9 +13,12 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/model/pdata"
+	"go.uber.org/zap"
 )
 
 type receiver struct {
+	component.ReceiverCreateSettings
+
 	source io.ReadCloser
 	sink   consumer.Logs
 
@@ -52,7 +55,8 @@ func (r *receiver) Start(ctx context.Context, host component.Host) error {
 
 			record, err := parseLine(b)
 			if err != nil {
-				panic(err) // FIXME should not be fatal; report the bad line.
+				r.Logger.Warn("Invalid line", zap.Error(err))
+				continue
 			}
 
 			message := pdata.NewLogs()
@@ -62,7 +66,7 @@ func (r *receiver) Start(ctx context.Context, host component.Host) error {
 				Logs().AppendEmpty())
 
 			if err := r.sink.ConsumeLogs(context.TODO(), message); err != nil {
-				panic(err) // FIXME ...
+				r.Logger.Error("Next consumer failed", zap.Error(err))
 			}
 		}
 
