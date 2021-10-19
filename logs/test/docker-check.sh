@@ -15,12 +15,12 @@ check() {
 	local failed=$?
 
 	if [ -s regression.diffs ]; then
-		cat regression.diffs
+		tail -vn+0 regression.diffs
 	else
-		cat log/postmaster.log
+		tail -vn+0 log/postmaster.log
 	fi
 
-	cat /tmp/pg-otel.txt
+	tail -vn+0 tmp_check/log/*
 
 	exit $failed
 }

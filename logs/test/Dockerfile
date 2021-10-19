@@ -10,7 +10,7 @@ RUN export APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 \
 
 RUN export DEBIAN_FRONTEND=noninteractive \
  && apt-get update \
- && apt-get install --no-install-recommends --yes 'postgresql-common' \
+ && apt-get install --no-install-recommends --yes 'postgresql-common' libipc-run-perl \
  && echo >> /etc/postgresql-common/createcluster.conf 'create_main_cluster = false' \
  && apt-get install --no-install-recommends --yes "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}"
 
