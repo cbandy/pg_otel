@@ -13,18 +13,17 @@ shared_preload_libraries = pg_otel_logs
 ));
 $node->start();
 
-my $contents = slurp_file('/tmp/pg-otel.txt');
+my $contents = slurp_file('/tmp/pg-otel.ndjson');
 like($contents, qr/
-	\A
-	^1,\[\d+,"LOG",9,"starting\ PostgreSQL[^\n]+\n
-	^1,\[\d+,"LOG",9,"listening
-/mx, 'hook works for initial messages');
+	.+?\{"timeUnixNano":"\d+","severityNumber":"SEVERITY_NUMBER_INFO","severityText":"LOG","body":\{"stringValue":"starting\ PostgreSQL
+	.+?\{"timeUnixNano":"\d+","severityNumber":"SEVERITY_NUMBER_INFO","severityText":"LOG","body":\{"stringValue":"listening
+/sx, 'hook works for initial messages');
 
 $node->psql('postgres', 'SELECT 1/0');
-$contents = slurp_file('/tmp/pg-otel.txt', length($contents));
+$contents = slurp_file('/tmp/pg-otel.ndjson', length($contents));
 like($contents, qr/
-	^1,\[\d+,"ERROR",17,"division\ by\ zero"]\n
-/mx, 'error level');
+	.+?\{"timeUnixNano":"\d+","severityNumber":"SEVERITY_NUMBER_ERROR","severityText":"ERROR","body":\{"stringValue":"division\ by\ zero"
+/sx, 'error level');
 
 $node->stop();
 done_testing();
