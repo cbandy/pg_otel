@@ -26,6 +26,12 @@
 #include "pgstat.h"
 #endif
 
+#ifdef WIN32
+#include "pthread-win32.h"
+#else
+#include <pthread.h>
+#endif
+
 #include "curl/curl.h"
 #include "opentelemetry/proto/collector/logs/v1/logs_service.pb-c.h"
 
@@ -55,26 +61,96 @@ static int otel_WorkerPipe[2] = {-1, -1};
 
 
 /* Allocate size memory, as needed by ProtobufCAllocator.alloc */
-static inline void *
-otel_ProtobufAllocatorAlloc(void *unused, size_t size) { return palloc(size); }
+static void *
+otel_ProtobufAllocatorAlloc(void *context, size_t size) {
+	return MemoryContextAlloc(context, size);
+}
 
 /* Free memory at pointer, as needed by ProtobufCAllocator.free */
-static inline void
-otel_ProtobufAllocatorFree(void *unused, void *pointer) { pfree(pointer); }
+static void
+otel_ProtobufAllocatorFree(void *context, void *pointer) {
+	pfree(pointer);
+}
+
+#define OTEL_FUNC_PROTO(name)     opentelemetry__proto__ ## name
+#define OTEL_FUNC_COLLECTOR(name) OTEL_FUNC_PROTO(collector__logs__v1__ ## name)
+#define OTEL_FUNC_COMMON(name)    OTEL_FUNC_PROTO(common__v1__ ## name)
+#define OTEL_FUNC_LOGS(name)      OTEL_FUNC_PROTO(logs__v1__ ## name)
+
+#define OTEL_TYPE_PROTO(name)     Opentelemetry__Proto__ ## name
+#define OTEL_TYPE_COLLECTOR(name) OTEL_TYPE_PROTO(Collector__Logs__V1__ ## name)
+#define OTEL_TYPE_COMMON(name)    OTEL_TYPE_PROTO(Common__V1__ ## name)
+#define OTEL_TYPE_LOGS(name)      OTEL_TYPE_PROTO(Logs__V1__ ## name)
+#define OTEL_TYPE_RESOURCE(name)  OTEL_TYPE_PROTO(Resource__V1__ ## name)
+
+
+#define OTEL_RECORD_MAX_ATTRIBUTES 20
+
+#define OTEL_SEVERITY_NUMBER(name) \
+	OPENTELEMETRY__PROTO__LOGS__V1__SEVERITY_NUMBER__SEVERITY_NUMBER_ ## name
+
+#define OTEL_VALUE_CASE(name) \
+	OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_ ## name ## _VALUE
+
+struct otel_RecordBatch
+{
+	MemoryContext context;
+	ProtobufCAllocator allocator;
+
+	int length, capacity;
+	OTEL_TYPE_LOGS(LogRecord) **records;
+};
+
+struct otel_ThreadState
+{
+	volatile sig_atomic_t quit;
+	CURL *http;
+
+	pthread_mutex_t              resourceMutex;
+	OTEL_TYPE_RESOURCE(Resource) resource;
+
+	pthread_cond_t          batchCondition;
+	pthread_mutex_t         batchMutex;
+	struct otel_RecordBatch batchHold, batchSend;
+};
+
+static void
+otel_InitializeRecordBatch(struct otel_RecordBatch *batch, int capacity)
+{
+	Assert(batch != NULL);
+	batch->capacity = capacity;
+	batch->length = 0;
+	batch->records = palloc0(sizeof(*(batch->records)) * capacity);
+	batch->context = AllocSetContextCreate(NULL, "pg_otel_logs batch",
+										   ALLOCSET_START_SMALL_SIZES);
+
+	batch->allocator.alloc = otel_ProtobufAllocatorAlloc;
+	batch->allocator.free = otel_ProtobufAllocatorFree;
+	batch->allocator.allocator_data = batch->context;
+}
+
+static void
+otel_ResetRecordBatch(struct otel_RecordBatch *batch)
+{
+	Assert(batch != NULL);
+	batch->length = 0;
+	MemoryContextReset(batch->context);
+}
 
 
 static void
-otel_WorkerSendBatch(CURL *http,
-					 const Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest *request)
+otel_WorkerSendToCollector(MemoryContext ctx, CURL *http,
+						   const OTEL_TYPE_COLLECTOR(ExportLogsServiceRequest) *request)
 {
-	char httpErrorBuffer[CURL_ERROR_SIZE];
+	char     httpErrorBuffer[CURL_ERROR_SIZE];
 	CURLcode httpResult;
-	struct curl_slist *requestHeaders = NULL;
-	uint8_t *requestBody;
-	size_t requestBodySize;
 
-	requestBody = palloc(opentelemetry__proto__collector__logs__v1__export_logs_service_request__get_packed_size(request));
-	requestBodySize = opentelemetry__proto__collector__logs__v1__export_logs_service_request__pack(request, requestBody);
+	struct curl_slist *requestHeaders = NULL;
+	uint8_t           *requestBody;
+	size_t             requestBodySize;
+
+	requestBody = MemoryContextAlloc(ctx, OTEL_FUNC_COLLECTOR(export_logs_service_request__get_packed_size)(request));
+	requestBodySize = OTEL_FUNC_COLLECTOR(export_logs_service_request__pack)(request, requestBody);
 
 	// TODO consider gzip encoding?
 	// TODO retry and backoff.
@@ -117,51 +193,24 @@ otel_WorkerSendBatch(CURL *http,
 }
 
 static void
-otel_WorkerProcessRecord(const char *packed, size_t size, CURL *http)
+otel_WorkerProcessRecord(struct otel_ThreadState *state,
+						 const char *packed, size_t size)
 {
-	ProtobufCAllocator alloc = {
-		otel_ProtobufAllocatorAlloc,
-		otel_ProtobufAllocatorFree,
-	};
+	pthread_mutex_lock(&(state->batchMutex));
 
-	Opentelemetry__Proto__Collector__Logs__V1__ExportLogsServiceRequest request =
-		OPENTELEMETRY__PROTO__COLLECTOR__LOGS__V1__EXPORT_LOGS_SERVICE_REQUEST__INIT;
+	if (state->batchHold.length < state->batchHold.capacity)
+	{
+		state->batchHold.records[state->batchHold.length] =
+			OTEL_FUNC_LOGS(log_record__unpack)(&(state->batchHold.allocator),
+											   size, (const uint8_t *)packed);
+		state->batchHold.length++;
+	}
+	else
+	{
+		// FIXME
+	}
 
-	Opentelemetry__Proto__Logs__V1__InstrumentationLibraryLogs libLogsData =
-		OPENTELEMETRY__PROTO__LOGS__V1__INSTRUMENTATION_LIBRARY_LOGS__INIT;
-
-	Opentelemetry__Proto__Logs__V1__InstrumentationLibraryLogs *libLogsList[1] = { &libLogsData };
-
-	Opentelemetry__Proto__Logs__V1__ResourceLogs resLogsData =
-		OPENTELEMETRY__PROTO__LOGS__V1__RESOURCE_LOGS__INIT;
-
-	Opentelemetry__Proto__Logs__V1__ResourceLogs *resLogsList[1] = { &resLogsData };
-
-	// TODO: This list is the batch of records. The capacity can be max queue.
-	Opentelemetry__Proto__Logs__V1__LogRecord *records[1];
-	records[0] = opentelemetry__proto__logs__v1__log_record__unpack(&alloc, size, (const uint8_t *)packed);
-
-	// TODO: A real library here?
-	libLogsData.instrumentation_library = NULL;
-
-	// https://opentelemetry.io/docs/reference/specification/schemas/overview/
-	libLogsData.schema_url = "https://opentelemetry.io/schemas/1.9.0";
-
-	// TODO: This list is the batch; the length.
-	libLogsData.log_records = records;
-	libLogsData.n_log_records = 1;
-
-	// TODO: A real resource here.
-	resLogsData.resource = NULL;
-	resLogsData.instrumentation_library_logs = libLogsList;
-	resLogsData.n_instrumentation_library_logs = 1;
-
-	request.resource_logs = resLogsList;
-	request.n_resource_logs = 1;
-
-	otel_WorkerSendBatch(http, &request);
-
-	opentelemetry__proto__logs__v1__log_record__free_unpacked(records[0], &alloc);
+	pthread_mutex_unlock(&(state->batchMutex));
 }
 
 
@@ -169,7 +218,7 @@ otel_WorkerProcessRecord(const char *packed, size_t size, CURL *http)
  * Send r to the background worker in atomic chunks.
  */
 static void
-otel_SendToWorker(const Opentelemetry__Proto__Logs__V1__LogRecord *r)
+otel_SendToWorker(const OTEL_TYPE_LOGS(LogRecord) *r)
 {
 	PipeProtoChunk chunk;
 	uint8_t *cursor;
@@ -177,8 +226,8 @@ otel_SendToWorker(const Opentelemetry__Proto__Logs__V1__LogRecord *r)
 	size_t remaining;
 	int rc;
 
-	packed = palloc(opentelemetry__proto__logs__v1__log_record__get_packed_size(r));
-	remaining = opentelemetry__proto__logs__v1__log_record__pack(r, packed);
+	packed = palloc(OTEL_FUNC_LOGS(log_record__get_packed_size)(r));
+	remaining = OTEL_FUNC_LOGS(log_record__pack)(r, packed);
 	cursor = packed;
 
 	chunk.proto.nuls[0] = chunk.proto.nuls[1] = '\0';
@@ -216,7 +265,8 @@ otel_SendToWorker(const Opentelemetry__Proto__Logs__V1__LogRecord *r)
 
 /* Extract records from atomic chunks sent by backends */
 static void
-otel_WorkerProcessInput(char *buffer, int *bufferOffset, CURL *http)
+otel_WorkerProcessInput(struct otel_ThreadState *state,
+						char *buffer, int *bufferOffset)
 {
 	struct Portion
 	{
@@ -285,7 +335,7 @@ otel_WorkerProcessInput(char *buffer, int *bufferOffset, CURL *http)
 #endif
 		{
 			/* This chunk is a complete message; send it */
-			otel_WorkerProcessRecord(cursor + PIPE_HEADER_SIZE, header.len, http);
+			otel_WorkerProcessRecord(state, cursor + PIPE_HEADER_SIZE, header.len);
 
 			/* On to the next chunk */
 			remaining -= length;
@@ -321,7 +371,7 @@ otel_WorkerProcessInput(char *buffer, int *bufferOffset, CURL *http)
 #endif
 		{
 			/* The message is now complete; send it */
-			otel_WorkerProcessRecord(message->data.data, message->data.len, http);
+			otel_WorkerProcessRecord(state, message->data.data, message->data.len);
 
 			/* Mark the slot unused and reclaim storage */
 			message->pid = 0;
@@ -337,6 +387,87 @@ otel_WorkerProcessInput(char *buffer, int *bufferOffset, CURL *http)
 	if (remaining > 0 && cursor != buffer)
 		memmove(buffer, cursor, remaining);
 	*bufferOffset = remaining;
+
+	/* Signal the thread that there may be records to send */
+	pthread_mutex_lock(&(state->batchMutex));
+	pthread_cond_signal(&(state->batchCondition));
+	pthread_mutex_unlock(&(state->batchMutex));
+}
+
+static void *
+otel_WorkerThread(void *pointer)
+{
+	struct otel_ThreadState *state = pointer;
+
+	OTEL_TYPE_LOGS(InstrumentationLibraryLogs)  libLogsData;
+	OTEL_TYPE_LOGS(InstrumentationLibraryLogs) *libLogsList[1];
+	OTEL_TYPE_LOGS(ResourceLogs)                resLogsData;
+	OTEL_TYPE_LOGS(ResourceLogs)               *resLogsList[1];
+
+	OTEL_FUNC_LOGS(instrumentation_library_logs__init)(&libLogsData);
+	OTEL_FUNC_LOGS(resource_logs__init)(&resLogsData);
+
+	libLogsList[0] = &libLogsData;
+	resLogsList[0] = &resLogsData;
+
+	// TODO: A real library here?
+	libLogsData.instrumentation_library = NULL;
+
+	// https://opentelemetry.io/docs/reference/specification/schemas/overview/
+	libLogsData.schema_url = "https://opentelemetry.io/schemas/1.9.0";
+
+	// TODO: A real resource here.
+	resLogsData.resource = NULL;
+	resLogsData.instrumentation_library_logs = libLogsList;
+	resLogsData.n_instrumentation_library_logs = 1;
+
+	for (;;)
+	{
+		/*
+		 * Wait for the worker to indicate there are records to send.
+		 */
+		pthread_mutex_lock(&(state->batchMutex));
+		pthread_cond_wait(&(state->batchCondition), &(state->batchMutex));
+
+		/*
+		 * When there are records to send, flip the batches so the worker can
+		 * continue to read from the local pipe while this thread sends to the
+		 * remote collector.
+		 */
+		if (state->batchHold.length > 0)
+		{
+			struct otel_RecordBatch temp = state->batchHold;
+			state->batchHold = state->batchSend;
+			state->batchSend = temp;
+		}
+
+		pthread_mutex_unlock(&(state->batchMutex));
+
+		/*
+		 * When there are records to send, send them as a single request then
+		 * release their resources.
+		 */
+		if (state->batchSend.length > 0)
+		{
+			OTEL_TYPE_COLLECTOR(ExportLogsServiceRequest) request;
+			OTEL_FUNC_COLLECTOR(export_logs_service_request__init)(&request);
+
+			request.resource_logs     = resLogsList;
+			request.n_resource_logs   = 1;
+			libLogsData.log_records   = state->batchSend.records;
+			libLogsData.n_log_records = state->batchSend.length;
+
+			otel_WorkerSendToCollector(state->batchSend.context, state->http,
+									   &request);
+
+			otel_ResetRecordBatch(&(state->batchSend));
+		}
+
+		if (state->quit)
+			break;
+	}
+
+	return NULL;
 }
 
 static void
@@ -362,7 +493,8 @@ otel_WorkerMain(Datum main_arg)
 {
 	char bufferData[2 * PIPE_CHUNK_SIZE];
 	int bufferOffset = 0;
-	CURL *http;
+	struct otel_ThreadState state = {};
+	pthread_t thread;
 	WaitEventSet *wes;
 
 	/* Register our signal handlers */
@@ -372,18 +504,30 @@ otel_WorkerMain(Datum main_arg)
 	/* Ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	/* Initialize CURL */
-	curl_global_init(CURL_GLOBAL_ALL);
-	http = curl_easy_init();
-	if (http == NULL)
-		ereport(FATAL, (errmsg("could not initialize CURL")));
-
 	/* Close our copy of the write end of the pipe */
 #ifndef WIN32
 	if (OTEL_WORKER_PIPE_W >= 0)
 		close(OTEL_WORKER_PIPE_W);
 	OTEL_WORKER_PIPE_W = -1;
 #endif
+
+	/* Initialize CURL */
+	curl_global_init(CURL_GLOBAL_ALL);
+	state.http = curl_easy_init();
+	if (state.http == NULL)
+		ereport(FATAL, (errmsg("could not initialize CURL for otel logs")));
+
+	if (pthread_cond_init(&state.batchCondition, NULL) != 0 ||
+		pthread_mutex_init(&state.batchMutex, NULL) != 0 ||
+		pthread_mutex_init(&state.resourceMutex, NULL) != 0)
+		ereport(FATAL, (errmsg("could not initialize otel thread synchronization")));
+
+	/* Initialize the batches that hold records waiting to send */
+	otel_InitializeRecordBatch(&state.batchHold, 500);
+	otel_InitializeRecordBatch(&state.batchSend, 500);
+
+	if (pthread_create(&thread, NULL, otel_WorkerThread, (void *)&state) != 0)
+		ereport(FATAL, (errmsg("could not create otel thread")));
 
 	/* Set up a WaitEventSet for our latch and pipe */
 	wes = CreateWaitEventSet(CurrentMemoryContext, 3);
@@ -426,7 +570,7 @@ otel_WorkerMain(Datum main_arg)
 			else if (n > 0)
 			{
 				bufferOffset += n;
-				otel_WorkerProcessInput(bufferData, &bufferOffset, http);
+				otel_WorkerProcessInput(&state, bufferData, &bufferOffset);
 			}
 			else
 			{
@@ -439,43 +583,41 @@ otel_WorkerMain(Datum main_arg)
 	/* TODO: flush */
 	// Look for techniques around ShutdownXLOG.
 
-	if (http != NULL)
-		curl_easy_cleanup(http);
+	/* Signal the thread and wait for it to finish sending records */
+	state.quit = true;
+	pthread_mutex_lock(&(state.batchMutex));
+	pthread_cond_signal(&(state.batchCondition));
+	pthread_mutex_unlock(&(state.batchMutex));
+	pthread_join(thread, NULL);
+
+	if (state.http != NULL)
+		curl_easy_cleanup(state.http);
 	curl_global_cleanup();
 
 	/* Exit zero so we aren't restarted */
 	proc_exit(0);
 }
 
-
-#define OTEL_RECORD_MAX_ATTRIBUTES 20
-
-#define OTEL_SEVERITY_NUMBER(name) \
-	OPENTELEMETRY__PROTO__LOGS__V1__SEVERITY_NUMBER__SEVERITY_NUMBER_ ## name
-
-#define OTEL_VALUE_TYPE(name) \
-	OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_ ## name ## _VALUE
-
 /*
  * Append key and value to record->attributes by storing them in key_values and any_values.
  */
 static void
-otel_AttributeInt(Opentelemetry__Proto__Logs__V1__LogRecord *record,
-				  Opentelemetry__Proto__Common__V1__KeyValue *key_values,
-				  Opentelemetry__Proto__Common__V1__AnyValue *any_values,
+otel_AttributeInt(OTEL_TYPE_LOGS(LogRecord) *record,
+				  OTEL_TYPE_COMMON(KeyValue) *keyValues,
+				  OTEL_TYPE_COMMON(AnyValue) *anyValues,
 				  const char *key, int value)
 {
 	size_t i = record->n_attributes;
 	Assert(i < OTEL_RECORD_MAX_ATTRIBUTES);
 
-	opentelemetry__proto__common__v1__key_value__init(&key_values[i]);
-	opentelemetry__proto__common__v1__any_value__init(&any_values[i]);
+	OTEL_FUNC_COMMON(key_value__init)(&keyValues[i]);
+	OTEL_FUNC_COMMON(any_value__init)(&anyValues[i]);
 
-	record->attributes[i] = &key_values[i];
-	key_values[i].key = (char *)key;
-	key_values[i].value = &any_values[i];
-	any_values[i].value_case = OTEL_VALUE_TYPE(INT);
-	any_values[i].int_value = value;
+	record->attributes[i] = &keyValues[i];
+	keyValues[i].key = (char *)key;
+	keyValues[i].value = &anyValues[i];
+	anyValues[i].value_case = OTEL_VALUE_CASE(INT);
+	anyValues[i].int_value = value;
 
 	++record->n_attributes;
 }
@@ -484,22 +626,22 @@ otel_AttributeInt(Opentelemetry__Proto__Logs__V1__LogRecord *record,
  * Append key and value to record->attributes by storing them in key_values and any_values.
  */
 static void
-otel_AttributeStr(Opentelemetry__Proto__Logs__V1__LogRecord *record,
-				  Opentelemetry__Proto__Common__V1__KeyValue *key_values,
-				  Opentelemetry__Proto__Common__V1__AnyValue *any_values,
+otel_AttributeStr(OTEL_TYPE_LOGS(LogRecord) *record,
+				  OTEL_TYPE_COMMON(KeyValue) *keyValues,
+				  OTEL_TYPE_COMMON(AnyValue) *anyValues,
 				  const char *key, const char *value)
 {
 	size_t i = record->n_attributes;
 	Assert(i < OTEL_RECORD_MAX_ATTRIBUTES);
 
-	opentelemetry__proto__common__v1__key_value__init(&key_values[i]);
-	opentelemetry__proto__common__v1__any_value__init(&any_values[i]);
+	OTEL_FUNC_COMMON(key_value__init)(&keyValues[i]);
+	OTEL_FUNC_COMMON(any_value__init)(&anyValues[i]);
 
-	record->attributes[i] = &key_values[i];
-	key_values[i].key = (char *)key;
-	key_values[i].value = &any_values[i];
-	any_values[i].value_case = OTEL_VALUE_TYPE(STRING);
-	any_values[i].string_value = (char *)value;
+	record->attributes[i] = &keyValues[i];
+	keyValues[i].key = (char *)key;
+	keyValues[i].value = &anyValues[i];
+	anyValues[i].value_case = OTEL_VALUE_CASE(STRING);
+	anyValues[i].string_value = (char *)value;
 
 	++record->n_attributes;
 }
@@ -510,27 +652,26 @@ otel_AttributeStr(Opentelemetry__Proto__Logs__V1__LogRecord *record,
 static void
 otel_EmitLogHook(ErrorData *edata)
 {
-	Opentelemetry__Proto__Common__V1__KeyValue attr_key_values[OTEL_RECORD_MAX_ATTRIBUTES];
-	Opentelemetry__Proto__Common__V1__AnyValue attr_any_values[OTEL_RECORD_MAX_ATTRIBUTES];
-	Opentelemetry__Proto__Common__V1__KeyValue *attr_list[OTEL_RECORD_MAX_ATTRIBUTES];
-	Opentelemetry__Proto__Common__V1__AnyValue body;
-	Opentelemetry__Proto__Logs__V1__LogRecord record;
+	OTEL_TYPE_COMMON(KeyValue)  attrKeyValues[OTEL_RECORD_MAX_ATTRIBUTES];
+	OTEL_TYPE_COMMON(AnyValue)  attrAnyValues[OTEL_RECORD_MAX_ATTRIBUTES];
+	OTEL_TYPE_COMMON(KeyValue) *attrList[OTEL_RECORD_MAX_ATTRIBUTES];
+	OTEL_TYPE_COMMON(AnyValue)  body;
+	OTEL_TYPE_LOGS(LogRecord)   record;
 	struct timeval tv;
-	uint64_t unix_nano;
+	uint64_t unixNanoSec;
 
 	gettimeofday(&tv, NULL);
-	unix_nano = tv.tv_sec * 1000000000 + tv.tv_usec * 1000;
+	unixNanoSec = tv.tv_sec * 1000000000 + tv.tv_usec * 1000;
 
-	opentelemetry__proto__logs__v1__log_record__init(&record);
+	OTEL_FUNC_LOGS(log_record__init)(&record);
+	OTEL_FUNC_COMMON(any_value__init)(&body);
 
-	record.attributes = attr_list;
+	record.attributes = attrList;
 	record.body = &body;
-	record.observed_time_unix_nano = unix_nano;
-	record.time_unix_nano = unix_nano;
-
-	opentelemetry__proto__common__v1__any_value__init(&body);
-	body.value_case = OTEL_VALUE_TYPE(STRING);
-	body.string_value = edata->message;
+	record.body->value_case = OTEL_VALUE_CASE(STRING);
+	record.body->string_value = edata->message;
+	record.observed_time_unix_nano = unixNanoSec;
+	record.time_unix_nano = unixNanoSec;
 
 	/*
 	 * Set severity number and text according to OpenTelemetry Log Data Model
@@ -617,29 +758,29 @@ otel_EmitLogHook(ErrorData *edata)
 	 */
 
 	if (MyProcPid != 0)
-		otel_AttributeInt(&record, attr_key_values, attr_any_values,
+		otel_AttributeInt(&record, attrKeyValues, attrAnyValues,
 						  "process.pid", MyProcPid);
 
 	if (edata->funcname != NULL)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 						  "code.function", edata->funcname);
 
 	if (edata->filename != NULL)
 	{
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 						  "code.filepath", edata->filename);
-		otel_AttributeInt(&record, attr_key_values, attr_any_values,
+		otel_AttributeInt(&record, attrKeyValues, attrAnyValues,
 						  "code.lineno", edata->lineno);
 	}
 
 	if (MyProcPort != NULL)
 	{
 		if (MyProcPort->database_name != NULL)
-			otel_AttributeStr(&record, attr_key_values, attr_any_values,
+			otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 							  "db.name", MyProcPort->database_name);
 
 		if (MyProcPort->user_name != NULL)
-			otel_AttributeStr(&record, attr_key_values, attr_any_values,
+			otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 							  "db.user", MyProcPort->user_name);
 
 		// TODO: MyProcPort->remote_host + MyProcPort->remote_port
@@ -647,56 +788,51 @@ otel_EmitLogHook(ErrorData *edata)
 
 	if (debug_query_string != NULL && !edata->hide_stmt)
 	{
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 						  "db.statement", debug_query_string);
 
 		if (edata->cursorpos > 0)
-			otel_AttributeInt(&record, attr_key_values, attr_any_values,
+			otel_AttributeInt(&record, attrKeyValues, attrAnyValues,
 							  "db.postgresql.cursor_position",
 							  edata->cursorpos);
 	}
 
 	if (edata->internalquery != NULL)
 	{
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 						  "db.postgresql.internal_query",
 						  edata->internalquery);
 
 		if (edata->internalpos > 0)
-			otel_AttributeInt(&record, attr_key_values, attr_any_values,
+			otel_AttributeInt(&record, attrKeyValues, attrAnyValues,
 							  "db.postgresql.internal_position",
 							  edata->internalpos);
 	}
 
 	if (edata->context != NULL && !edata->hide_ctx)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
-						  "db.postgresql.context",
-						  edata->context);
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
+						  "db.postgresql.context", edata->context);
 
 	if (edata->sqlerrcode != 0)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
 						  "db.postgresql.state_code",
 						  unpack_sql_state(edata->sqlerrcode));
 
 	if (edata->hint != NULL)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
-						  "db.postgresql.hint",
-						  edata->hint);
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
+						  "db.postgresql.hint", edata->hint);
 
 	if (edata->detail_log != NULL)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
-						  "db.postgresql.detail",
-						  edata->detail_log);
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
+						  "db.postgresql.detail", edata->detail_log);
 
 	else if (edata->detail != NULL)
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
-						  "db.postgresql.detail",
-						  edata->detail);
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
+						  "db.postgresql.detail", edata->detail);
 
 	if (application_name != NULL && application_name[0] != '\0')
-		otel_AttributeStr(&record, attr_key_values, attr_any_values,
-						  "db.postgresql.application_name",
-						  application_name);
+		otel_AttributeStr(&record, attrKeyValues, attrAnyValues,
+						  "db.postgresql.application_name", application_name);
 
 	// TODO: backend_type
 	// TODO: session_id
@@ -742,7 +878,10 @@ _PG_init(void)
 	emit_log_hook = otel_EmitLogHook;
 }
 
-/* Called when the module is unloaded */
+/*
+ * Called when the module is unloaded, which is never.
+ * - https://git.postgresql.org/gitweb/?p=postgresql.git;f=src/backend/utils/fmgr/dfmgr.c;hb=REL_10_0#l389
+ */
 void
 _PG_fini(void)
 {
