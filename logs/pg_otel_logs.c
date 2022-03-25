@@ -124,9 +124,9 @@ otel_InitializeRecordBatch(struct otel_RecordBatch *batch, int capacity)
 	batch->context = AllocSetContextCreate(NULL, "pg_otel_logs batch",
 										   ALLOCSET_START_SMALL_SIZES);
 
+	batch->allocator.allocator_data = batch->context;
 	batch->allocator.alloc = otel_ProtobufAllocatorAlloc;
 	batch->allocator.free = otel_ProtobufAllocatorFree;
-	batch->allocator.allocator_data = batch->context;
 }
 
 static void
@@ -399,27 +399,24 @@ otel_WorkerThread(void *pointer)
 {
 	struct otel_ThreadState *state = pointer;
 
-	OTEL_TYPE_LOGS(InstrumentationLibraryLogs)  libLogsData;
-	OTEL_TYPE_LOGS(InstrumentationLibraryLogs) *libLogsList[1];
-	OTEL_TYPE_LOGS(ResourceLogs)                resLogsData;
-	OTEL_TYPE_LOGS(ResourceLogs)               *resLogsList[1];
+	OTEL_TYPE_LOGS(ResourceLogs)  resourceLogsData;
+	OTEL_TYPE_LOGS(ResourceLogs) *resourceLogsList[1] = { &resourceLogsData };
+	OTEL_TYPE_LOGS(ScopeLogs)     scopeLogsData;
+	OTEL_TYPE_LOGS(ScopeLogs)    *scopeLogsList[1] = { &scopeLogsData };
 
-	OTEL_FUNC_LOGS(instrumentation_library_logs__init)(&libLogsData);
-	OTEL_FUNC_LOGS(resource_logs__init)(&resLogsData);
+	OTEL_FUNC_LOGS(resource_logs__init)(&resourceLogsData);
+	OTEL_FUNC_LOGS(scope_logs__init)(&scopeLogsData);
 
-	libLogsList[0] = &libLogsData;
-	resLogsList[0] = &resLogsData;
-
-	// TODO: A real library here?
-	libLogsData.instrumentation_library = NULL;
+	// TODO: A real scope here.
+	scopeLogsData.scope = NULL;
 
 	// https://opentelemetry.io/docs/reference/specification/schemas/overview/
-	libLogsData.schema_url = "https://opentelemetry.io/schemas/1.9.0";
+	scopeLogsData.schema_url = "https://opentelemetry.io/schemas/1.9.0";
 
 	// TODO: A real resource here.
-	resLogsData.resource = NULL;
-	resLogsData.instrumentation_library_logs = libLogsList;
-	resLogsData.n_instrumentation_library_logs = 1;
+	resourceLogsData.resource = NULL;
+	resourceLogsData.scope_logs = scopeLogsList;
+	resourceLogsData.n_scope_logs = 1;
 
 	for (;;)
 	{
@@ -452,10 +449,10 @@ otel_WorkerThread(void *pointer)
 			OTEL_TYPE_COLLECTOR(ExportLogsServiceRequest) request;
 			OTEL_FUNC_COLLECTOR(export_logs_service_request__init)(&request);
 
-			request.resource_logs     = resLogsList;
-			request.n_resource_logs   = 1;
-			libLogsData.log_records   = state->batchSend.records;
-			libLogsData.n_log_records = state->batchSend.length;
+			request.resource_logs       = resourceLogsList;
+			request.n_resource_logs     = 1;
+			scopeLogsData.log_records   = state->batchSend.records;
+			scopeLogsData.n_log_records = state->batchSend.length;
 
 			otel_WorkerSendToCollector(state->batchSend.context, state->http,
 									   &request);
