@@ -109,7 +109,7 @@ struct otel_ThreadState
 	pthread_mutex_t              resourceMutex;
 	OTEL_TYPE_RESOURCE(Resource) resource;
 
-	pthread_cond_t          batchCondition;
+	struct Latch            batchLatch;
 	pthread_mutex_t         batchMutex;
 	struct otel_RecordBatch batchHold, batchSend;
 };
@@ -390,7 +390,7 @@ otel_WorkerProcessInput(struct otel_ThreadState *state,
 
 	/* Signal the thread that there may be records to send */
 	pthread_mutex_lock(&(state->batchMutex));
-	pthread_cond_signal(&(state->batchCondition));
+	SetLatch(&(state->batchLatch));
 	pthread_mutex_unlock(&(state->batchMutex));
 }
 
@@ -423,8 +423,9 @@ otel_WorkerThread(void *pointer)
 		/*
 		 * Wait for the worker to indicate there are records to send.
 		 */
+		WaitLatch(&(state->batchLatch), WL_LATCH_SET, -1, PG_WAIT_EXTENSION);
 		pthread_mutex_lock(&(state->batchMutex));
-		pthread_cond_wait(&(state->batchCondition), &(state->batchMutex));
+		ResetLatch(&(state->batchLatch));
 
 		/*
 		 * When there are records to send, flip the batches so the worker can
@@ -514,8 +515,11 @@ otel_WorkerMain(Datum main_arg)
 	if (state.http == NULL)
 		ereport(FATAL, (errmsg("could not initialize CURL for otel logs")));
 
-	if (pthread_cond_init(&state.batchCondition, NULL) != 0 ||
-		pthread_mutex_init(&state.batchMutex, NULL) != 0 ||
+	/* Initialize thread synchronization */
+	InitializeLatchSupport();
+	InitLatch(&state.batchLatch);
+
+	if (pthread_mutex_init(&state.batchMutex, NULL) != 0 ||
 		pthread_mutex_init(&state.resourceMutex, NULL) != 0)
 		ereport(FATAL, (errmsg("could not initialize otel thread synchronization")));
 
@@ -526,7 +530,7 @@ otel_WorkerMain(Datum main_arg)
 	if (pthread_create(&thread, NULL, otel_WorkerThread, (void *)&state) != 0)
 		ereport(FATAL, (errmsg("could not create otel thread")));
 
-	/* Set up a WaitEventSet for our latch and pipe */
+	/* Set up a WaitEventSet for our process latch and pipe */
 	wes = CreateWaitEventSet(CurrentMemoryContext, 3);
 	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 	AddWaitEventToSet(wes, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
@@ -583,7 +587,7 @@ otel_WorkerMain(Datum main_arg)
 	/* Signal the thread and wait for it to finish sending records */
 	state.quit = true;
 	pthread_mutex_lock(&(state.batchMutex));
-	pthread_cond_signal(&(state.batchCondition));
+	SetLatch(&state.batchLatch);
 	pthread_mutex_unlock(&(state.batchMutex));
 	pthread_join(thread, NULL);
 
