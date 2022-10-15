@@ -1,0 +1,21 @@
+-- vim: set expandtab shiftwidth=0 syntax=pgsql tabstop=2 :
+-- TEST: custom parameters and their defaults
+\pset format csv
+SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
+  FROM pg_catalog.pg_settings
+ WHERE name LIKE 'otel.%';
+name,setting,unit,context,vartype,min_val,max_val,enumvals
+otel.attribute_count_limit,128,,internal,integer,128,128,
+otel.otlp_endpoint,http://localhost:4318,,sighup,string,,,
+otel.otlp_protocol,http/protobuf,,internal,string,,,
+otel.otlp_timeout,10000,ms,sighup,integer,1,3600000,
+otel.resource_attributes,,,sighup,string,,,
+otel.service_name,postgresql,,sighup,string,,,
+\pset format aligned
+-- TEST: protocol cannot be changed
+ALTER SYSTEM SET otel.otlp_protocol TO 'grpc';
+ERROR:  parameter "otel.otlp_protocol" cannot be changed
+-- TEST: service.name cannot be blank
+ALTER SYSTEM SET otel.service_name TO '';
+ERROR:  invalid value for parameter "otel.service_name": ""
+DETAIL:  resource attribute "service.name" cannot be blank.

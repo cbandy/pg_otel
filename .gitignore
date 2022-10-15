@@ -1,3 +1,5 @@
 *.bc
 *.o
 *.so
+
+/opentelemetry/
