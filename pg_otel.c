@@ -13,6 +13,7 @@
 #include "storage/shmem.h"
 
 #include "pg_otel_config.c"
+#include "pg_otel_proto.c"
 
 /* Dynamically loadable module */
 PG_MODULE_MAGIC;
@@ -23,6 +24,7 @@ void _PG_fini(void);
 
 /* Variables set via GUC (parameters) */
 static struct otelConfiguration config;
+static struct otelResource resource;
 
 /* Called when the module is loaded */
 void
@@ -33,6 +35,7 @@ _PG_init(void)
 
 	otel_DefineCustomVariables(&config);
 	otel_ReadEnvironment();
+	otel_LoadResource(&config, &resource);
 }
 
 /*

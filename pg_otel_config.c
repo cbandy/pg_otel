@@ -3,21 +3,7 @@
 #include "postgres.h"
 #include "utils/guc.h"
 
-struct otlpConfiguration
-{
-	char *endpoint;
-	char *protocol;
-	int timeoutMS;
-};
-struct otelConfiguration
-{
-	int attributeCountLimit;
-	int attributeValueLengthLimit;
-	struct otlpConfiguration otlp;
-	struct otlpConfiguration otlpLogs;
-	char *resourceAttributes;
-	char *serviceName;
-};
+#include "pg_otel_config.h"
 
 static bool
 otel_CheckBaggage(char **next, void **extra, GucSource source)
@@ -77,7 +63,9 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 NULL,
 
 		 &dst->attributeCountLimit,
-		 128, 128, 128,
+		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
+		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
+		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
 
 		 PGC_INTERNAL, 0, NULL, NULL, NULL);
 
