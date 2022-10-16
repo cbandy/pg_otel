@@ -6,6 +6,7 @@ SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
  WHERE name LIKE 'otel.%';
 name,setting,unit,context,vartype,min_val,max_val,enumvals
 otel.attribute_count_limit,128,,internal,integer,128,128,
+otel.export,,,sighup,string,,,
 otel.otlp_endpoint,http://localhost:4318,,sighup,string,,,
 otel.otlp_protocol,http/protobuf,,internal,string,,,
 otel.otlp_timeout,10000,ms,sighup,integer,1,3600000,

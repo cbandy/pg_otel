@@ -2,8 +2,30 @@
 
 #include "postgres.h"
 #include "utils/guc.h"
+#include "utils/varlena.h"
 
 #include "pg_otel_config.h"
+
+#if PG_VERSION_NUM < 160000
+/* https://git.postgresql.org/gitweb/?p=postgresql.git;h=0a20ff54f5e661589 */
+#include "utils/elog.h"
+static void *guc_malloc(int elevel, size_t size)
+{
+	void *data = malloc(size);
+	if (data == NULL)
+		ereport(elevel,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	return data;
+}
+#endif
+
+/*
+ * The GUC system expects variables to be assigned statically, so hooks are
+ * called without any destination pointers. We pretty much do the same.
+ * Pass some pointers from [otel_DefineCustomVariables] to hooks through here.
+ */
+static struct otelSignalConfiguration *gucExportsHook = NULL;
 
 static bool
 otel_CheckBaggage(char **next, void **extra, GucSource source)
@@ -25,6 +47,58 @@ otel_CheckEndpoint(char **next, void **extra, GucSource source)
 	}
 
 	return true;
+}
+
+static bool
+otel_CheckExports(char **next, void **extra, GucSource source)
+{
+	struct otelSignalConfiguration parsed = {};
+
+	ListCell *cell = NULL;
+	List     *list = NULL;
+
+	parsed.text = pstrdup(*next);
+	if (!SplitIdentifierString(parsed.text, ',', &list))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(parsed.text);
+		list_free(list);
+		return false;
+	}
+
+	foreach(cell, list)
+	{
+		char *item = (char *) lfirst(cell);
+
+		if (pg_strcasecmp(item, "logs") == 0 ||
+			pg_strcasecmp(item, "log") == 0)
+			parsed.signals |= PG_OTEL_CONFIG_LOGS;
+		else
+		{
+			GUC_check_errdetail("Unrecognized signal: \"%s\".", item);
+			pfree(parsed.text);
+			list_free(list);
+			return false;
+		}
+	}
+
+	pfree(parsed.text);
+	parsed.text = NULL;
+	list_free(list);
+
+	/* This will be freed by PostgreSQL GUC */
+	*extra = guc_malloc(ERROR, sizeof(struct otelSignalConfiguration));
+	memcpy(*extra, &parsed, sizeof(struct otelSignalConfiguration));
+	return true;
+}
+
+static void
+otel_AssignExports(const char *next, void *extra)
+{
+	struct otelSignalConfiguration *parsed =
+		(struct otelSignalConfiguration *) extra;
+
+	gucExportsHook->signals = parsed->signals;
 }
 
 static bool
@@ -68,6 +142,18 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
 
 		 PGC_INTERNAL, 0, NULL, NULL, NULL);
+
+	gucExportsHook = &dst->exports;
+	DefineCustomStringVariable
+		("otel.export",
+		 "Signals to export over OTLP",
+		 "May be empty or \"logs\".",
+
+		 &dst->exports.text,
+		 "",
+
+		 PGC_SIGHUP, GUC_LIST_INPUT,
+		 otel_CheckExports, otel_AssignExports, NULL);
 
 	DefineCustomStringVariable
 		("otel.otlp_endpoint",
@@ -147,6 +233,12 @@ otel_ReadEnvironment(void)
 	/*
 	 * https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/#general-sdk-configuration
 	 */
+	{
+		/* "OTEL_SDK_DISABLED=true" should no-op all telemetry signals */
+		char *value = getenv("OTEL_SDK_DISABLED");
+		if (value != NULL && pg_strcasecmp(value, "true") == 0)
+			SetConfigOption("otel.export", "", PGC_POSTMASTER, PGC_S_ENV_VAR);
+	}
 	otel_CustomVariableEnv("otel.resource_attributes", "OTEL_RESOURCE_ATTRIBUTES");
 	otel_CustomVariableEnv("otel.service_name", "OTEL_SERVICE_NAME");
 }
