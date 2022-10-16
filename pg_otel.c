@@ -18,9 +18,17 @@
 /* Dynamically loadable module */
 PG_MODULE_MAGIC;
 
-/* Hooks called when the module is (un)loaded */
+/* Called when the module is loaded */
 void _PG_init(void);
+
+#if PG_VERSION_NUM < 150000
+/*
+ * Called when the module is unloaded, which is never.
+ * - https://git.postgresql.org/gitweb/?p=postgresql.git;f=src/backend/utils/fmgr/dfmgr.c;hb=REL_11_0#l389
+ */
 void _PG_fini(void);
+void _PG_fini(void) {}
+#endif
 
 /* Variables set via GUC (parameters) */
 static struct otelConfiguration config;
@@ -36,13 +44,4 @@ _PG_init(void)
 	otel_DefineCustomVariables(&config);
 	otel_ReadEnvironment();
 	otel_LoadResource(&config, &resource);
-}
-
-/*
- * Called when the module is unloaded, which is never.
- * - https://git.postgresql.org/gitweb/?p=postgresql.git;f=src/backend/utils/fmgr/dfmgr.c;hb=REL_10_0#l389
- */
-void
-_PG_fini(void)
-{
 }
