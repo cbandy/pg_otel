@@ -13,6 +13,10 @@ otel.otlp_timeout,10000,ms,sighup,integer,1,3600000,
 otel.resource_attributes,,,sighup,string,,,
 otel.service_name,postgresql,,sighup,string,,,
 \pset format aligned
+-- TEST: endpoint requires scheme
+ALTER SYSTEM SET otel.otlp_endpoint TO 'localhost:8080';
+ERROR:  invalid value for parameter "otel.otlp_endpoint": "localhost:8080"
+DETAIL:  URL must begin with http or https.
 -- TEST: protocol cannot be changed
 ALTER SYSTEM SET otel.otlp_protocol TO 'grpc';
 ERROR:  parameter "otel.otlp_protocol" cannot be changed

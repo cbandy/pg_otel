@@ -7,6 +7,9 @@ SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
  WHERE name LIKE 'otel.%';
 \pset format aligned
 
+-- TEST: endpoint requires scheme
+ALTER SYSTEM SET otel.otlp_endpoint TO 'localhost:8080';
+
 -- TEST: protocol cannot be changed
 ALTER SYSTEM SET otel.otlp_protocol TO 'grpc';
 

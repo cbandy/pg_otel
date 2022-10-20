@@ -14,6 +14,9 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+CURL_CONFIG = curl-config
+CFLAGS += $(shell $(CURL_CONFIG) --cflags)
+SHLIB_LINK += $(shell $(CURL_CONFIG) --libs)
 SHLIB_LINK += -lprotobuf-c
 
 .PHONY: otel-protobufs

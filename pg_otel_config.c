@@ -4,6 +4,8 @@
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
+#include "curl/curl.h"
+
 #include "pg_otel_config.h"
 
 #if PG_VERSION_NUM < 160000
@@ -37,14 +39,45 @@ otel_CheckBaggage(char **next, void **extra, GucSource source)
 static bool
 otel_CheckEndpoint(char **next, void **extra, GucSource source)
 {
-	/* TODO: https://curl.se/libcurl/c/curl_url.html */
+	const char *const *protocol;
+	curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
 
-	if (strncmp(*next, "http://", 7) != 0 &&
-		strncmp(*next, "https://", 8) != 0)
+	if (strncmp(*next, "http://", 7) == 0)
+	{
+		for (protocol = version->protocols; protocol; protocol++)
+			if (pg_strcasecmp(*protocol, "http") == 0)
+				break;
+
+		if (protocol == NULL)
+		{
+			GUC_check_errdetail("libcurl %s not compiled with support for HTTP.",
+								version->version);
+			return false;
+		}
+	}
+	else if (strncmp(*next, "https://", 8) == 0)
+	{
+		for (protocol = version->protocols; protocol; protocol++)
+			if (pg_strcasecmp(*protocol, "https") == 0)
+				break;
+
+		if (protocol == NULL)
+		{
+			GUC_check_errdetail("libcurl %s not compiled with support for HTTPS.",
+								version->version);
+			return false;
+		}
+	}
+	else
 	{
 		GUC_check_errdetail("URL must begin with http or https.");
 		return false;
 	}
+
+	/*
+	 * libcurl 7.62.0 has functions for building and parsing URLs.
+	 * - https://curl.se/libcurl/c/curl_url.html
+	 */
 
 	return true;
 }
