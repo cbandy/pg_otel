@@ -1,4 +1,0 @@
-/*.go
-/go.*
-/opentelemetry-collector-builder
-/pg_otel_logs_exporter
