@@ -2,9 +2,33 @@
 
 #include "postgres.h"
 #include "utils/guc.h"
+#include "utils/palloc.h"
 
 #include "pg_otel.h"
 #include "pg_otel_proto.h"
+
+/* Allocate size memory, as needed by [ProtobufCAllocator.alloc] */
+static void *
+otel_ProtobufAllocatorAlloc(void *context, size_t size) {
+	return MemoryContextAlloc(context, size);
+}
+
+/* Free memory at pointer, as needed by [ProtobufCAllocator.free] */
+static void
+otel_ProtobufAllocatorFree(void *context, void *pointer) {
+	pfree(pointer);
+}
+
+/* Initialize allocator to allocate within ctx */
+static void
+otel_InitProtobufCAllocator(ProtobufCAllocator *allocator, MemoryContext ctx)
+{
+	Assert(allocator != NULL);
+
+	allocator->allocator_data = ctx;
+	allocator->alloc = otel_ProtobufAllocatorAlloc;
+	allocator->free = otel_ProtobufAllocatorFree;
+}
 
 static void
 otel_AttributeStr(OTEL_TYPE_COMMON(AnyValue) *anyValues,
