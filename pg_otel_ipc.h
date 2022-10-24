@@ -3,7 +3,9 @@
 #ifndef PG_OTEL_IPC_H
 #define PG_OTEL_IPC_H
 
+#include "postgres.h"
 #include "postmaster/syslogger.h"
+#include "storage/latch.h"
 
 #define PG_OTEL_IPC_FINISHED 0x01
 #define PG_OTEL_IPC_LOGS     0x10
@@ -21,6 +23,10 @@ struct otelIPC
 	int pipe[2];
 #endif
 };
+
+static uint32 otel_AddReadEventToSet(struct otelIPC *ipc, WaitEventSet *set);
+static void otel_CloseWrite(struct otelIPC *ipc);
+static void otel_OpenIPC(struct otelIPC *ipc);
 
 static void
 otel_ReceiveOverIPC(struct otelIPC *ipc,

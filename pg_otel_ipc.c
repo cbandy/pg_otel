@@ -11,6 +11,45 @@
 
 #include "pg_otel_ipc.h"
 
+static uint32
+otel_AddReadEventToSet(struct otelIPC *ipc, WaitEventSet *set)
+{
+	Assert(ipc != NULL);
+	Assert(set != NULL);
+
+#ifndef WIN32
+	AddWaitEventToSet(set, WL_SOCKET_READABLE, ipc->pipe[0], NULL, NULL);
+	return WL_SOCKET_READABLE;
+#endif
+
+	return 0;
+}
+
+static void
+otel_CloseWrite(struct otelIPC *ipc)
+{
+	Assert(ipc != NULL);
+
+#ifndef WIN32
+	if (ipc->pipe[1] >= 0)
+		close(ipc->pipe[1]);
+	ipc->pipe[1] = -1;
+#endif
+}
+
+static void
+otel_OpenIPC(struct otelIPC *ipc)
+{
+	Assert(ipc != NULL);
+
+#ifndef WIN32
+	if (pipe(ipc->pipe) < 0)
+		ereport(FATAL,
+				(errcode_for_socket_access(),
+				 errmsg("could not create pipe: %m")));
+#endif
+}
+
 /*
  * Write message to ipc in atomic chunks.
  */
