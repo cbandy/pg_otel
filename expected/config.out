@@ -1,17 +1,18 @@
 -- vim: set expandtab shiftwidth=0 syntax=pgsql tabstop=2 :
 -- TEST: custom parameters and their defaults
-\pset format csv
+\pset format unaligned
 SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
   FROM pg_catalog.pg_settings
  WHERE name LIKE 'otel.%';
-name,setting,unit,context,vartype,min_val,max_val,enumvals
-otel.attribute_count_limit,128,,internal,integer,128,128,
-otel.export,,,sighup,string,,,
-otel.otlp_endpoint,http://localhost:4318,,sighup,string,,,
-otel.otlp_protocol,http/protobuf,,internal,string,,,
-otel.otlp_timeout,10000,ms,sighup,integer,1,3600000,
-otel.resource_attributes,,,sighup,string,,,
-otel.service_name,postgresql,,sighup,string,,,
+name|setting|unit|context|vartype|min_val|max_val|enumvals
+otel.attribute_count_limit|128||internal|integer|128|128|
+otel.export|||sighup|string|||
+otel.otlp_endpoint|http://localhost:4318||sighup|string|||
+otel.otlp_protocol|http/protobuf||internal|string|||
+otel.otlp_timeout|10000|ms|sighup|integer|1|3600000|
+otel.resource_attributes|||sighup|string|||
+otel.service_name|postgresql||sighup|string|||
+(7 rows)
 \pset format aligned
 -- TEST: endpoint requires scheme
 ALTER SYSTEM SET otel.otlp_endpoint TO 'localhost:8080';

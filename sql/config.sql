@@ -1,7 +1,7 @@
 -- vim: set expandtab shiftwidth=0 syntax=pgsql tabstop=2 :
 
 -- TEST: custom parameters and their defaults
-\pset format csv
+\pset format unaligned
 SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
   FROM pg_catalog.pg_settings
  WHERE name LIKE 'otel.%';

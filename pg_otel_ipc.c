@@ -5,7 +5,6 @@
 #include "postgres.h"
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
-#include "port/pg_bitutils.h"
 #include "postmaster/syslogger.h"
 #include "utils/elog.h"
 
@@ -130,7 +129,9 @@ otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 #endif
 		if (!(header.nuls[0] == '\0' && header.nuls[1] == '\0' &&
 			  header.len > 0 && header.len <= PIPE_MAX_PAYLOAD &&
-			  header.pid != 0 && pg_popcount((char *) &signal, 1) == 1))
+			  header.pid != 0 && (signal == PG_OTEL_IPC_LOGS ||
+								  signal == PG_OTEL_IPC_METRICS ||
+								  signal == PG_OTEL_IPC_TRACES)))
 		{
 			ereport(WARNING, (errmsg("unexpected otel message header")));
 
