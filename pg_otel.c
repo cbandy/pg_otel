@@ -13,6 +13,7 @@
 
 #include "pg_otel.h"
 #include "pg_otel_config.c"
+#include "pg_otel_logs.c"
 #include "pg_otel_proto.c"
 #include "pg_otel_worker.c"
 
@@ -34,9 +35,14 @@ void _PG_fini(void) {}
 /* BackgroundWorker entry point */
 void otel_WorkerMain(Datum arg) pg_attribute_noreturn();
 
+/* Hooks overridden by this module */
+static emit_log_hook_type next_EmitLogHook = NULL;
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_SharedMemoryRequestHook = NULL;
+#endif
+
 /* Variables set via GUC (parameters) */
 static struct otelConfiguration config;
-static struct otelResource resource;
 
 /* Values shared between backends and the background worker */
 static struct otelWorker worker;
@@ -62,6 +68,42 @@ otel_WorkerHandleSIGTERM(SIGNAL_ARGS)
 }
 
 /*
+ * Called when a log message is not suppressed by log_min_messages.
+ */
+static void
+otel_EmitLogHook(ErrorData *edata)
+{
+	/*
+	 * Export log messages when configured to do so. Sending messages *from*
+	 * the background worker *to* the background worker could cause a feedback
+	 * loop, so don't do that. These messages go to the next log processor
+	 * which is usually PostgreSQL's built-in logging_collector or stderr.
+	 */
+	if (config.exports.signals & PG_OTEL_CONFIG_LOGS && MyProcPid != worker.pid)
+		otel_SendLogMessage(&worker.ipc, edata);
+
+	if (next_EmitLogHook)
+		next_EmitLogHook(edata);
+}
+
+/*
+ * Since PostgreSQL 15, this hook is called after shared_preload_libraries
+ * are loaded (so their GUCs exist) and before shared memory and semaphores
+ * are initialized. Prior to PostgreSQL 15, modules must do this work in their
+ * own [_PG_init].
+ */
+static void
+otel_SharedMemoryRequestHook(void)
+{
+#if PG_VERSION_NUM >= 150000
+	if (prev_SharedMemoryRequestHook)
+		prev_SharedMemoryRequestHook();
+#endif
+
+	RequestNamedLWLockTranche(PG_OTEL_LIBRARY, PG_OTEL_LWLOCKS);
+}
+
+/*
  * Called in the background worker after being forked.
  */
 void
@@ -78,7 +120,8 @@ otel_WorkerMain(Datum arg)
 	worker.pid = MyProcPid;
 
 	otel_CloseWrite(&worker.ipc);
-	otel_WorkerRun(&worker, &config);
+	otel_WorkerRun(&worker, &config,
+				   GetNamedLWLockTranche(PG_OTEL_LIBRARY));
 
 	/* Exit zero so we aren't restarted */
 	proc_exit(0);
@@ -103,7 +146,6 @@ _PG_init(void)
 
 	otel_DefineCustomVariables(&config);
 	otel_ReadEnvironment();
-	otel_LoadResource(&config, &resource);
 	otel_OpenIPC(&worker.ipc);
 
 	/*
@@ -117,4 +159,16 @@ _PG_init(void)
 	snprintf(exporter.bgw_library_name, BGW_MAXLEN, PG_OTEL_LIBRARY);
 	snprintf(exporter.bgw_function_name, BGW_MAXLEN, "otel_WorkerMain");
 	RegisterBackgroundWorker(&exporter);
+
+	/* Request locks and other shared resources */
+#if PG_VERSION_NUM >= 150000
+	prev_SharedMemoryRequestHook = shmem_request_hook;
+	shmem_request_hook = otel_SharedMemoryRequestHook;
+#else
+	otel_SharedMemoryRequestHook();
+#endif
+
+	/* Install our log processor */
+	next_EmitLogHook = emit_log_hook;
+	emit_log_hook = otel_EmitLogHook;
 }

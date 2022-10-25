@@ -31,6 +31,26 @@ otel_InitProtobufCAllocator(ProtobufCAllocator *allocator, MemoryContext ctx)
 }
 
 static void
+otel_AttributeInt(OTEL_TYPE_COMMON(AnyValue) *anyValues,
+				  OTEL_TYPE_COMMON(KeyValue) *keyValues,
+				  OTEL_TYPE_COMMON(KeyValue) **attributes,
+				  size_t *n_attributes, const char *key, int value)
+{
+	size_t i = *n_attributes;
+
+	OTEL_FUNC_COMMON(any_value__init)(&anyValues[i]);
+	anyValues[i].int_value = value;
+	anyValues[i].value_case = OTEL_VALUE_CASE(INT);
+
+	OTEL_FUNC_COMMON(key_value__init)(&keyValues[i]);
+	keyValues[i].key = (char *)key;
+	keyValues[i].value = &anyValues[i];
+
+	attributes[i] = &keyValues[i];
+	*n_attributes += 1;
+}
+
+static void
 otel_AttributeStr(OTEL_TYPE_COMMON(AnyValue) *anyValues,
 				  OTEL_TYPE_COMMON(KeyValue) *keyValues,
 				  OTEL_TYPE_COMMON(KeyValue) **attributes,
@@ -57,6 +77,32 @@ otel_CompareKeyValueKeys(const void *a, const void *b)
 	const OTEL_TYPE_COMMON(KeyValue) *kvb = b;
 
 	return strcmp(kva->key, kvb->key);
+}
+
+static void
+otel_LogAttributeInt(struct otelLogRecord *r, const char *key, int value)
+{
+	Assert(r != NULL);
+	Assert(r->record.n_attributes < PG_OTEL_LOG_RECORD_MAX_ATTRIBUTES);
+
+	otel_AttributeInt(r->attrAnyValues,
+					  r->attrKeyValues,
+					  r->record.attributes,
+					  &r->record.n_attributes,
+					  key, value);
+}
+
+static void
+otel_LogAttributeStr(struct otelLogRecord *r, const char *key, const char *value)
+{
+	Assert(r != NULL);
+	Assert(r->record.n_attributes < PG_OTEL_LOG_RECORD_MAX_ATTRIBUTES);
+
+	otel_AttributeStr(r->attrAnyValues,
+					  r->attrKeyValues,
+					  r->record.attributes,
+					  &r->record.n_attributes,
+					  key, value);
 }
 
 static void

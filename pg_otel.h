@@ -6,4 +6,6 @@
 #define PG_OTEL_LIBRARY "pg_otel"
 #define PG_OTEL_VERSION "0.0.1"
 
+#define PG_OTEL_USERAGENT PG_OTEL_LIBRARY "/" PG_OTEL_VERSION
+
 #endif
