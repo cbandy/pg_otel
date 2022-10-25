@@ -5,7 +5,8 @@ MODULE_big = pg_otel
 OBJS = pg_otel.o $(OTEL_PROTO_FILES:.proto=.pb-c.o)
 
 OTEL_PROTO_NEEDED = collector/logs common resource logs
-OTEL_PROTO_FILES = $(wildcard $(patsubst %,opentelemetry/proto/%/*/*.proto,$(OTEL_PROTO_NEEDED)))
+OTEL_PROTO_FILES = $(patsubst opentelemetry-proto/%,%,\
+	$(wildcard $(patsubst %,opentelemetry-proto/opentelemetry/proto/%/*/*.proto,$(OTEL_PROTO_NEEDED))))
 
 REGRESS = config
 REGRESS_OPTS = --temp-config='test/postgresql.conf'
