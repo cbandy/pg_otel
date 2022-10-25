@@ -1,0 +1,73 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  installcheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql: [11,12,13,14,15]
+    steps:
+      - name: Install packages
+        env:
+          PG_MAJOR: ${{ matrix.postgresql }}
+        run: |
+          . /etc/os-release && sudo tee /etc/apt/sources.list.d/pgdg.list <<< \
+            "deb http://apt.postgresql.org/pub/repos/apt/ ${VERSION_CODENAME}-pgdg main ${PG_MAJOR}"
+          sudo apt-get update
+
+          sudo apt-get install postgresql-common
+          sudo tee -a /etc/postgresql-common/createcluster.conf <<< 'create_main_cluster = false'
+
+          set -x
+          sudo apt-get install libprotobuf-c-dev protobuf-c-compiler protobuf-compiler
+          sudo apt-get install --no-install-recommends 'libcurl?-openssl-dev' 'libkrb?-dev'
+          sudo apt-get install "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}"
+
+          echo >> $GITHUB_PATH "/usr/lib/postgresql/${PG_MAJOR}/bin"
+
+      - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+        with:
+          repository: open-telemetry/opentelemetry-proto
+          path: opentelemetry-proto
+          ref: v0.19.0
+
+      - run: make otel-protobufs
+      - run: make clean all
+      - run: sudo env PATH="$PATH" make install
+
+      - name: Start Collector
+        run: |
+          docker run --detach --network host --read-only \
+            --name 'collector' --user "$(id -u)" --volume "$(pwd):/mnt" --workdir '/mnt' \
+            ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:latest \
+            --config 'test/otel-collector.yaml' \
+            --set 'exporters.file.path=/mnt/.otel.ndjson'
+
+      - run: |
+          make installcheck EXTRA_REGRESS_OPTS="--temp-instance=$(mktemp -d)" && exit
+          failed=$?
+
+          if [ -s regression.diffs ]; then
+            tail -vn+0 regression.diffs
+          else
+            tail -vn+0 "$(pwd)/log/postmaster.log"
+          fi
+
+          if [ -s .otel.ndjson ]; then
+            tail -vn+0 .otel.ndjson
+          else
+            echo '::group::Collector logs'; docker logs 'collector'; echo '::endgroup::'
+          fi
+
+          exit $failed
+
+      - name: Stop Collector
+        run: docker stop 'collector' || true
