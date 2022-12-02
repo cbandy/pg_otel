@@ -1,6 +1,7 @@
 ---
-status: proposed
-date: 2022-11-01
+status: accepted
+date: 2022-12-01
+deciders: ['@cbandy']
 
 ---
 # Use Decision Records
