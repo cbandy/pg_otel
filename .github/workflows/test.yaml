@@ -18,9 +18,16 @@ jobs:
         env:
           PG_MAJOR: ${{ matrix.postgresql }}
         run: |
-          . /etc/os-release && sudo tee /etc/apt/sources.list.d/pgdg.list <<< \
-            "deb http://apt.postgresql.org/pub/repos/apt/ ${VERSION_CODENAME}-pgdg main ${PG_MAJOR}"
-          sudo apt-get update
+          wget -qO- 'https://www.postgresql.org/media/keys/ACCC4CF8.asc' |
+            gpg --dearmor | sudo tee /usr/share/keyrings/pgdg.gpg > /dev/null
+
+          (. /etc/os-release && sudo tee /etc/apt/sources.list.d/pgdg.list <<< \
+            "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt/ ${VERSION_CODENAME}-pgdg main ${PG_MAJOR}")
+
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist='sources.list.d/pgdg.list' \
+            -o Dir::Etc::sourceparts='-' \
+            -o APT::Get::List-Cleanup=0
 
           sudo apt-get install postgresql-common
           sudo tee -a /etc/postgresql-common/createcluster.conf <<< 'create_main_cluster = false'
