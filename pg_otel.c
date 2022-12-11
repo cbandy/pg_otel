@@ -100,7 +100,7 @@ otel_SharedMemoryRequestHook(void)
 		prev_SharedMemoryRequestHook();
 #endif
 
-	RequestNamedLWLockTranche(PG_OTEL_LIBRARY, PG_OTEL_LWLOCKS);
+	/* no-op */
 }
 
 /*
@@ -120,8 +120,7 @@ otel_WorkerMain(Datum arg)
 	worker.pid = MyProcPid;
 
 	otel_CloseWrite(&worker.ipc);
-	otel_WorkerRun(&worker, &config,
-				   GetNamedLWLockTranche(PG_OTEL_LIBRARY));
+	otel_WorkerRun(&worker, &config);
 
 	/* Exit zero so we aren't restarted */
 	proc_exit(0);
