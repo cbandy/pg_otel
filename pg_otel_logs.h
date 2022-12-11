@@ -4,63 +4,55 @@
 #define PG_OTEL_LOGS_H
 
 #include "postgres.h"
-#include "storage/latch.h"
-#include "storage/lwlock.h"
+#include "lib/ilist.h"
+#include "nodes/pg_list.h"
 #include "utils/palloc.h"
-
-#ifdef WIN32
-#include "pthread-win32.h"
-#else
-#include <pthread.h>
-#endif
 
 #include "curl/curl.h"
 
 #include "pg_otel_config.h"
 #include "pg_otel_proto.h"
 
+/*
+ * otelLogsBatch is a dlist_node of one memory context containing a list of
+ * ResourceLogs. That list can be sent as a single ExportLogsServiceRequest.
+ */
 struct otelLogsBatch
 {
+	dlist_node list_node;
+
 	MemoryContext context;
 	ProtobufCAllocator allocator;
 
 	int length, capacity, dropped;
 	OTEL_TYPE_LOGS(LogRecord) **records;
+
+	List *resourceLogs; /* OTEL_TYPE_LOGS(ResourceLogs) */
 };
-
-struct otelLogsThread
+struct otelLogsExporter
 {
-	sig_atomic_t volatile quit;
-	pthread_t thread;
-
-	CURL *http;
-	LWLock *lock;
-
-	struct Latch         batchLatch;
-	struct otelLogsBatch batchHold, batchSend;
-	struct otelResource  resource;
+	dlist_head queue; /* struct otelLogsBatch */
+	int batchMax, queueLength, queueMax;
 
 	char *endpoint;
 	bool  insecure;
 	int   timeoutMS;
+	struct otelResource resource;
 };
 
 static void
-otel_InitLogsThread(struct otelLogsThread *t, LWLock *lock, int batchCapacity);
+otel_InitLogsExporter(struct otelLogsExporter *exporter,
+					  const struct otelConfiguration *config);
 
 static void
-otel_LoadLogsConfig(struct otelLogsThread *t, struct otelConfiguration *config);
+otel_LoadLogsConfig(struct otelLogsExporter *exporter,
+					const struct otelConfiguration *config);
 
 static void
-otel_ReceiveLogMessage(struct otelLogsThread *t, const char *msg, size_t size);
+otel_ReceiveLogMessage(struct otelLogsExporter *exporter,
+					   const uint8_t *message, size_t size);
 
 static void
-otel_StartLogsThread(struct otelLogsThread *t);
-
-static void
-otel_WakeLogsThread(struct otelLogsThread *t);
-
-static void
-otel_WaitLogsThread(struct otelLogsThread *t);
+otel_SendLogsToCollector(struct otelLogsExporter *exporter, CURL *http);
 
 #endif

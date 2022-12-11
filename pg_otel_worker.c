@@ -2,7 +2,6 @@
 
 #include "postgres.h"
 #include "miscadmin.h"
-#include "storage/lwlock.h"
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/wait_event.h"
@@ -15,8 +14,6 @@
 #include "pg_otel_proto.h"
 #include "pg_otel_ipc.c"
 
-#define PG_OTEL_LWLOCKS 1
-
 struct otelWorker
 {
 	sig_atomic_t volatile gotSIGHUP;
@@ -26,41 +23,34 @@ struct otelWorker
 	int pid;
 };
 
-struct otelWorkerThreads
+struct otelWorkerExporter
 {
-	struct otelLogsThread logs;
-	bits8 received;
+	struct otelLogsExporter logs;
 };
 
 static void
-otel_WorkerReceive(void *ptr, bits8 signal, const char *message, size_t size)
+otel_WorkerReceive(void *ptr, bits8 signal, const uint8_t *message, size_t size)
 {
-	struct otelWorkerThreads *threads = ptr;
+	struct otelWorkerExporter *exporter = ptr;
 
-	Assert(threads != NULL);
-
-	threads->received |= signal;
+	Assert(exporter != NULL);
 
 	if (signal & PG_OTEL_IPC_LOGS)
-		otel_ReceiveLogMessage(&threads->logs, message, size);
+		otel_ReceiveLogMessage(&exporter->logs, message, size);
 }
 
 static void
-otel_WorkerRun(struct otelWorker *worker,
-			   struct otelConfiguration *config,
-			   LWLockPadded *locks)
+otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 {
-	struct otelWorkerThreads threads = {};
+	struct otelWorkerExporter exporter = {};
 	uint32 readEvent = 0;
 	WaitEventSet *wes;
+	CURL *http = curl_easy_init();
 
-	/*
-	 * TODO: Accept settings for "Batch LogRecord Processor"
-	 * - https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/
-	 */
-	otel_InitLogsThread(&threads.logs, &locks[0].lock, 500);
-	otel_LoadLogsConfig(&threads.logs, config);
-	otel_StartLogsThread(&threads.logs);
+	if (http == NULL)
+		ereport(FATAL, (errmsg("could not initialize curl for otel exporter")));
+
+	otel_InitLogsExporter(&exporter.logs, config);
 
 	/* Set up a WaitEventSet for our process latch and IPC */
 	wes = CreateWaitEventSet(CurrentMemoryContext, 3);
@@ -71,35 +61,35 @@ otel_WorkerRun(struct otelWorker *worker,
 	for (;;)
 	{
 		WaitEvent event;
+		int remainingData = 0;
 
-		/* Wait forever for some work */
-		WaitEventSetWait(wes, -1, &event, 1, PG_WAIT_EXTENSION);
+		/* Wait one second for some work */
+		WaitEventSetWait(wes, 1000, &event, 1, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
-
-		if (worker->gotSIGTERM)
-			break;
 
 		if (worker->gotSIGHUP)
 		{
 			worker->gotSIGHUP = false;
 			ProcessConfigFile(PGC_SIGHUP);
 
-			otel_LoadLogsConfig(&threads.logs, config);
+			otel_LoadLogsConfig(&exporter.logs, config);
 		}
 
 		if (event.events == readEvent)
+			otel_ReceiveOverIPC(&worker->ipc, &exporter, otel_WorkerReceive);
+
+		if (exporter.logs.queueLength > 0)
 		{
-			threads.received = 0;
-			otel_ReceiveOverIPC(&worker->ipc, &threads, otel_WorkerReceive);
-
-			if (threads.received & PG_OTEL_IPC_LOGS)
-				otel_WakeLogsThread(&threads.logs);
+			otel_SendLogsToCollector(&exporter.logs, http);
+			remainingData += exporter.logs.queueLength;
 		}
+
+		/*
+		 * Stop when the queues are empty and the IPC channel can be handed off
+		 * to postmaster.
+		 */
+		if (worker->gotSIGTERM && remainingData == 0 &&
+			otel_IPCIsIdle(&worker->ipc))
+			break;
 	}
-
-	/* TODO: flush; look for techniques around ShutdownXLOG */
-
-	threads.logs.quit = true;
-	otel_WakeLogsThread(&threads.logs);
-	otel_WaitLogsThread(&threads.logs);
 }

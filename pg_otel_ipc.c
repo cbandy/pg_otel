@@ -98,7 +98,7 @@ otel_SendOverIPC(struct otelIPC *ipc, bits8 signal, uint8_t *message, size_t siz
 static void
 otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 				  void (*dispatch)(void *opaque, bits8 signal,
-								   const char *message, size_t size))
+								   const uint8_t *message, size_t size))
 {
 	struct Portion
 	{
@@ -106,7 +106,7 @@ otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 		StringInfoData data;
 	};
 
-	char *cursor = ipc->buffer;
+	uint8_t *cursor = ipc->buffer;
 	int remaining = ipc->offset;
 
 	while (remaining >= (int) (PIPE_HEADER_SIZE + 1))
@@ -204,11 +204,13 @@ otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 			message = empty;
 			message->pid = header.pid;
 			initStringInfo((StringInfo) &(message->data));
+
+			ipc->unfinished++;
 		}
 
 		/* Append this chunk to its partial message */
 		appendBinaryStringInfo((StringInfo) &(message->data),
-							   cursor + PIPE_HEADER_SIZE, header.len);
+							   (char *)cursor + PIPE_HEADER_SIZE, header.len);
 
 #if PG_VERSION_NUM >= 150000
 		if (header.flags & PG_OTEL_IPC_FINISHED)
@@ -217,11 +219,13 @@ otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 #endif
 		{
 			/* The message is now complete; return it */
-			dispatch(opaque, signal, message->data.data, message->data.len);
+			dispatch(opaque, signal, (uint8_t *)message->data.data, message->data.len);
 
 			/* Mark the slot unused and reclaim storage */
 			message->pid = 0;
 			pfree(message->data.data);
+
+			ipc->unfinished--;
 		}
 
 		/* On to the next chunk */
@@ -241,7 +245,7 @@ otel_ProcessInput(struct otelIPC *ipc, void *opaque,
 static void
 otel_ReceiveOverIPC(struct otelIPC *ipc, void *opaque,
 					void (*dispatch)(void *opaque, bits8 signal,
-									 const char *message, size_t size))
+									 const uint8_t *message, size_t size))
 {
 	int n = 0;
 
@@ -267,8 +271,11 @@ otel_ReceiveOverIPC(struct otelIPC *ipc, void *opaque,
 		otel_ProcessInput(ipc, opaque, dispatch);
 	}
 	else
-	{
-		/* FIXME */
-		ereport(LOG, (errmsg("otel pipe EOF")));
-	}
+		ipc->eof = true;
+}
+
+static inline bool
+otel_IPCIsIdle(struct otelIPC *ipc)
+{
+	return ipc->eof || (ipc->offset == 0 && ipc->unfinished == 0);
 }

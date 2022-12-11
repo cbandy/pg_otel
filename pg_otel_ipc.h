@@ -15,9 +15,10 @@
 
 struct otelIPC
 {
-	List *buckets[3][256];
-	char  buffer[2 * PIPE_CHUNK_SIZE];
-	int   offset;
+	List    *buckets[3][256];
+	uint8_t  buffer[2 * PIPE_CHUNK_SIZE];
+	int      offset, unfinished;
+	bool     eof;
 
 #ifndef WIN32
 	int pipe[2];
@@ -32,7 +33,7 @@ static void
 otel_ReceiveOverIPC(struct otelIPC *ipc,
 					void *opaque,
 					void (*dispatch)(void *opaque, bits8 signal,
-									 const char *message, size_t size));
+									 const uint8_t *message, size_t size));
 
 static void
 otel_SendOverIPC(struct otelIPC *ipc,
