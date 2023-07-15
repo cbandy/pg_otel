@@ -10,7 +10,6 @@ RUN export APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1 \
 
 RUN export DEBIAN_FRONTEND=noninteractive \
  && apt-get update \
- && apt-get install --no-install-recommends --yes cgreen1 libcgreen1-dev \
  && apt-get install --no-install-recommends --yes postgresql-common libipc-run-perl \
  && apt-get install --no-install-recommends --yes libprotobuf-dev protobuf-compiler \
  && apt-get install --no-install-recommends --yes libprotobuf-c-dev protobuf-c-compiler \
