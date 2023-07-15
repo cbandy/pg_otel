@@ -17,6 +17,6 @@ RUN export DEBIAN_FRONTEND=noninteractive \
  && apt-get install --no-install-recommends --yes "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}"
 
 # https://opentelemetry.io/docs/collector/getting-started/#linux-packaging
-RUN REPO='open-telemetry/opentelemetry-collector-releases' VERSION=0.61.0 \
+RUN REPO='open-telemetry/opentelemetry-collector-releases' VERSION=0.81.0 \
  && wget "https://github.com/${REPO}/releases/download/v${VERSION}/otelcol_${VERSION}_linux_amd64.deb" \
  && dpkg --install "otelcol_${VERSION}_linux_amd64.deb"
