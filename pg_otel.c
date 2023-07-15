@@ -105,6 +105,12 @@ otel_ProcExitHook(int code, Datum arg)
 	worker.pid = MyProcPid;
 	otel_CloseWrite(&worker.ipc);
 	otel_WorkerDrain(&worker, &config);
+
+	/*
+	 * Finish with libcurl. It was initialized during [_PG_init].
+	 * - https://curl.se/libcurl/c/libcurl.html#GLOBAL
+	 */
+	curl_global_cleanup();
 }
 
 /*
@@ -158,7 +164,6 @@ _PG_init(void)
 
 	/*
 	 * Initialize libcurl as soon as possible; not all versions are thread-safe.
-	 * TODO: Call curl_global_cleanup before postgres terminates?
 	 * - https://curl.se/libcurl/c/libcurl.html#GLOBAL
 	 */
 	if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK)

@@ -70,6 +70,8 @@ otel_WorkerDrain(struct otelWorker *worker, struct otelConfiguration *config)
 		if (otel_WorkerReadIPC(&worker->ipc, &exporter, http))
 			break;
 	}
+
+	curl_easy_cleanup(http);
 }
 
 static void
@@ -118,4 +120,6 @@ otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 		if (worker->gotSIGTERM && idle)
 			break;
 	}
+
+	curl_easy_cleanup(http);
 }
