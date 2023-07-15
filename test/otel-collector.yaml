@@ -1,7 +1,8 @@
+# https://opentelemetry.io/docs/collector/configuration/
+
 receivers:
   otlp:
     protocols:
-      grpc:
       http:
 
 processors:
@@ -9,9 +10,13 @@ processors:
 
 exporters:
   file:
+    rotation:
 
 service:
   pipelines:
     logs:
       receivers: [otlp]
       exporters: [file]
+  telemetry:
+    metrics:
+      level: none
