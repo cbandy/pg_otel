@@ -29,7 +29,7 @@ jobs:
             -o Dir::Etc::sourceparts='-' \
             -o APT::Get::List-Cleanup=0
 
-          sudo apt-get install postgresql-common
+          sudo apt-get install postgresql-common libipc-run-perl
           sudo tee -a /etc/postgresql-common/createcluster.conf <<< 'create_main_cluster = false'
 
           set -x
@@ -38,6 +38,12 @@ jobs:
           sudo apt-get install "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}"
 
           echo >> $GITHUB_PATH "/usr/lib/postgresql/${PG_MAJOR}/bin"
+
+      - name: Install Collector
+        run: |
+          id=$(docker create ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:latest)
+          docker cp "${id}:/otelcol" - | tar -xC /usr/local/bin
+          docker rm "${id}"
 
       - uses: actions/checkout@v3
       - uses: actions/checkout@v3

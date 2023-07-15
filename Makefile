@@ -10,6 +10,7 @@ OTEL_PROTO_FILES = $(patsubst opentelemetry-proto/%,%,\
 
 REGRESS = config
 REGRESS_OPTS = --temp-config='test/postgresql.conf'
+TAP_TESTS = yes
 
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
