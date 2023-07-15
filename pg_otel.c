@@ -75,15 +75,36 @@ otel_EmitLogHook(ErrorData *edata)
 {
 	/*
 	 * Export log messages when configured to do so. Sending messages *from*
-	 * the background worker *to* the background worker could cause a feedback
-	 * loop, so don't do that. These messages go to the next log processor
-	 * which is usually PostgreSQL's built-in logging_collector or stderr.
+	 * the exporter *to* the exporter could cause a feedback loop, so don't
+	 * do that. These messages still go to the next log processor which is
+	 * usually PostgreSQL's built-in logging_collector or stderr.
 	 */
 	if (config.exports.signals & PG_OTEL_CONFIG_LOGS && MyProcPid != worker.pid)
 		otel_SendLogMessage(&worker.ipc, edata);
 
 	if (next_EmitLogHook)
 		next_EmitLogHook(edata);
+}
+
+/*
+ * Called after client backends and background workers have stopped, when
+ * postmaster is shutting down.
+ */
+static void
+otel_ProcExitHook(int code, Datum arg)
+{
+	/* Should already be the case, but check anyway */
+	if (MyProcPid != PostmasterPid)
+		return;
+
+	/*
+	 * Some telemetry data is emitted even after the background worker has
+	 * stopped. Notice when any further data is from postmaster itself, and
+	 * flush the pipe.
+	 */
+	worker.pid = MyProcPid;
+	otel_CloseWrite(&worker.ipc);
+	otel_WorkerDrain(&worker, &config);
 }
 
 /*
@@ -166,6 +187,9 @@ _PG_init(void)
 #else
 	otel_SharedMemoryRequestHook();
 #endif
+
+	/* Cleanup on postmaster exit */
+	on_proc_exit(otel_ProcExitHook, 0);
 
 	/* Install our log processor */
 	next_EmitLogHook = emit_log_hook;

@@ -39,6 +39,39 @@ otel_WorkerReceive(void *ptr, bits8 signal, const uint8_t *message, size_t size)
 		otel_ReceiveLogMessage(&exporter->logs, message, size);
 }
 
+static bool
+otel_WorkerReadIPC(struct otelIPC *ipc, struct otelWorkerExporter *exporter, CURL *http)
+{
+	Assert(exporter != NULL);
+	Assert(http != NULL);
+	Assert(ipc != NULL);
+
+	otel_ReceiveOverIPC(ipc, exporter, otel_WorkerReceive);
+
+	if (exporter->logs.queueLength > 0)
+		otel_SendLogsToCollector(&exporter->logs, http);
+
+	return exporter->logs.queueLength == 0 && otel_IPCIsIdle(ipc);
+}
+
+static void
+otel_WorkerDrain(struct otelWorker *worker, struct otelConfiguration *config)
+{
+	struct otelWorkerExporter exporter = {};
+	CURL *http = curl_easy_init();
+
+	if (http == NULL)
+		ereport(FATAL, (errmsg("could not initialize curl for otel exporter")));
+
+	otel_InitLogsExporter(&exporter.logs, config);
+
+	for (;;)
+	{
+		if (otel_WorkerReadIPC(&worker->ipc, &exporter, http))
+			break;
+	}
+}
+
 static void
 otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 {
@@ -60,8 +93,8 @@ otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 
 	for (;;)
 	{
-		WaitEvent event;
-		int remainingData = 0;
+		WaitEvent event = {};
+		bool idle = true;
 
 		/* Wait one second for some work */
 		WaitEventSetWait(wes, 1000, &event, 1, PG_WAIT_EXTENSION);
@@ -76,20 +109,13 @@ otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 		}
 
 		if (event.events == readEvent)
-			otel_ReceiveOverIPC(&worker->ipc, &exporter, otel_WorkerReceive);
-
-		if (exporter.logs.queueLength > 0)
-		{
-			otel_SendLogsToCollector(&exporter.logs, http);
-			remainingData += exporter.logs.queueLength;
-		}
+			idle = otel_WorkerReadIPC(&worker->ipc, &exporter, http);
 
 		/*
 		 * Stop when the queues are empty and the IPC channel can be handed off
 		 * to postmaster.
 		 */
-		if (worker->gotSIGTERM && remainingData == 0 &&
-			otel_IPCIsIdle(&worker->ipc))
+		if (worker->gotSIGTERM && idle)
 			break;
 	}
 }
