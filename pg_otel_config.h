@@ -10,6 +10,11 @@
 #define PG_OTEL_LOG_RECORD_MAX_ATTRIBUTES 20
 #define PG_OTEL_RESOURCE_MAX_ATTRIBUTES 128
 
+struct otelBaggageConfiguration
+{
+	char *parsed;
+	char *text;
+};
 struct otelSignalConfiguration
 {
 	int signals;
@@ -28,7 +33,7 @@ struct otelConfiguration
 	struct otelSignalConfiguration exports;
 	struct otlpConfiguration otlp;
 	struct otlpConfiguration otlpLogs;
-	char *resourceAttributes;
+	struct otelBaggageConfiguration resourceAttributes;
 	char *serviceName;
 };
 

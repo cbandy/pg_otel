@@ -143,8 +143,9 @@ static void
 otel_LoadResource(const struct otelConfiguration *src, struct otelResource *dst)
 {
 	size_t i;
-	const char *value;
+	const char *key, *pos, *value;
 
+	Assert(src != NULL);
 	Assert(dst != NULL);
 	Assert(dst->resource.n_attributes < PG_OTEL_RESOURCE_MAX_ATTRIBUTES);
 
@@ -177,7 +178,15 @@ otel_LoadResource(const struct otelConfiguration *src, struct otelResource *dst)
 	/*
 	 * Add attributes from src->resourceAttributes, if any.
 	 */
-	// TODO: Baggage!
+	pos = src->resourceAttributes.parsed;
+	while (*pos != '\0')
+	{
+		key = pos;
+		value = key + strlen(key) + 1;
+		pos = value + strlen(value) + 1;
+
+		otel_ResourceAttributeStr(dst, key, value);
+	}
 
 	/*
 	 * Finally, add attributes that cannot be overridden by src.

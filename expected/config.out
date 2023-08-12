@@ -21,6 +21,19 @@ DETAIL:  URL must begin with http or https.
 -- TEST: protocol cannot be changed
 ALTER SYSTEM SET otel.otlp_protocol TO 'grpc';
 ERROR:  parameter "otel.otlp_protocol" cannot be changed
+-- TEST: attributes must be W3C Baggage
+ALTER SYSTEM SET otel.resource_attributes TO 'one=two, three=4 ';
+ALTER SYSTEM SET otel.resource_attributes TO 'five=,six=Am%C3%A9lie';
+ALTER SYSTEM SET otel.resource_attributes TO 'keynovalue';
+ERROR:  invalid value for parameter "otel.resource_attributes": "keynovalue"
+DETAIL:  baggage syntax is invalid.
+ALTER SYSTEM SET otel.resource_attributes TO '=valuenokey';
+ERROR:  invalid value for parameter "otel.resource_attributes": "=valuenokey"
+DETAIL:  baggage syntax is invalid.
+ALTER SYSTEM SET otel.resource_attributes TO 'k=v,';
+ERROR:  invalid value for parameter "otel.resource_attributes": "k=v,"
+DETAIL:  baggage syntax is invalid.
+ALTER SYSTEM RESET otel.resource_attributes;
 -- TEST: service.name cannot be blank
 ALTER SYSTEM SET otel.service_name TO '';
 ERROR:  invalid value for parameter "otel.service_name": ""
