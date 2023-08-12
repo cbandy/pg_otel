@@ -10,7 +10,9 @@
 
 #if PG_VERSION_NUM < 160000
 /* https://git.postgresql.org/gitweb/?p=postgresql.git;h=0a20ff54f5e661589 */
+/* https://git.postgresql.org/gitweb/?p=postgresql.git;h=407b50f2d421bca5b */
 #include "utils/elog.h"
+#define guc_free free
 static void *guc_malloc(int elevel, size_t size)
 {
 	void *data = malloc(size);
@@ -20,14 +22,16 @@ static void *guc_malloc(int elevel, size_t size)
 				 errmsg("out of memory")));
 	return data;
 }
+static char *guc_strdup(int elevel, const char *src)
+{
+	char *data = strdup(src);
+	if (data == NULL)
+		ereport(elevel,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	return data;
+}
 #endif
-
-/*
- * The GUC system expects variables to be assigned statically, so hooks are
- * called without any destination pointers. We pretty much do the same.
- * Pass some pointers from [otel_DefineCustomVariables] to hooks through here.
- */
-static struct otelSignalConfiguration *gucExportsHook = NULL;
 
 static bool
 otel_CheckBaggage(char **next, void **extra, GucSource source)
@@ -90,11 +94,11 @@ otel_CheckExports(char **next, void **extra, GucSource source)
 	ListCell *cell = NULL;
 	List     *list = NULL;
 
-	parsed.text = pstrdup(*next);
+	parsed.text = guc_strdup(ERROR, *next);
 	if (!SplitIdentifierString(parsed.text, ',', &list))
 	{
 		GUC_check_errdetail("List syntax is invalid.");
-		pfree(parsed.text);
+		guc_free(parsed.text);
 		list_free(list);
 		return false;
 	}
@@ -109,19 +113,19 @@ otel_CheckExports(char **next, void **extra, GucSource source)
 		else
 		{
 			GUC_check_errdetail("Unrecognized signal: \"%s\".", item);
-			pfree(parsed.text);
+			guc_free(parsed.text);
 			list_free(list);
 			return false;
 		}
 	}
 
-	pfree(parsed.text);
+	guc_free(parsed.text);
 	parsed.text = NULL;
 	list_free(list);
 
 	/* This will be freed by PostgreSQL GUC */
-	*extra = guc_malloc(ERROR, sizeof(struct otelSignalConfiguration));
-	memcpy(*extra, &parsed, sizeof(struct otelSignalConfiguration));
+	*extra = guc_malloc(ERROR, sizeof(parsed));
+	memcpy(*extra, &parsed, sizeof(parsed));
 	return true;
 }
 
@@ -131,7 +135,7 @@ otel_AssignExports(const char *next, void *extra)
 	struct otelSignalConfiguration *parsed =
 		(struct otelSignalConfiguration *) extra;
 
-	gucExportsHook->signals = parsed->signals;
+	config.exports.signals = parsed->signals;
 }
 
 static bool
@@ -162,27 +166,26 @@ otel_CustomVariableEnv(const char *opt, const char *env)
 }
 
 static void
-otel_DefineCustomVariables(struct otelConfiguration *dst)
+otel_DefineCustomVariables()
 {
 	DefineCustomIntVariable
 		("otel.attribute_count_limit",
 		 "Maximum attributes allowed on each signal",
 		 NULL,
 
-		 &dst->attributeCountLimit,
+		 &config.attributeCountLimit,
 		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
 		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
 		 PG_OTEL_RESOURCE_MAX_ATTRIBUTES,
 
 		 PGC_INTERNAL, 0, NULL, NULL, NULL);
 
-	gucExportsHook = &dst->exports;
 	DefineCustomStringVariable
 		("otel.export",
 		 "Signals to export over OTLP",
 		 "May be empty or \"logs\".",
 
-		 &dst->exports.text,
+		 &config.exports.text,
 		 "",
 
 		 PGC_SIGHUP, GUC_LIST_INPUT,
@@ -195,7 +198,7 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 "A scheme of https indicates a secure connection."
 		 " The per-signal endpoint configuration options take precedence.",
 
-		 &dst->otlp.endpoint,
+		 &config.otlp.endpoint,
 		 "http://localhost:4318",
 
 		 PGC_SIGHUP, 0, otel_CheckEndpoint, NULL, NULL);
@@ -205,7 +208,7 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 "The exporter transport protocol",
 		 NULL,
 
-		 &dst->otlp.protocol,
+		 &config.otlp.protocol,
 		 "http/protobuf",
 
 		 PGC_INTERNAL, 0, NULL, NULL, NULL);
@@ -215,7 +218,7 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 "Maximum time the exporter will wait for each batch export",
 		 NULL,
 
-		 &dst->otlp.timeoutMS,
+		 &config.otlp.timeoutMS,
 		 10 * 1000L, 1, 60 * 60 * 1000L, /* 10sec; between 1ms and 60min */
 
 		 PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
@@ -226,7 +229,7 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 
 		 "Formatted as W3C Baggage.",
 
-		 &dst->resourceAttributes,
+		 &config.resourceAttributes,
 		 NULL,
 
 		 PGC_SIGHUP, 0, otel_CheckBaggage, NULL, NULL);
@@ -236,7 +239,7 @@ otel_DefineCustomVariables(struct otelConfiguration *dst)
 		 "Logical name of this service",
 		 NULL,
 
-		 &dst->serviceName,
+		 &config.serviceName,
 		 "postgresql",
 
 		 PGC_SIGHUP, 0, otel_CheckServiceName, NULL, NULL);
