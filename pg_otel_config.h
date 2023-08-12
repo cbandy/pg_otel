@@ -32,4 +32,6 @@ struct otelConfiguration
 	char *serviceName;
 };
 
+static struct otelConfiguration config;
+
 #endif

@@ -169,7 +169,7 @@ _PG_init(void)
 	if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK)
 		ereport(ERROR, (errmsg("unable to initialize libcurl")));
 
-	otel_DefineCustomVariables(&config);
+	otel_DefineCustomVariables();
 	otel_ReadEnvironment();
 	otel_OpenIPC(&worker.ipc);
 
