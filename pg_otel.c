@@ -21,19 +21,19 @@
 PG_MODULE_MAGIC;
 
 /* Called when the module is loaded */
-void _PG_init(void);
+PGDLLEXPORT void _PG_init(void);
 
 #if PG_VERSION_NUM < 150000
 /*
  * Called when the module is unloaded, which is never.
  * - https://git.postgresql.org/gitweb/?p=postgresql.git;f=src/backend/utils/fmgr/dfmgr.c;hb=REL_11_0#l389
  */
-void _PG_fini(void);
-void _PG_fini(void) {}
+PGDLLEXPORT void _PG_fini(void);
+PGDLLEXPORT void _PG_fini(void) {}
 #endif
 
 /* BackgroundWorker entry point */
-void otel_WorkerMain(Datum arg) pg_attribute_noreturn();
+PGDLLEXPORT void otel_WorkerMain(Datum arg) pg_attribute_noreturn();
 
 /* Hooks overridden by this module */
 static emit_log_hook_type next_EmitLogHook = NULL;
