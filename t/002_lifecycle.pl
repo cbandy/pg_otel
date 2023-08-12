@@ -37,7 +37,8 @@ otel.otlp_endpoint = http://localhost:${otlp_port}
 ));
 $node->start();
 
-# Expect events from startup to be exported
+
+# TEST: Events from startup should be exported
 my $otlp_json = slurp_file($otlp_file);
 like($otlp_json, qr/
 	.+?"severityText":"LOG","body":\{"stringValue":"starting\ PostgreSQL
@@ -47,7 +48,8 @@ like($otlp_json, qr/
 # Stop PostgreSQL
 $node->stop();
 
-# Expect events from shutdown to be exported
+
+# TEST: Events from shutdown should be exported
 # - The "shutting down" message is emitted by the checkpointer process.
 # - The "database system is shut down" message is emitted by postmaster during
 #   an on_proc_exit hook. [miscinit.c]
@@ -55,6 +57,7 @@ $otlp_json = slurp_file($otlp_file, length($otlp_json));
 like($otlp_json, qr/
 	.+?"severityText":"LOG","body":\{"stringValue":"shutting\ down"
 /sx, 'works for final messages');
+
 
 # Stop the OpenTelemetry Collector
 $collector->kill_kill();
