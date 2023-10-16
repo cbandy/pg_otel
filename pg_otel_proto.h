@@ -4,6 +4,7 @@
 #define PG_OTEL_PROTO_H
 
 #include "opentelemetry/proto/collector/logs/v1/logs_service.pb-c.h"
+#include "opentelemetry/proto/collector/trace/v1/trace_service.pb-c.h"
 #include "opentelemetry/proto/resource/v1/resource.pb-c.h"
 
 #include "pg_otel_config.h"
@@ -12,6 +13,7 @@
 #define OTEL_FUNC_COMMON(name)   OTEL_FUNC_PROTO(common__v1__ ## name)
 #define OTEL_FUNC_LOGS(name)     OTEL_FUNC_PROTO(logs__v1__ ## name)
 #define OTEL_FUNC_RESOURCE(name) OTEL_FUNC_PROTO(resource__v1__ ## name)
+#define OTEL_FUNC_TRACE(name)    OTEL_FUNC_PROTO(trace__v1__ ## name)
 #define OTEL_FUNC_EXPORT_LOGS(name) \
 	OTEL_FUNC_PROTO(collector__logs__v1__export_logs_service_ ## name)
 
@@ -19,11 +21,15 @@
 #define OTEL_TYPE_COMMON(name)   OTEL_TYPE_PROTO(Common__V1__ ## name)
 #define OTEL_TYPE_LOGS(name)     OTEL_TYPE_PROTO(Logs__V1__ ## name)
 #define OTEL_TYPE_RESOURCE(name) OTEL_TYPE_PROTO(Resource__V1__ ## name)
+#define OTEL_TYPE_TRACE(name)    OTEL_TYPE_PROTO(Trace__V1__ ## name)
 #define OTEL_TYPE_EXPORT_LOGS(name) \
 	OTEL_TYPE_PROTO(Collector__Logs__V1__ExportLogsService ## name)
 
 #define OTEL_SEVERITY_NUMBER(name) \
 	OPENTELEMETRY__PROTO__LOGS__V1__SEVERITY_NUMBER__SEVERITY_NUMBER_ ## name
+
+#define OTEL_SPAN_KIND(name) \
+	OPENTELEMETRY__PROTO__TRACE__V1__SPAN__SPAN_KIND__SPAN_KIND_ ## name
 
 #define OTEL_VALUE_CASE(name) \
 	OPENTELEMETRY__PROTO__COMMON__V1__ANY_VALUE__VALUE_ ## name ## _VALUE
@@ -52,7 +58,7 @@ otel_InitLogRecord(struct otelLogRecord *r)
 }
 
 static void
-otel_LogAttributeInt(struct otelLogRecord *r, const char *key, int value);
+otel_LogAttributeInt(struct otelLogRecord *r, const char *key, int64_t value);
 
 static void
 otel_LogAttributeStr(struct otelLogRecord *r, const char *key, const char *value);
@@ -77,5 +83,33 @@ otel_InitResource(struct otelResource *r)
 
 static void
 otel_LoadResource(const struct otelConfiguration *src, struct otelResource *dst);
+
+struct otelSpan
+{
+	OTEL_TYPE_TRACE(Span)       span;
+	OTEL_TYPE_TRACE(Status)     status;
+	OTEL_TYPE_COMMON(AnyValue)  attrAnyValues[PG_OTEL_SPAN_MAX_ATTRIBUTES];
+	OTEL_TYPE_COMMON(KeyValue)  attrKeyValues[PG_OTEL_SPAN_MAX_ATTRIBUTES];
+	OTEL_TYPE_COMMON(KeyValue) *attrList[PG_OTEL_SPAN_MAX_ATTRIBUTES];
+
+	uint8_t id[8];
+	uint8_t parent[8];
+	uint8_t trace[16];
+};
+
+static void
+otel_InitSpan(struct otelSpan *s)
+{
+	Assert(s != NULL);
+
+	OTEL_FUNC_TRACE(span__init)(&s->span);
+	OTEL_FUNC_TRACE(status__init)(&s->status);
+
+	s->span.attributes = s->attrList;
+	s->span.span_id.data = s->id;
+	s->span.span_id.len = sizeof(s->id);
+	s->span.trace_id.data = s->trace;
+	s->span.trace_id.len = sizeof(s->trace);
+}
 
 #endif

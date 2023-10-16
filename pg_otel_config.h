@@ -9,6 +9,7 @@
 
 #define PG_OTEL_LOG_RECORD_MAX_ATTRIBUTES 20
 #define PG_OTEL_RESOURCE_MAX_ATTRIBUTES 128
+#define PG_OTEL_SPAN_MAX_ATTRIBUTES 20
 
 struct otelBaggageConfiguration
 {

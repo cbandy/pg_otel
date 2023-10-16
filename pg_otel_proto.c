@@ -34,7 +34,7 @@ static void
 otel_AttributeInt(OTEL_TYPE_COMMON(AnyValue) *anyValues,
 				  OTEL_TYPE_COMMON(KeyValue) *keyValues,
 				  OTEL_TYPE_COMMON(KeyValue) **attributes,
-				  size_t *n_attributes, const char *key, int value)
+				  size_t *n_attributes, const char *key, int64_t value)
 {
 	size_t i = *n_attributes;
 
@@ -80,7 +80,7 @@ otel_CompareKeyValueKeys(const void *a, const void *b)
 }
 
 static void
-otel_LogAttributeInt(struct otelLogRecord *r, const char *key, int value)
+otel_LogAttributeInt(struct otelLogRecord *r, const char *key, int64_t value)
 {
 	Assert(r != NULL);
 	Assert(r->record.n_attributes < PG_OTEL_LOG_RECORD_MAX_ATTRIBUTES);
@@ -137,6 +137,19 @@ otel_ResourceAttributeStr(struct otelResource *r,
 	}
 	else
 		r->resource.dropped_attributes_count++;
+}
+
+static void
+otel_SpanAttributeInt(struct otelSpan *s, const char *key, int64_t value)
+{
+	Assert(s != NULL);
+	Assert(s->span.n_attributes < PG_OTEL_SPAN_MAX_ATTRIBUTES);
+
+	otel_AttributeInt(s->attrAnyValues,
+					  s->attrKeyValues,
+					  s->span.attributes,
+					  &s->span.n_attributes,
+					  key, value);
 }
 
 static void

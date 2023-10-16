@@ -2,11 +2,13 @@
 
 #include "postgres.h"
 
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "tcop/utility.h"
 #include "utils/elog.h"
 
 #include "curl/curl.h"
@@ -15,6 +17,7 @@
 #include "pg_otel_config.c"
 #include "pg_otel_logs.c"
 #include "pg_otel_proto.c"
+#include "pg_otel_traces.c"
 #include "pg_otel_worker.c"
 
 /* Dynamically loadable module */
@@ -37,12 +40,17 @@ PGDLLEXPORT void otel_WorkerMain(Datum arg) pg_attribute_noreturn();
 
 /* Hooks overridden by this module */
 static emit_log_hook_type next_EmitLogHook = NULL;
+static ExecutorRun_hook_type next_ExecutorRunHook = NULL;
+static ProcessUtility_hook_type next_ProcessUtilityHook = NULL;
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_SharedMemoryRequestHook = NULL;
 #endif
 
 /* Variables set via GUC (parameters) */
 static struct otelConfiguration config;
+
+/* FIXME */
+static struct otelSpan *currentSpan;
 
 /* Values shared between backends and the background worker */
 static struct otelWorker worker;
@@ -84,6 +92,85 @@ otel_EmitLogHook(ErrorData *edata)
 
 	if (next_EmitLogHook)
 		next_EmitLogHook(edata);
+}
+
+/*
+ * Called when FIXME
+ */
+static void
+otel_ExecutorRun(QueryDesc *query, ScanDirection dir, uint64 count, bool once)
+{
+	struct otelSpan *priorSpan = currentSpan;
+	struct otelSpan *span = NULL;
+
+	/*
+	 * Prepare a span for this query when configured to do so.
+	 *
+	 * TODO: trace configuration
+	 */
+	if (true || (config.exports.signals & PG_OTEL_CONFIG_TRACES))
+	{
+		span = otel_StartSpan(CurTransactionContext, currentSpan, query->sourceText);
+		currentSpan = span;
+	}
+
+	PG_TRY();
+	{
+		next_ExecutorRunHook(query, dir, count, once);
+	}
+	PG_FINALLY();
+	{
+		currentSpan = priorSpan;
+	}
+	PG_END_TRY();
+
+	if (span != NULL)
+	{
+		otel_EndQuerySpan(span, query);
+		otel_SendSpan(&worker.ipc, span);
+
+		pfree(span);
+	}
+}
+
+static void
+otel_ProcessUtility(PlannedStmt *planned, const char *unparsed,
+					bool readOnlyTree, ProcessUtilityContext context,
+					ParamListInfo params, QueryEnvironment *environment,
+					DestReceiver *receiver, QueryCompletion *completion)
+{
+	struct otelSpan *priorSpan = currentSpan;
+	struct otelSpan *span = NULL;
+
+	/*
+	 * Prepare a span for this statement when configured to do so.
+	 *
+	 * TODO: trace configuration
+	 */
+	if (true || (config.exports.signals & PG_OTEL_CONFIG_TRACES))
+	{
+		span = otel_StartSpan(CurTransactionContext, currentSpan, unparsed);
+		currentSpan = span;
+	}
+
+	PG_TRY();
+	{
+		next_ProcessUtilityHook(planned, unparsed, readOnlyTree, context,
+								params, environment, receiver, completion);
+	}
+	PG_FINALLY();
+	{
+		currentSpan = priorSpan;
+	}
+	PG_END_TRY();
+
+	if (span != NULL)
+	{
+		otel_EndUtilitySpan(span, context, planned);
+		otel_SendSpan(&worker.ipc, span);
+
+		pfree(span);
+	}
 }
 
 /*
@@ -185,7 +272,7 @@ _PG_init(void)
 	snprintf(exporter.bgw_function_name, BGW_MAXLEN, "otel_WorkerMain");
 	RegisterBackgroundWorker(&exporter);
 
-	/* Request locks and other shared resources */
+	/* Request locks and other shared resources, miscadmin.h */
 #if PG_VERSION_NUM >= 150000
 	prev_SharedMemoryRequestHook = shmem_request_hook;
 	shmem_request_hook = otel_SharedMemoryRequestHook;
@@ -196,7 +283,13 @@ _PG_init(void)
 	/* Cleanup on postmaster exit */
 	on_proc_exit(otel_ProcExitHook, 0);
 
-	/* Install our log processor */
+	/* Install our log processor, elog.h */
 	next_EmitLogHook = emit_log_hook;
 	emit_log_hook = otel_EmitLogHook;
+
+	/* Install our query processor, executor.h, utility.h */
+	next_ExecutorRunHook = ExecutorRun_hook ? ExecutorRun_hook : standard_ExecutorRun;
+	next_ProcessUtilityHook = ProcessUtility_hook ? ProcessUtility_hook : standard_ProcessUtility;
+	ExecutorRun_hook = otel_ExecutorRun;
+	ProcessUtility_hook = otel_ProcessUtility;
 }

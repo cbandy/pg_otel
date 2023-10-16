@@ -4,7 +4,7 @@
 MODULE_big = pg_otel
 OBJS = pg_otel.o $(OTEL_PROTO_FILES:.proto=.pb-c.o)
 
-OTEL_PROTO_NEEDED = collector/logs common resource logs
+OTEL_PROTO_NEEDED = collector/logs collector/trace common resource logs trace
 OTEL_PROTO_FILES = $(patsubst opentelemetry-proto/%,%,\
 	$(wildcard $(patsubst %,opentelemetry-proto/opentelemetry/proto/%/*/*.proto,$(OTEL_PROTO_NEEDED))))
 
