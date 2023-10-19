@@ -10,9 +10,9 @@
 #endif
 
 #include "pg_otel_config.h"
-#include "pg_otel_logs.h"
-#include "pg_otel_proto.h"
 #include "pg_otel_ipc.c"
+#include "pg_otel_logs.h"
+#include "pg_otel_traces.h"
 
 struct otelWorker
 {
@@ -26,6 +26,7 @@ struct otelWorker
 struct otelWorkerExporter
 {
 	struct otelLogsExporter logs;
+	struct otelTraceExporter traces;
 };
 
 static void
@@ -37,6 +38,9 @@ otel_WorkerReceive(void *ptr, bits8 signal, const uint8_t *message, size_t size)
 
 	if (signal & PG_OTEL_IPC_LOGS)
 		otel_ReceiveLogMessage(&exporter->logs, message, size);
+
+	if (signal & PG_OTEL_IPC_TRACES)
+		otel_ReceiveSpan(&exporter->traces, message, size);
 }
 
 static bool
@@ -51,7 +55,13 @@ otel_WorkerReadIPC(struct otelIPC *ipc, struct otelWorkerExporter *exporter, CUR
 	if (exporter->logs.queueLength > 0)
 		otel_SendLogsToCollector(&exporter->logs, http);
 
-	return exporter->logs.queueLength == 0 && otel_IPCIsIdle(ipc);
+	if (exporter->traces.queueLength > 0)
+		otel_SendSpansToCollector(&exporter->traces, http);
+
+	return
+		exporter->logs.queueLength == 0 &&
+		exporter->traces.queueLength == 0 &&
+		otel_IPCIsIdle(ipc);
 }
 
 static void
@@ -64,6 +74,7 @@ otel_WorkerDrain(struct otelWorker *worker, struct otelConfiguration *config)
 		ereport(FATAL, (errmsg("could not initialize curl for otel exporter")));
 
 	otel_InitLogsExporter(&exporter.logs, config);
+	otel_InitTraceExporter(&exporter.traces, config);
 
 	for (;;)
 	{
@@ -86,6 +97,7 @@ otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 		ereport(FATAL, (errmsg("could not initialize curl for otel exporter")));
 
 	otel_InitLogsExporter(&exporter.logs, config);
+	otel_InitTraceExporter(&exporter.traces, config);
 
 	/* Set up a WaitEventSet for our process latch and IPC */
 	wes = CreateWaitEventSet(CurrentMemoryContext, 3);
@@ -108,6 +120,7 @@ otel_WorkerRun(struct otelWorker *worker, struct otelConfiguration *config)
 			ProcessConfigFile(PGC_SIGHUP);
 
 			otel_LoadLogsConfig(&exporter.logs, config);
+			otel_LoadTraceConfig(&exporter.traces, config);
 		}
 
 		if (event.events == readEvent)

@@ -131,7 +131,7 @@ otel_SendLogMessage(struct otelIPC *ipc, const ErrorData *edata)
 
 	/*
 	 * Set attributes according to OpenTelemetry Semantic Conventions.
-	 * - https://docs.opentelemetry.io/reference/specification/overview/
+	 * - https://opentelemetry.io/docs/specs/otel/semantic-conventions/
 	 */
 
 	if (MyProcPid != 0) /* miscadmin.h */
@@ -355,8 +355,8 @@ otel_SendLogsRequestToCollector(MemoryContext ctx, CURL *http,
 	/*
 	 * TODO: gzip encoding
 	 * TODO: retry and backoff
-	 * - https://opentelemetry.io/docs/reference/specification/protocol/otlp/
-	 * - https://opentelemetry.io/docs/reference/specification/protocol/exporter/
+	 * - https://opentelemetry.io/docs/specs/otlp/
+	 * - https://opentelemetry.io/docs/specs/otel/protocol/exporter/
 	 */
 
 #ifdef PG_OTEL_DEBUG
@@ -397,7 +397,7 @@ otel_SendLogsToCollector(struct otelLogsExporter *exporter, CURL *http)
 
 	/*
 	 * All log records come from the same instrumentation scope: this module.
-	 * - https://docs.opentelemetry.io/reference/specification/glossary/#instrumentation-scope
+	 * - https://opentelemetry.io/docs/specs/otel/glossary/#instrumentation-scope
 	 */
 	scopeData.name = PG_OTEL_LIBRARY;
 	scopeData.version = PG_OTEL_VERSION;
@@ -460,7 +460,7 @@ otel_LoadLogsConfig(struct otelLogsExporter *exporter,
 	 * Without a per-signal configuration, the OTLP endpoint is a base URL and
 	 * signals are sent relative to that.
 	 *
-	 * - https://opentelemetry.io/docs/reference/specification/protocol/exporter/
+	 * - https://opentelemetry.io/docs/specs/otel/protocol/exporter/
 	 */
 	{
 		StringInfoData str;
@@ -488,7 +488,7 @@ otel_LoadLogsConfig(struct otelLogsExporter *exporter,
 
 	/*
 	 * TODO: Accept settings for "Batch LogRecord Processor"
-	 * - https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/
+	 * - https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
 	 *
 	 * TODO: Clamp both >= 1 for now.
 	 */

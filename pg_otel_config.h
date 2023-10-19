@@ -34,6 +34,7 @@ struct otelConfiguration
 	struct otelSignalConfiguration exports;
 	struct otlpConfiguration otlp;
 	struct otlpConfiguration otlpLogs;
+	struct otlpConfiguration otlpTrace;
 	struct otelBaggageConfiguration resourceAttributes;
 	char *serviceName;
 };

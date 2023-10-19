@@ -16,6 +16,8 @@
 #define OTEL_FUNC_TRACE(name)    OTEL_FUNC_PROTO(trace__v1__ ## name)
 #define OTEL_FUNC_EXPORT_LOGS(name) \
 	OTEL_FUNC_PROTO(collector__logs__v1__export_logs_service_ ## name)
+#define OTEL_FUNC_EXPORT_TRACE(name) \
+	OTEL_FUNC_PROTO(collector__trace__v1__export_trace_service_ ## name)
 
 #define OTEL_TYPE_PROTO(name)    Opentelemetry__Proto__ ## name
 #define OTEL_TYPE_COMMON(name)   OTEL_TYPE_PROTO(Common__V1__ ## name)
@@ -24,6 +26,8 @@
 #define OTEL_TYPE_TRACE(name)    OTEL_TYPE_PROTO(Trace__V1__ ## name)
 #define OTEL_TYPE_EXPORT_LOGS(name) \
 	OTEL_TYPE_PROTO(Collector__Logs__V1__ExportLogsService ## name)
+#define OTEL_TYPE_EXPORT_TRACE(name) \
+	OTEL_TYPE_PROTO(Collector__Trace__V1__ExportTraceService ## name)
 
 #define OTEL_SEVERITY_NUMBER(name) \
 	OPENTELEMETRY__PROTO__LOGS__V1__SEVERITY_NUMBER__SEVERITY_NUMBER_ ## name
