@@ -105,10 +105,8 @@ otel_ExecutorRun(QueryDesc *query, ScanDirection dir, uint64 count, bool once)
 
 	/*
 	 * Prepare a span for this query when configured to do so.
-	 *
-	 * TODO: trace configuration
 	 */
-	if (true || (config.exports.signals & PG_OTEL_CONFIG_TRACES))
+	if (config.exports.signals & PG_OTEL_CONFIG_TRACES)
 	{
 		span = otel_StartSpan(CurTransactionContext, currentSpan, query->sourceText);
 		currentSpan = span;
@@ -144,10 +142,8 @@ otel_ProcessUtility(PlannedStmt *planned, const char *unparsed,
 
 	/*
 	 * Prepare a span for this statement when configured to do so.
-	 *
-	 * TODO: trace configuration
 	 */
-	if (true || (config.exports.signals & PG_OTEL_CONFIG_TRACES))
+	if (config.exports.signals & PG_OTEL_CONFIG_TRACES)
 	{
 		span = otel_StartSpan(CurTransactionContext, currentSpan, unparsed);
 		currentSpan = span;

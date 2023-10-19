@@ -1,9 +1,9 @@
 # pg_otel
 
-A loadable module for PostgreSQL that exports server log messages
+A loadable module for PostgreSQL that exports traces and server log messages
 to an OpenTelemetry [collector][].
 
-[collector]: https://docs.opentelemetry.io/concepts/data-collection/
+[collector]: https://opentelemetry.io/docs/collector/
 
 
 ## Getting Started
@@ -31,7 +31,7 @@ These settings affect every connection to PostgreSQL, so the server needs to
 [reload][] to finally apply them.
 
 ```sql
-ALTER SYSTEM SET otel.export TO 'logs';
+ALTER SYSTEM SET otel.export TO 'logs, traces';
 SELECT pg_reload_conf();
 ```
 
@@ -75,5 +75,5 @@ The following settings cannot be changed at this time:
  otel.otlp_protocol         | http/protobuf         |      | The exporter transport protocol
 ```
 
-[sdk-env]: https://opentelemetry.io/docs/reference/specification/sdk-environment-variables/
+[sdk-env]: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
 

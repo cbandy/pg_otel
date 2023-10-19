@@ -320,6 +320,11 @@ otel_CheckExports(char **next, void **extra, GucSource source)
 		if (pg_strcasecmp(item, "logs") == 0 ||
 			pg_strcasecmp(item, "log") == 0)
 			parsed.signals |= PG_OTEL_CONFIG_LOGS;
+		else if (pg_strcasecmp(item, "traces") == 0 ||
+				 pg_strcasecmp(item, "trace") == 0 ||
+				 pg_strcasecmp(item, "spans") == 0 ||
+				 pg_strcasecmp(item, "span") == 0)
+			parsed.signals |= PG_OTEL_CONFIG_TRACES;
 		else
 		{
 			GUC_check_errdetail("Unrecognized signal: \"%s\".", item);
@@ -366,7 +371,7 @@ otel_CustomVariableEnv(const char *opt, const char *env)
 	char *value = getenv(env);
 
 	/*
-	 * https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/#parsing-empty-value
+	 * https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#parsing-empty-value
 	 *
 	 * > The SDK MUST interpret an empty value of an environment variable
 	 * > the same way as when the variable is unset.
@@ -466,19 +471,19 @@ static void
 otel_ReadEnvironment(void)
 {
 	/*
-	 * https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/#attribute-limits
+	 * https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#attribute-limits
 	 */
 	otel_CustomVariableEnv("otel.attribute_count_limit", "OTEL_ATTRIBUTE_COUNT_LIMIT");
 
 	/*
-	 * https://docs.opentelemetry.io/reference/specification/protocol/exporter/
+	 * https://opentelemetry.io/docs/specs/otel/protocol/exporter/
 	 */
 	otel_CustomVariableEnv("otel.otlp_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT");
 	otel_CustomVariableEnv("otel.otlp_protocol", "OTEL_EXPORTER_OTLP_PROTOCOL");
 	otel_CustomVariableEnv("otel.otlp_timeout", "OTEL_EXPORTER_OTLP_TIMEOUT");
 
 	/*
-	 * https://docs.opentelemetry.io/reference/specification/sdk-environment-variables/#general-sdk-configuration
+	 * https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#general-sdk-configuration
 	 */
 	{
 		/* "OTEL_SDK_DISABLED=true" should no-op all telemetry signals */
