@@ -103,12 +103,16 @@ otel_ExecutorRun(QueryDesc *query, ScanDirection dir, uint64 count, bool once)
 	struct otelSpan *priorSpan = currentSpan;
 	struct otelSpan *span = NULL;
 
+	Assert(query != NULL);
+	Assert(query->plannedstmt != NULL);
+
 	/*
 	 * Prepare a span for this query when configured to do so.
 	 */
 	if (config.exports.signals & PG_OTEL_CONFIG_TRACES)
 	{
-		span = otel_StartSpan(CurTransactionContext, currentSpan, query->sourceText);
+		span = otel_StartSpan(CurTransactionContext, currentSpan,
+							  query->plannedstmt, query->sourceText);
 		currentSpan = span;
 	}
 
@@ -140,12 +144,19 @@ otel_ProcessUtility(PlannedStmt *planned, const char *unparsed,
 	struct otelSpan *priorSpan = currentSpan;
 	struct otelSpan *span = NULL;
 
+	Assert(planned != NULL);
+	Assert(planned->utilityStmt != NULL);
+
 	/*
-	 * Prepare a span for this statement when configured to do so.
+	 * Prepare a span for this statement when configured to do so. Assume that
+	 * SET statements of Trace Context variables are preambles to another query
+	 * or statement and elide them for now.
 	 */
-	if (config.exports.signals & PG_OTEL_CONFIG_TRACES)
+	if ((config.exports.signals & PG_OTEL_CONFIG_TRACES) &&
+		!otel_IsSetTraceContext(planned->utilityStmt))
 	{
-		span = otel_StartSpan(CurTransactionContext, currentSpan, unparsed);
+		span = otel_StartSpan(CurTransactionContext, currentSpan,
+							  planned, unparsed);
 		currentSpan = span;
 	}
 

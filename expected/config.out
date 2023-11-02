@@ -12,7 +12,9 @@ otel.otlp_protocol|http/protobuf||internal|string|||
 otel.otlp_timeout|10000|ms|sighup|integer|1|3600000|
 otel.resource_attributes|||sighup|string|||
 otel.service_name|postgresql||sighup|string|||
-(7 rows)
+otel.traceparent|||user|string|||
+otel.tracestate|||user|string|||
+(9 rows)
 \pset format aligned
 -- TEST: endpoint requires scheme
 ALTER SYSTEM SET otel.otlp_endpoint TO 'localhost:8080';
@@ -38,3 +40,10 @@ ALTER SYSTEM RESET otel.resource_attributes;
 ALTER SYSTEM SET otel.service_name TO '';
 ERROR:  invalid value for parameter "otel.service_name": ""
 DETAIL:  resource attribute "service.name" cannot be blank.
+-- TEST: W3C Trace Context
+SET otel.traceparent TO 'asdf';
+NOTICE:  traceparent "asdf" is malformed
+SET otel.traceparent TO '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+RESET otel.traceparent;
+SET otel.tracestate TO 'anything';
+RESET otel.tracestate;

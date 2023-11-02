@@ -23,3 +23,10 @@ ALTER SYSTEM RESET otel.resource_attributes;
 
 -- TEST: service.name cannot be blank
 ALTER SYSTEM SET otel.service_name TO '';
+
+-- TEST: W3C Trace Context
+SET otel.traceparent TO 'asdf';
+SET otel.traceparent TO '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+RESET otel.traceparent;
+SET otel.tracestate TO 'anything';
+RESET otel.tracestate;

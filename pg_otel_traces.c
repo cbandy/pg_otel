@@ -4,6 +4,7 @@
 
 #include "postgres.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "tcop/utility.h"
 
 #if PG_VERSION_NUM >= 150000
@@ -20,12 +21,12 @@ static struct otelTraceBatch *otel_AddTraceBatch(struct otelTraceExporter *);
 static void otel_AddTraceResource(struct otelTraceBatch *, struct otelResource *);
 
 static struct otelSpan *
-otel_StartSpan(MemoryContext ctx,
-			   const struct otelSpan *parent, const char *statement)
+otel_StartSpan(MemoryContext ctx, const struct otelSpan *parent,
+			   const PlannedStmt *planned, const char *statement)
 {
+	bool needsTrace = true;
 	struct otelSpan *s;
 	struct timespec ts;
-	uint8_t *traceID = NULL;
 
 	/* Get the current time right away */
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -40,25 +41,47 @@ otel_StartSpan(MemoryContext ctx,
 	((uint32_t *) s->id)[1] = ((uint32_t) random()) + 1;
 #endif
 
+	/*
+	 * Copy trace ID, parent ID, and propagated trace state from one of three
+	 * sources:
+	 *  1. The parent span, if it exists
+	 *  2. Propagation values in the session, if they exist
+	 *  3. TODO: SQL comments
+	 */
 	if (parent != NULL)
 	{
 		memcpy(s->trace, parent->trace, sizeof(parent->trace));
-		traceID = s->trace;
-
 		memcpy(s->parent, parent->id, sizeof(parent->id));
 		s->span.parent_span_id.data = s->parent;
 		s->span.parent_span_id.len = sizeof(s->parent);
-	}
+		s->span.trace_state = parent->span.trace_state;
 
-	//if (traceID == NULL && false)
-	//{
-	//	// TODO: session configuration for trace id
-	//}
-	if (traceID == NULL && statement != NULL && statement[0] != '\0')
+		needsTrace = false;
+	}
+	else if (config.traceContext.parsed)
+	{
+		memcpy(s->trace, config.traceContext.traceID, sizeof(s->trace));
+		memcpy(s->parent, config.traceContext.parentID, sizeof(s->parent));
+		s->span.parent_span_id.data = s->parent;
+		s->span.parent_span_id.len = sizeof(s->parent);
+
+		if (config.traceContext.textTracestate != NULL &&
+			config.traceContext.textTracestate[0] != '\0')
+			s->span.trace_state = config.traceContext.textTracestate;
+
+		needsTrace = false;
+	}
+	else if (statement != NULL && statement[0] != '\0')
 	{
 		// TODO: Extract {traceparent} from statement comment
+		// - https://google.github.io/sqlcommenter/
+
+		fprintf(stderr, PG_OTEL_LIBRARY ": start -- (%d, %d)\n%s\n",
+				planned->stmt_location, planned->stmt_len, statement);
 	}
-	if (traceID == NULL)
+
+	/* Generate a trace ID (root span) when none was present above */
+	if (needsTrace)
 	{
 #if PG_VERSION_NUM >= 150000
 		((uint64_t *) s->trace)[0] = pg_prng_uint64(&pg_global_prng_state);
@@ -67,7 +90,6 @@ otel_StartSpan(MemoryContext ctx,
 		((uint32_t *) s->trace)[1] = ((uint32_t) random());
 #endif
 		((uint64_t *) s->trace)[1] = *((uint64_t *) s->id);
-		traceID = s->trace;
 	}
 
 	s->span.start_time_unix_nano = ts.tv_sec * 1000000000 + ts.tv_nsec;
@@ -78,23 +100,14 @@ otel_StartSpan(MemoryContext ctx,
 static void
 otel_EndQuerySpan(struct otelSpan *s, const QueryDesc *query)
 {
+	const char *operation;
 	PlannedStmt *planned = query->plannedstmt;
 	struct timespec ts;
 
 	/* Get the current time right away */
 	clock_gettime(CLOCK_REALTIME, &ts);
 
-	if (planned->queryId != 0)
-		otel_SpanAttributeInt(s, "db.postgresql.query_id", planned->queryId);
-
-	s->span.end_time_unix_nano = ts.tv_sec * 1000000000 + ts.tv_nsec;
-	s->span.kind = true ? OTEL_SPAN_KIND(SERVER) : OTEL_SPAN_KIND(INTERNAL);
-
-	/*
-	 * Set the span name according to the query operation.
-	 * See: tcop/pquery.c
-	 */
-	if (s->span.name == NULL || s->span.name[0] == '\0')
+	/* See: tcop/pquery.c */
 	{
 		CommandTag tag = CMDTAG_UNKNOWN;
 
@@ -115,8 +128,35 @@ otel_EndQuerySpan(struct otelSpan *s, const QueryDesc *query)
 				tag = CMDTAG_UNKNOWN;
 		}
 
-		s->span.name = (char *) GetCommandTagName(tag);
+		operation = GetCommandTagName(tag);
+		otel_SpanAttributeStr(s, "db.operation", operation);
 	}
+
+	if (planned->queryId != 0)
+		otel_SpanAttributeInt(s, "db.postgresql.query_id", planned->queryId);
+
+	if (query->estate != NULL)
+		otel_SpanAttributeInt(s, "db.postgresql.rows", query->estate->es_processed);
+
+	if (MyProcPid != 0) /* miscadmin.h */
+		otel_SpanAttributeInt(s, "process.pid", MyProcPid);
+
+	if (MyProcPort != NULL) /* miscadmin.h */
+	{
+		if (MyProcPort->database_name != NULL)
+			otel_SpanAttributeStr(s, "db.name", MyProcPort->database_name);
+
+		if (MyProcPort->user_name != NULL)
+			otel_SpanAttributeStr(s, "db.user", MyProcPort->user_name);
+
+		/* TODO: MyProcPort->remote_host + MyProcPort->remote_port */
+	}
+
+	s->span.end_time_unix_nano = ts.tv_sec * 1000000000 + ts.tv_nsec;
+	s->span.kind = true ? OTEL_SPAN_KIND(SERVER) : OTEL_SPAN_KIND(INTERNAL);
+
+	if (s->span.name == NULL || s->span.name[0] == '\0')
+		s->span.name = (char *) operation;
 
 	//s.span.trace_state;		// char *
 	//s.span.status = &s.status;	// optional
@@ -126,10 +166,14 @@ static void
 otel_EndUtilitySpan(struct otelSpan *s, ProcessUtilityContext context,
 					const PlannedStmt *planned)
 {
+	const char *operation;
 	struct timespec ts;
 
 	/* Get the current time right away */
 	clock_gettime(CLOCK_REALTIME, &ts);
+
+	operation = GetCommandTagName(CreateCommandTag(planned->utilityStmt));
+	otel_SpanAttributeStr(s, "db.operation", operation);
 
 	if (planned->queryId != 0)
 		otel_SpanAttributeInt(s, "db.postgresql.query_id", planned->queryId);
@@ -141,7 +185,8 @@ otel_EndUtilitySpan(struct otelSpan *s, ProcessUtilityContext context,
 	else
 		s->span.kind = OTEL_SPAN_KIND(INTERNAL);
 
-	s->span.name = (char *) GetCommandTagName(CreateCommandTag(planned->utilityStmt));
+	if (s->span.name == NULL || s->span.name[0] == '\0')
+		s->span.name = (char *) operation;
 
 	//s.span.trace_state;		// char *
 	//s.span.status = &s.status;	// optional

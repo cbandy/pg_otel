@@ -2,6 +2,10 @@
 
 #include "postgres.h"
 #include "parser/scansup.h"
+#if PG_VERSION_NUM < 150000
+/* https://git.postgresql.org/gitweb/?p=postgresql.git;h=3c6f8c011f85df7b3 */
+#include "utils/builtins.h"
+#endif
 #include "utils/guc.h"
 #include "utils/varlena.h"
 
@@ -33,6 +37,139 @@ static char *guc_strdup(int elevel, const char *src)
 	return data;
 }
 #endif
+
+static bool
+otel_DecodeHex(const char *src, int len, uint8_t *dst)
+{
+	Assert(src != NULL);
+	Assert(dst != NULL);
+
+	for (int i = 0, j = 1; j < len; j += 2)
+	{
+		char c = src[j-1];
+
+		if (c >= '0' && c <= '9') dst[i] = (c - '0') << 4;
+		else if (c >= 'a' && c <= 'f') dst[i] = (c + 10 - 'a') << 4;
+		else if (c >= 'A' && c <= 'F') dst[i] = (c + 10 - 'A') << 4;
+		else
+			return false;
+
+		c = src[j];
+
+		if (c >= '0' && c <= '9') dst[i] |= (c - '0');
+		else if (c >= 'a' && c <= 'f') dst[i] |= (c + 10 - 'a');
+		else if (c >= 'A' && c <= 'F') dst[i] |= (c + 10 - 'A');
+		else
+			return false;
+
+		i++;
+	}
+
+	return true;
+}
+
+/*
+ * otel_ParseW3CTraceParent parses a W3C Trace Context traceparent value.
+ * It returns false when the string has an invalid character. When it returns
+ * true, four optional arguments are populated.
+ *
+ * See: https://www.w3.org/TR/trace-context-1/
+ */
+static bool
+otel_ParseW3CTraceParent(const char *src, int len, uint8_t *version,
+						 uint8_t (*traceID)[16], uint8_t (*parentID)[8],
+						 uint8_t *flags)
+{
+	if (len < 0)
+		len = strlen(src);
+
+	/*
+	 * > If the size of the header is shorter than 55 characters, the vendor
+	 * > should not parse the header and should restart the trace.
+	 */
+	if (src == NULL || len < 55)
+		return false;
+
+	/*
+	 * > When the version prefix cannot be parsed (it's not 2 hex characters
+	 * > followed by a dash (-)), the implementation should restart the trace.
+	 */
+	if (!isxdigit(src[0]) || !isxdigit(src[1]) || src[2] != '-')
+		return false;
+
+	/*
+	 * > Version (version) is 1 byte representing an 8-bit unsigned integer.
+	 * > Version ff is invalid.
+	 */
+	if (src[0] == 'f' && src[1] == 'f')
+		return false;
+
+	if (version != NULL)
+	{
+		char part[3] = { src[0], src[1], '\0' };
+
+#if PG_VERSION_NUM >= 150000
+		*version = (uint8_t) strtou64(part, NULL, 16);
+#else
+		*version = (uint8_t) pg_strtouint64(part, NULL, 16); /* builtins.h */
+#endif
+	}
+
+	/*
+	 * > Parse trace-id (from the first dash through the next 32 characters).
+	 * > Vendors MUST check that the 32 characters are hex, and that they are
+	 * > followed by a dash (-).
+	 */
+	if (traceID == NULL)
+	{
+		for (int i = 3; i < 35; i++)
+			if (!isxdigit(src[i]))
+				return false;
+	}
+	else if (!otel_DecodeHex(src + 3, 32, *traceID))
+		return false;
+
+	if (src[35] != '-')
+		return false;
+
+	/*
+	 * > Parse parent-id (from the second dash at the 35th position through
+	 * > the next 16 characters). Vendors MUST check that the 16 characters
+	 * > are hex and followed by a dash.
+	 */
+	if (parentID == NULL)
+	{
+		for (int i = 36; i < 52; i++)
+			if (!isxdigit(src[i]))
+				return false;
+	}
+	else if (!otel_DecodeHex(src + 36, 16, *parentID))
+		return false;
+
+	if (src[52] != '-')
+		return false;
+
+	/*
+	 * > Parse the sampled bit of flags (2 characters from the third dash).
+	 * > Vendors MUST check that the 2 characters are either the end of the
+	 * > string or a dash.
+	 */
+	if (!isxdigit(src[53]) || !isxdigit(src[54]) || !(len == 55 || src[55] == '-'))
+		return false;
+
+	if (flags != NULL)
+	{
+		char part[3] = { src[53], src[54], '\0' };
+
+#if PG_VERSION_NUM >= 150000
+		*flags = (uint8_t) strtou64(part, NULL, 16);
+#else
+		*flags = (uint8_t) pg_strtouint64(part, NULL, 16); /* builtins.h */
+#endif
+	}
+
+	return true;
+}
 
 /*
  * otel_ScanW3CBaggage parses a W3C Baggage key or value that begins at start.
@@ -365,6 +502,42 @@ otel_CheckServiceName(char **next, void **extra, GucSource source)
 	return true;
 }
 
+static bool
+otel_CheckTraceparent(char **next, void **extra, GucSource source)
+{
+	if (source < PGC_S_CLIENT && *next != NULL && *next[0] != '\0')
+	{
+		GUC_check_errdetail("can only be used in a session.");
+		return false;
+	}
+
+	if (source >= PGC_S_INTERACTIVE &&
+		!otel_ParseW3CTraceParent(*next, -1, NULL, NULL, NULL, NULL))
+	{
+		ereport(NOTICE, (errmsg("traceparent \"%s\" is malformed", *next)));
+	}
+
+	return true;
+}
+
+static void
+otel_AssignTraceparent(const char *next, void *extra)
+{
+	config.traceContext.parsed =
+		otel_ParseW3CTraceParent(next, -1, NULL,
+								 &config.traceContext.traceID,
+								 &config.traceContext.parentID,
+								 &config.traceContext.traceFlags);
+}
+
+static inline bool
+otel_IsSetTraceContext(Node *stmt)
+{
+	return IsA(stmt, VariableSetStmt) &&
+		(strcmp(((VariableSetStmt *) stmt)->name, "otel.traceparent") == 0 ||
+		 strcmp(((VariableSetStmt *) stmt)->name, "otel.tracestate") == 0);
+}
+
 static void
 otel_CustomVariableEnv(const char *opt, const char *env)
 {
@@ -459,6 +632,26 @@ otel_DefineCustomVariables()
 		 "postgresql",
 
 		 PGC_SIGHUP, 0, otel_CheckServiceName, NULL, NULL);
+
+	DefineCustomStringVariable
+		("otel.traceparent",
+		 "W3C Trace Context traceparent header",
+		 NULL,
+
+		 &config.traceContext.textTraceparent,
+		 "",
+
+		 PGC_USERSET, 0, otel_CheckTraceparent, otel_AssignTraceparent, NULL);
+
+	DefineCustomStringVariable
+		("otel.tracestate",
+		 "W3C Trace Context tracestate header",
+		 NULL,
+
+		 &config.traceContext.textTracestate,
+		 "",
+
+		 PGC_USERSET, 0, NULL, NULL, NULL);
 
 #if PG_VERSION_NUM >= 150000
 	MarkGUCPrefixReserved("otel");

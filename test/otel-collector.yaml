@@ -17,6 +17,9 @@ service:
     logs:
       receivers: [otlp]
       exporters: [file]
+    traces:
+      receivers: [otlp]
+      exporters: [file]
   telemetry:
     metrics:
       level: none

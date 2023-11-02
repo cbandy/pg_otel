@@ -153,6 +153,19 @@ otel_SpanAttributeInt(struct otelSpan *s, const char *key, int64_t value)
 }
 
 static void
+otel_SpanAttributeStr(struct otelSpan *s, const char *key, const char *value)
+{
+	Assert(s != NULL);
+	Assert(s->span.n_attributes < PG_OTEL_SPAN_RECORD_MAX_ATTRIBUTES);
+
+	otel_AttributeStr(s->attrAnyValues,
+					  s->attrKeyValues,
+					  s->span.attributes,
+					  &s->span.n_attributes,
+					  key, value);
+}
+
+static void
 otel_LoadResource(const struct otelConfiguration *src, struct otelResource *dst)
 {
 	size_t i;
