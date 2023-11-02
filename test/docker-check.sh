@@ -5,12 +5,6 @@ mkdir -p /build
 cp -R -t /build /mnt/*
 cd /build
 
-touch /tmp/otelcol.log /tmp/otel.ndjson
-otelcol > /tmp/otelcol.log 2>&1 \
-	--config 'test/otel-collector.yaml' \
-	--set 'exporters.file.path=/tmp/otel.ndjson' \
-	&
-
 make clean all install
 
 chown -R postgres: .
@@ -27,8 +21,6 @@ check() {
 	fi
 
 	tail -vn+0 tmp_check/log/*
-
-	tail -vn+0 /tmp/otelcol.log /tmp/otel.ndjson
 
 	exit $failed
 }
