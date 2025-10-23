@@ -1,0 +1,6 @@
+comment = 'pg_otel: FIXME'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_otel'
+relocatable = false
+superuser = true
+trusted = false

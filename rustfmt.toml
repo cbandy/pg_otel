@@ -1,0 +1,3 @@
+# https://rust-lang.github.io/rustfmt
+
+fn_call_width = 80

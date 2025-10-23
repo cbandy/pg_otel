@@ -1,0 +1,53 @@
+[package]
+name = "pg_otel"
+version = "0.0.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_otel"
+path = "./src/bin/pgrx_embed.rs"
+
+# https://www.postgresql.org/support/versioning
+[features]
+default = ["pg17", "tls", "zstd"]
+
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+tls = ["opentelemetry-otlp/tls"]
+gzip = ["opentelemetry-otlp/gzip-http", "opentelemetry-otlp/gzip-tonic"]
+zstd = ["opentelemetry-otlp/zstd-http", "opentelemetry-otlp/zstd-tonic"]
+
+[dependencies]
+bincode = "2"
+enumset = "1"
+http = "*"
+libc = "0"
+pgrx = "0.16.1"
+thiserror = "2"
+
+[dependencies.opentelemetry-otlp]
+version = "~0.31.0"
+features = [ "logs", "metrics", "trace", "grpc-tonic", "http-json", "http-proto" ]
+
+[dev-dependencies]
+pgrx-tests = "0.16.1"
+rstest = "*"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

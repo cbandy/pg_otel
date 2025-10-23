@@ -1,0 +1,36 @@
+-- vim: set expandtab shiftwidth=0 syntax=pgsql tabstop=2 :
+\set VERBOSITY default
+-- TEST: custom parameters and their defaults
+\pset format unaligned
+SELECT name, setting, unit, context, vartype, min_val, max_val, enumvals
+  FROM pg_catalog.pg_settings
+ WHERE name LIKE 'otel.%';
+name|setting|unit|context|vartype|min_val|max_val|enumvals
+otel.attribute_count_limit|128||internal|integer|128|128|
+otel.export|||sighup|string|||
+otel.otlp_compression|||sighup|string|||
+otel.otlp_endpoint|http://localhost:4318||sighup|string|||
+otel.otlp_protocol|http/json||sighup|string|||
+otel.otlp_timeout|10000|ms|sighup|integer|1|3600000|
+otel.service_name|postgresql||sighup|string|||
+(7 rows)
+\pset format aligned
+-- TEST: endpoint requires scheme
+ALTER SYSTEM SET otel.otlp_endpoint TO 'localhost:8080';
+ERROR:  invalid value for parameter "otel.otlp_endpoint": "localhost:8080"
+DETAIL:  URL must begin with http or https
+-- TEST: protocol can be changed
+ALTER SYSTEM SET otel.otlp_protocol TO 'grpc';
+ALTER SYSTEM SET otel.otlp_protocol TO 'http/json';
+ALTER SYSTEM RESET otel.otlp_protocol;
+-- TEST: protocol must be one of a few
+ALTER SYSTEM SET otel.otlp_protocol TO 'http';
+ERROR:  invalid value for parameter "otel.otlp_protocol": "http"
+DETAIL:  unknown protocol: "http"
+ALTER SYSTEM SET otel.otlp_protocol TO 'sftp';
+ERROR:  invalid value for parameter "otel.otlp_protocol": "sftp"
+DETAIL:  unknown protocol: "sftp"
+-- TEST: service.name cannot be blank
+ALTER SYSTEM SET otel.service_name TO '';
+ERROR:  invalid value for parameter "otel.service_name": ""
+DETAIL:  resource attribute "service.name" cannot be blank.

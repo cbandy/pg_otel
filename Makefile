@@ -32,3 +32,11 @@ docker-check:
 	cd test && docker build --tag 'pg_otel-test' .
 	docker run --rm -t -v "$$(pwd):/mnt" -w '/mnt' -u "$$(id -u)" 'pg_otel-test' make otel-protobufs
 	docker run --rm -t -v "$$(pwd):/mnt" -w '/mnt' 'pg_otel-test' ./test/docker-check.sh
+
+.PHONY: rust-check
+rust-check:
+	cargo test
+
+.PHONY: rust-regress
+rust-regress:
+	cargo pgrx regress --postgresql-conf shared_preload_libraries=pg_otel
