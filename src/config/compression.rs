@@ -69,6 +69,7 @@ impl convert::Into<otlp::Compression> for ExportCompression {
 #[cfg(test)]
 mod test {
     use super::ExportCompression;
+    use googletest::prelude::*;
     use opentelemetry_otlp::Compression as otlp;
     use rstest::rstest;
 
@@ -83,7 +84,7 @@ mod test {
     #[case(otlp::Gzip, "gzip")]
     #[case(otlp::Zstd, "zstd")]
     fn display(#[case] input: otlp, #[case] expected: &str) {
-        assert_eq!(format!("{}", ExportCompression(input)), expected);
+        assert_that!(ExportCompression(input), displays_as(eq(expected)));
     }
 
     #[rstest]
@@ -98,30 +99,28 @@ mod test {
     #[case::empty(c"".as_ptr())]
     #[case::null(std::ptr::null())]
     fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_eq!(ExportCompression::from_ptr(&input).unwrap(), None);
+        assert_that!(ExportCompression::from_ptr(&input), ok(none()));
     }
 
     #[rstest]
     #[case::wrong(c"other")]
     #[case::not_utf8(c"\xf0\x28\x8c\x28")]
     fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        let result = ExportCompression::from_ptr(&input.as_ptr());
-        assert!(result.is_err());
+        assert_that!(ExportCompression::from_ptr(&input.as_ptr()), err(anything()));
     }
 
     #[rstest]
     #[case::correct(c"gzip")]
     #[case::correct(c"zstd")]
     fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        let result = ExportCompression::from_ptr(&input.as_ptr());
-        assert!(result.unwrap().is_some());
+        assert_that!(ExportCompression::from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 
     #[rstest]
     #[case::empty("")]
     #[case::wrong("other")]
     fn parse_invalid(#[case] input: &str) {
-        assert!(input.parse::<ExportCompression>().is_err());
+        assert_that!(input.parse::<ExportCompression>(), err(anything()));
     }
 
     #[rstest]
@@ -130,6 +129,6 @@ mod test {
     #[case("zstd", otlp::Zstd)]
     #[case("ZStd", otlp::Zstd)]
     fn parse_valid(#[case] input: &str, #[case] expected: otlp) {
-        assert_eq!(ExportCompression(expected), input.parse().unwrap());
+        assert_that!(input.parse::<ExportCompression>(), ok(eq(&ExportCompression(expected))));
     }
 }

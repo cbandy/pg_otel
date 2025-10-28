@@ -40,8 +40,9 @@ version = "~0.31.0"
 features = [ "logs", "metrics", "trace", "grpc-tonic", "http-json", "http-proto" ]
 
 [dev-dependencies]
-pgrx-tests = "0.16.1"
-rstest = "*"
+googletest = "*"
+pgrx-tests = { version = "0.16.1", default-features = false }
+rstest = { version = "*", default-features = false }
 
 [profile.dev]
 panic = "unwind"

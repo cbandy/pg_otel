@@ -67,6 +67,7 @@ impl convert::TryFrom<&CStr> for ExportEndpoint {
 #[cfg(test)]
 mod test {
     use super::ExportEndpoint;
+    use googletest::prelude::*;
     use rstest::rstest;
 
     #[rstest]
@@ -80,14 +81,14 @@ mod test {
     #[case("http://localhost", "http://localhost/")]
     #[case("https://[::1]:9999/ingest", "https://[::1]:9999/ingest")]
     fn display(#[case] input: &str, #[case] expected: &str) {
-        assert_eq!(format!("{}", ExportEndpoint::new(input).unwrap()), expected);
+        assert_that!(ExportEndpoint::new(input), ok(displays_as(eq(expected))));
     }
 
     #[rstest]
     #[case::empty(c"".as_ptr())]
     #[case::null(std::ptr::null())]
     fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_eq!(ExportEndpoint::from_ptr(&input).unwrap(), None);
+        assert_that!(ExportEndpoint::from_ptr(&input), ok(none()));
     }
 
     #[rstest]
@@ -95,16 +96,14 @@ mod test {
     #[case::not_utf8(c"\xf0\x28\x8c\x28")]
     #[case::wrong_scheme(c"ftp://localhost")]
     fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        let result = ExportEndpoint::from_ptr(&input.as_ptr());
-        assert!(result.is_err());
+        assert_that!(ExportEndpoint::from_ptr(&input.as_ptr()), err(anything()));
     }
 
     #[rstest]
     #[case::correct(c"http://localhost")]
     #[case::correct(c"https://[::1]:9999")]
     fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        let result = ExportEndpoint::from_ptr(&input.as_ptr());
-        assert!(result.unwrap().is_some());
+        assert_that!(ExportEndpoint::from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 
     #[rstest]
@@ -112,13 +111,13 @@ mod test {
     #[case::not_url("other")]
     #[case::wrong_scheme("ftp://localhost")]
     fn parse_invalid(#[case] input: &str) {
-        assert!(input.parse::<ExportEndpoint>().is_err());
+        assert_that!(input.parse::<ExportEndpoint>(), err(anything()));
     }
 
     #[rstest]
     #[case::correct("http://localhost")]
     #[case::correct("https://[::1]:9999")]
     fn parse_valid(#[case] input: &str) {
-        assert!(input.parse::<ExportEndpoint>().is_ok());
+        assert_that!(input.parse::<ExportEndpoint>(), ok(anything()));
     }
 }

@@ -78,6 +78,7 @@ impl convert::TryFrom<&CStr> for ExportProtocol {
 #[cfg(test)]
 mod test {
     use super::ExportProtocol;
+    use googletest::prelude::*;
     use opentelemetry_otlp::Protocol as otlp;
     use rstest::rstest;
 
@@ -94,7 +95,7 @@ mod test {
     #[case(otlp::HttpBinary, "http/protobuf")]
     #[case(otlp::HttpJson, "http/json")]
     fn display(#[case] input: otlp, #[case] expected: &str) {
-        assert_eq!(format!("{}", ExportProtocol(input)), expected);
+        assert_that!(ExportProtocol(input), displays_as(eq(expected)));
     }
 
     #[rstest]
@@ -110,15 +111,14 @@ mod test {
     #[case::empty(c"".as_ptr())]
     #[case::null(std::ptr::null())]
     fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_eq!(ExportProtocol::from_ptr(&input).unwrap(), None);
+        assert_that!(ExportProtocol::from_ptr(&input), ok(none()));
     }
 
     #[rstest]
     #[case::wrong(c"other")]
     #[case::not_utf8(c"\xf0\x28\x8c\x28")]
     fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        let result = ExportProtocol::from_ptr(&input.as_ptr());
-        assert!(result.is_err());
+        assert_that!(ExportProtocol::from_ptr(&input.as_ptr()), err(anything()));
     }
 
     #[rstest]
@@ -126,15 +126,14 @@ mod test {
     #[case::correct(c"http/json")]
     #[case::correct(c"http/protobuf")]
     fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        let result = ExportProtocol::from_ptr(&input.as_ptr());
-        assert!(result.unwrap().is_some());
+        assert_that!(ExportProtocol::from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 
     #[rstest]
     #[case::empty("")]
     #[case::wrong("other")]
     fn parse_invalid(#[case] input: &str) {
-        assert!(input.parse::<ExportProtocol>().is_err());
+        assert_that!(input.parse::<ExportProtocol>(), err(anything()));
     }
 
     #[rstest]
@@ -144,6 +143,6 @@ mod test {
     #[case("http/JSON", otlp::HttpJson)]
     #[case("http/protobuf", otlp::HttpBinary)]
     fn parse_valid(#[case] input: &str, #[case] expected: otlp) {
-        assert_eq!(ExportProtocol(expected), input.parse().unwrap());
+        assert_that!(input.parse::<ExportProtocol>(), ok(eq(&ExportProtocol(expected))));
     }
 }
