@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 
-pub(crate) use crate::config_types::ExportSignal::*;
-use crate::config_types::*;
+pub(crate) use crate::config::ExportSignal::*;
+use crate::config::*;
 use opentelemetry_otlp as otlp;
 use pgrx::GucSetting;
 use pgrx::prelude::*;
@@ -116,12 +116,24 @@ fn guc_check_hook_error(args: &[GucHookError]) {
 pub fn define() {
     use pgrx::{GucContext, GucFlags, GucRegistry, pg_sys::GucSource};
 
-    const CTX_SERVER_CONFIG: GucContext = GucContext::Sighup; // startup or config; requires reload
-    const CTX_SHOW_ONLY: GucContext = GucContext::Internal; // cannot be set, only shown
+    struct Context {}
+    impl Context {
+        /// startup or config; requires reload
+        const SERVER_RELOAD: GucContext = GucContext::Sighup;
+        /// cannot be set, only shown
+        const SHOW_ONLY: GucContext = GucContext::Internal;
+    }
 
-    const FLAGS_LIST: GucFlags = GucFlags::from_bits_retain(pg_sys::GUC_LIST_INPUT as i32);
-    const FLAGS_NAME: GucFlags = GucFlags::IS_NAME;
-    const FLAGS_NONE: GucFlags = GucFlags::empty();
+    struct Options {}
+    impl Options {
+        /// input can be in list format
+        const LIST: GucFlags = GucFlags::from_bits_retain(pg_sys::GUC_LIST_INPUT as i32);
+        /// limit string length to NAMEDATALEN-1
+        const NAME: GucFlags = GucFlags::IS_NAME;
+        const NONE: GucFlags = GucFlags::empty();
+        /// number in milliseconds
+        const UNIT_MS: GucFlags = GucFlags::UNIT_MS;
+    }
 
     GucRegistry::define_int_guc(
         c"otel.attribute_count_limit",                // name
@@ -130,8 +142,8 @@ pub fn define() {
         &OTEL_ATTRIBUTE_COUNT_LIMIT,
         OTEL_ATTRIBUTE_COUNT_LIMIT.get(), // min
         OTEL_ATTRIBUTE_COUNT_LIMIT.get(), // max
-        CTX_SHOW_ONLY,
-        FLAGS_NONE,
+        Context::SHOW_ONLY,
+        Options::NONE,
     );
 
     // SAFETY: GUC hooks *must* be defined with #[pg_guard].
@@ -141,8 +153,8 @@ pub fn define() {
             c"Signals to export over OTLP", // short
             c"May be empty or \"logs\".",   // long
             &OTEL_EXPORTS,
-            CTX_SERVER_CONFIG,
-            FLAGS_LIST | FLAGS_NAME,
+            Context::SERVER_RELOAD,
+            Options::LIST | Options::NAME,
             Some(check),  // check
             Some(assign), // assign
             None,         // show
@@ -198,8 +210,8 @@ pub fn define() {
             #[cfg(all(not(feature = "gzip"), feature = "zstd"))]
             c"May be empty or \"zstd\".", // long
             &OTEL_OTLP_COMPRESSION,
-            CTX_SERVER_CONFIG,
-            FLAGS_NONE,
+            Context::SERVER_RELOAD,
+            Options::NONE,
             Some(check), // check
             None,        // assign
             None,        // show
@@ -237,8 +249,8 @@ pub fn define() {
             c"Target URL to which the exporter sends signals",   // short
             c"A scheme of https indicates a secure connection.", // long
             &OTEL_OTLP_ENDPOINT,
-            CTX_SERVER_CONFIG,
-            FLAGS_NONE,
+            Context::SERVER_RELOAD,
+            Options::NONE,
             Some(check), // check
             None,        // assign
             None,        // show
@@ -277,8 +289,8 @@ pub fn define() {
             c"The exporter transport protocol", // short
             c"",                                // long
             &OTEL_OTLP_PROTOCOL,
-            CTX_SERVER_CONFIG,
-            FLAGS_NONE,
+            Context::SERVER_RELOAD,
+            Options::NONE,
             Some(check), // check
             None,        // assign
             None,        // show
@@ -315,10 +327,10 @@ pub fn define() {
         c"Maximum time the exporter will wait for each batch export", // short
         c"",                                                          // long
         &OTEL_OTLP_TIMEOUT_MS,
-        1,                 // min = 1ms
-        60 * 60 * 1000,    // max = 60min
-        CTX_SERVER_CONFIG, //
-        GucFlags::UNIT_MS, // milliseconds
+        1,                      // min = 1ms
+        60 * 60 * 1000,         // max = 60min
+        Context::SERVER_RELOAD, //
+        Options::UNIT_MS,       // milliseconds
     );
 
     //todo!("string, hooks: otel.resource_attributes");
@@ -330,8 +342,8 @@ pub fn define() {
             c"Logical name of this service", // short
             c"",                             // long
             &OTEL_SERVICE_NAME,
-            CTX_SERVER_CONFIG,
-            FLAGS_NONE,
+            Context::SERVER_RELOAD,
+            Options::NONE,
             Some(check), // check
             None,        // assign
             None,        // show
@@ -352,7 +364,7 @@ pub fn define() {
             if raw.is_null() || unsafe { CStr::from_ptr(raw) }.is_empty() {
                 guc_check_hook_error(&[GucHookError::Detail(
                     CString::new(format!(
-                        "resource attribute {:?} cannot be blank.",
+                        "resource attribute {:?} cannot be blank",
                         "service.name"
                     ))
                     .unwrap(),

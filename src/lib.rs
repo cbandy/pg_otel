@@ -10,7 +10,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod config;
-mod config_types;
+mod guc;
 
 use pgrx::prelude::*;
 
@@ -34,7 +34,7 @@ pub extern "C-unwind" fn _PG_init() {
     }
 
     // Define our GUC variables.
-    config::define();
+    guc::define();
 }
 
 // This module must be visible at the root of the crate to configure `cargo pgrx test`.
@@ -48,7 +48,7 @@ pub mod pg_test {
     }
 
     // Every function annotated with `#[pg_test]` MUST be inside a module named "tests" with
-    // these annotations:
+    // these attributes:
     //
     // ```rust
     // #[cfg(any(test, feature = "pg_test"))]
