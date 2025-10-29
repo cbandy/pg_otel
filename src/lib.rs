@@ -11,6 +11,7 @@
 
 mod config;
 mod guc;
+mod ipc;
 
 use pgrx::prelude::*;
 
