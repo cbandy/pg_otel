@@ -23,7 +23,7 @@ impl Drop for WaitEventSet {
 impl WaitEventSet {
     /// WaitEventSet can only wait for a fixed number of event types.
     /// Choose a capacity that is greater than or equal to the number of expected events.
-    pub(crate) fn new(capacity: i32) -> WaitEventSet {
+    pub fn new(capacity: i32) -> WaitEventSet {
         #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
         let inner = unsafe { pg_sys::CreateWaitEventSet(pg_sys::TopMemoryContext, capacity) };
 
@@ -60,6 +60,22 @@ impl WaitEventSet {
                 self.inner.as_ptr(),
                 pg_sys::WL_POSTMASTER_DEATH,
                 pg_sys::PGINVALID_SOCKET,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        self.capacity -= 1;
+    }
+
+    pub fn expect_readable(&mut self, reader: &crate::ipc::Reader) {
+        use std::os::fd::AsRawFd;
+
+        debug_assert!(self.capacity > 0);
+        unsafe {
+            pg_sys::AddWaitEventToSet(
+                self.inner.as_ptr(),
+                pg_sys::WL_SOCKET_READABLE,
+                reader.0.as_raw_fd(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
@@ -105,31 +121,52 @@ impl WaitEventSet {
 #[pgrx::pg_schema]
 mod tests {
     use super::WaitEventSet;
+    use pgrx::pg_sys;
 
     #[pgrx::pg_test]
     fn memory_management() {
         let ctx: pgrx::PgMemoryContexts;
-        let counters = unsafe { pgrx::PgBox::<pgrx::pg_sys::MemoryContextCounters>::alloc() };
+        let counters = unsafe { pgrx::PgBox::<pg_sys::MemoryContextCounters>::alloc() };
 
         // Create a WaitEventSet and note the metrics of its MemoryContext.
-        let during: pgrx::pg_sys::MemoryContextCounters;
+        let during: pg_sys::MemoryContextCounters;
         {
             let ws = WaitEventSet::new(8);
             ctx = unsafe { pgrx::PgMemoryContexts::of(ws.inner.as_ptr() as pgrx::void_mut_ptr) }
                 .unwrap();
 
-            unsafe { pgrx::pg_sys::MemoryContextMemConsumed(ctx.value(), counters.as_ptr()) };
+            unsafe { pg_sys::MemoryContextMemConsumed(ctx.value(), counters.as_ptr()) };
             during = *counters;
 
             // The WaitEventSet is dropped and freed here.
         }
 
         // Read the metrics of the MemoryContext again.
-        let after: pgrx::pg_sys::MemoryContextCounters;
-        unsafe { pgrx::pg_sys::MemoryContextMemConsumed(ctx.value(), counters.as_ptr()) };
+        let after: pg_sys::MemoryContextCounters;
+        unsafe { pg_sys::MemoryContextMemConsumed(ctx.value(), counters.as_ptr()) };
         after = *counters;
 
         assert_eq!(after.nblocks, during.nblocks);
         assert!(after.freechunks > during.freechunks);
+    }
+
+    #[pgrx::pg_test]
+    fn event_readable() {
+        let (r, mut w) = super::super::new().unwrap();
+
+        // Register for readable events.
+        let mut ws = WaitEventSet::new(8);
+        ws.expect_readable(&r);
+
+        // Trigger an IO event.
+        use std::io::Write;
+        w.0.write(&[0]).unwrap();
+
+        // Wait for some event; timeout returns None.
+        let event = ws
+            .wait(Some(std::time::Duration::from_secs(1)))
+            .expect("no timeout");
+
+        assert_eq!(event.events & pg_sys::WL_SOCKET_READABLE, pg_sys::WL_SOCKET_READABLE);
     }
 }
