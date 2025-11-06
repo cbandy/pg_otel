@@ -28,16 +28,20 @@ gzip = ["opentelemetry-otlp/gzip-http", "opentelemetry-otlp/gzip-tonic"]
 zstd = ["opentelemetry-otlp/zstd-http", "opentelemetry-otlp/zstd-tonic"]
 
 [dependencies]
+libc = { version = "0", default-features = false }
+pgrx = { version = "0.16.1", default-features = false }
+
+opentelemetry_sdk = { version = "*", default-features = false }
+
 bincode = "2"
 enumset = "1"
 http = "*"
-libc = "0"
-pgrx = "0.16.1"
 thiserror = "2"
 
 [dependencies.opentelemetry-otlp]
+default-features = false
+features = ["logs", "metrics", "trace", "grpc-tonic", "http-json", "http-proto"]
 version = "~0.31.0"
-features = [ "logs", "metrics", "trace", "grpc-tonic", "http-json", "http-proto" ]
 
 [dev-dependencies]
 googletest = "*"

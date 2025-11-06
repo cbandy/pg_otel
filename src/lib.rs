@@ -10,10 +10,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod config;
-mod guc;
 mod ipc;
 
-use pgrx::prelude::*;
+use pgrx::pg_sys;
 
 const PG_OTEL_LIBRARY: &str = env!("CARGO_PKG_NAME");
 #[cfg(any())]
@@ -21,11 +20,11 @@ const PG_OTEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pgrx::pg_module_magic!(name, version);
 
-/// Called when the module is loaded.
-#[allow(non_snake_case)]
-#[pg_guard]
-pub extern "C-unwind" fn _PG_init() {
-    // SAFETY: It is safe to read this variable because this function is called by Postmaster during startup.
+pub(crate) fn assert_postmaster_startup() -> bool {
+    // This panics when called from a thread other than the main one.
+    pg_sys::thread_check::check_active_thread();
+
+    // SAFETY: It is safe to read this variable from the main thread.
     if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
         pgrx::ereport!(
             pgrx::PgLogLevel::ERROR,
@@ -34,8 +33,19 @@ pub extern "C-unwind" fn _PG_init() {
         )
     }
 
+    // Return a value so this call can be passed to debug_assert!.
+    true
+}
+
+/// Called when the module is loaded.
+#[allow(non_snake_case)]
+#[pgrx::pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    // Panic if the extension is loaded after Postgres startup.
+    assert_postmaster_startup();
+
     // Define our GUC variables.
-    guc::define();
+    crate::config::define_guc_variables();
 }
 
 // This module must be visible at the root of the crate to configure `cargo pgrx test`.

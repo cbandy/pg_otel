@@ -13,21 +13,19 @@ impl ExportProtocol {
         match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
             None => Ok(None),
             Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().and_then(|_self| Ok(Some(_self))),
+            Some(cstr) => cstr.try_into().map(Some),
         }
     }
 
     fn new(raw: &str) -> Result<Self, Error> {
         let lower = raw.to_lowercase();
 
-        Ok(Self {
-            0: match lower.as_str() {
-                "grpc" => Ok(otlp::Protocol::Grpc),
-                "http/protobuf" => Ok(otlp::Protocol::HttpBinary),
-                "http/json" => Ok(otlp::Protocol::HttpJson),
-                _ => Err(Error::ExportProtocol(raw.to_owned())),
-            }?,
-        })
+        Ok(Self(match lower.as_str() {
+            "grpc" => Ok(otlp::Protocol::Grpc),
+            "http/protobuf" => Ok(otlp::Protocol::HttpBinary),
+            "http/json" => Ok(otlp::Protocol::HttpJson),
+            _ => Err(Error::ExportProtocol(raw.to_owned())),
+        }?))
     }
 }
 
@@ -61,9 +59,9 @@ impl convert::From<otlp::Protocol> for ExportProtocol {
     }
 }
 
-impl convert::Into<otlp::Protocol> for ExportProtocol {
-    fn into(self) -> otlp::Protocol {
-        self.0
+impl convert::From<ExportProtocol> for otlp::Protocol {
+    fn from(value: ExportProtocol) -> otlp::Protocol {
+        value.0
     }
 }
 

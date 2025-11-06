@@ -13,7 +13,7 @@ impl ExportEndpoint {
         match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
             None => Ok(None),
             Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().and_then(|_self| Ok(Some(_self))),
+            Some(cstr) => cstr.try_into().map(Some),
         }
     }
 
@@ -32,7 +32,7 @@ impl ExportEndpoint {
             }
         }
 
-        Ok(Self { 0: parsed })
+        Ok(Self(parsed))
     }
 }
 

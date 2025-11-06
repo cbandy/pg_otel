@@ -33,4 +33,4 @@ DETAIL:  unknown protocol: "sftp"
 -- TEST: service.name cannot be blank
 ALTER SYSTEM SET otel.service_name TO '';
 ERROR:  invalid value for parameter "otel.service_name": ""
-DETAIL:  resource attribute "service.name" cannot be blank.
+DETAIL:  resource attribute "service.name" cannot be blank

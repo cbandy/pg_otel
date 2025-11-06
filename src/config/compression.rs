@@ -13,16 +13,14 @@ impl ExportCompression {
         match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
             None => Ok(None),
             Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().and_then(|_self| Ok(Some(_self))),
+            Some(cstr) => cstr.try_into().map(Some),
         }
     }
 
     fn new(raw: &str) -> Result<Self, Error> {
         let lower = raw.to_lowercase();
 
-        Ok(Self {
-            0: lower.parse().map_err(Error::ExportCompression)?,
-        })
+        Ok(Self(lower.parse().map_err(Error::ExportCompression)?))
     }
 }
 
@@ -60,9 +58,9 @@ impl convert::From<otlp::Compression> for ExportCompression {
     }
 }
 
-impl convert::Into<otlp::Compression> for ExportCompression {
-    fn into(self) -> otlp::Compression {
-        self.0
+impl convert::From<ExportCompression> for otlp::Compression {
+    fn from(value: ExportCompression) -> otlp::Compression {
+        value.0
     }
 }
 

@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: ISC
 
-pub(crate) use crate::config::ExportSignal::*;
-use crate::config::*;
 use opentelemetry_otlp as otlp;
-use pgrx::GucSetting;
-use pgrx::prelude::*;
+use opentelemetry_sdk as sdk;
+use pgrx::pg_sys;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
-type ParameterInt = GucSetting<i32>;
-type ParameterStr = GucSetting<Option<CString>>;
+type ParameterInt = pgrx::GucSetting<i32>;
+type ParameterStr = pgrx::GucSetting<Option<CString>>;
 
 // These static variables are populated by PostgreSQL during ProcessConfigFile.
 // - https://doxygen.postgresql.org/guc_8h.html
@@ -21,102 +19,123 @@ static OTEL_EXPORTS: ParameterStr = ParameterStr::new(None);
 static OTEL_SERVICE_NAME: ParameterStr = ParameterStr::new(Some(c"postgresql"));
 
 static OTEL_OTLP_COMPRESSION: ParameterStr = ParameterStr::new(None);
-static OTEL_OTLP_ENDPOINT: ParameterStr = ParameterStr::new(None); // populated during [define]
-static OTEL_OTLP_PROTOCOL: ParameterStr = ParameterStr::new(None); // populated during [define]
-static OTEL_OTLP_TIMEOUT_MS: ParameterInt = ParameterInt::new(1); // populated during [define]
+static OTEL_OTLP_ENDPOINT: ParameterStr = ParameterStr::new(None); // populated during [`define_guc_variables()`]
+static OTEL_OTLP_PROTOCOL: ParameterStr = ParameterStr::new(None); // populated during [`define_guc_variables()`]
+static OTEL_OTLP_TIMEOUT_MS: ParameterInt = ParameterInt::new(1); // populated during [`define_guc_variables()`]
 
 // These static variables are populated by our GUC assign hooks during ProcessConfigFile.
 
-static PARSED_EXPORTS: LazyLock<RwLock<ExportSignalSet>> =
-    LazyLock::new(|| RwLock::new(ExportSignalSet::empty()));
+static PARSED_EXPORTS: LazyLock<RwLock<super::ExportSignalSet>> =
+    LazyLock::new(|| RwLock::new(super::ExportSignalSet::empty()));
 
-#[allow(dead_code)]
-pub fn exporter() -> (
-    ExportProtocol,
-    ExportEndpoint,
-    Option<ExportCompression>,
-    Duration,
-    HashMap<String, String>,
-) {
-    let compression = match OTEL_OTLP_COMPRESSION.get() {
-        None => None,
-        Some(v) if v.is_empty() => None,
-        Some(v) => Some(
-            ExportCompression::try_from(v.as_c_str()).expect("check ensures this is valid text"),
-        ),
-    };
-
-    let endpoint = match OTEL_OTLP_ENDPOINT.get() {
-        None => otlp::OTEL_EXPORTER_OTLP_ENDPOINT_DEFAULT.parse().unwrap(),
-        Some(v) => {
-            ExportEndpoint::try_from(v.as_c_str()).expect("check ensures this is valid text")
-        }
-    };
-
-    let metadata = HashMap::new();
-
-    let protocol = match OTEL_OTLP_PROTOCOL.get() {
-        None => otlp::OTEL_EXPORTER_OTLP_PROTOCOL_DEFAULT.parse().unwrap(),
-        Some(v) => {
-            ExportProtocol::try_from(v.as_c_str()).expect("check ensures this is valid text")
-        }
-    };
-
-    let timeout = match OTEL_OTLP_TIMEOUT_MS.get() {
-        n if n > 0 => Duration::from_millis(n as u64),
-        _ => otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-    };
-
-    (protocol, endpoint, compression, timeout, metadata)
-}
-
-/// Returns true when signal is present in the "otel.export" GUC variable.
-pub fn exporting(signal: ExportSignal) -> bool {
+/// Returns true when signal is present in the `otel.export` GUC variable.
+/// This is faster than [`loaded()`] and safe to call from anywhere.
+pub fn exporting(signal: super::ExportSignal) -> bool {
     match PARSED_EXPORTS.read() {
         Ok(exports) => exports.contains(signal),
         Err(_) => false,
     }
 }
 
-#[allow(dead_code)]
-enum GucHookError {
-    ErrCode(i32),
-    Message(CString),
-    Detail(CString),
-    Hint(CString),
+/// This returns a copy of all configuration.
+///
+/// # Safety
+///
+/// This can only be called from the main thread because it reads from Postgres GUC variables.
+pub fn loaded() -> super::Config {
+    let export = super::OTLP {
+        compression: match OTEL_OTLP_COMPRESSION.get() {
+            None => None,
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(
+                super::ExportCompression::try_from(v.as_c_str())
+                    .expect("check ensures this is valid text")
+                    .into(),
+            ),
+        },
+        endpoint: match OTEL_OTLP_ENDPOINT.get() {
+            None => otlp::OTEL_EXPORTER_OTLP_ENDPOINT_DEFAULT.into(),
+            Some(v) => super::ExportEndpoint::try_from(v.as_c_str())
+                .expect("check ensures this is valid text")
+                .to_string(),
+        },
+        // TODO: validate as gRPC ASCII
+        metadata: HashMap::new(),
+        protocol: match OTEL_OTLP_PROTOCOL.get() {
+            None => otlp::OTEL_EXPORTER_OTLP_PROTOCOL_DEFAULT
+                .parse::<super::ExportProtocol>()
+                .unwrap()
+                .into(),
+            Some(v) => super::ExportProtocol::try_from(v.as_c_str())
+                .expect("check ensures this is valid text")
+                .into(),
+        },
+        timeout: match OTEL_OTLP_TIMEOUT_MS.get() {
+            n if n > 0 => Duration::from_millis(n as u64),
+            _ => otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
+        },
+    };
+
+    // TODO: with_attributes()
+    // TODO: with_schema_url()
+
+    // Start with only the SDK name and version.
+    let mut resource = sdk::Resource::builder_empty()
+        .with_detector(Box::new(sdk::resource::TelemetryResourceDetector));
+
+    if let Some(cstr) = OTEL_SERVICE_NAME.get() {
+        resource = resource.with_service_name(
+            cstr.into_string()
+                .expect("check ensures this is valid text"),
+        );
+    }
+
+    super::Config {
+        logs_otlp: export,
+        resource: resource.build(),
+    }
 }
 
-fn guc_check_hook_error(args: &[GucHookError]) {
-    // https://doxygen.postgresql.org/guc_8h.html
+struct HookError;
+impl HookError {
+    #[allow(dead_code)]
+    fn errcode(code: std::ffi::c_int) {
+        unsafe { pg_sys::GUC_check_errcode(code) };
+    }
 
-    for arg in args {
-        match arg {
-            GucHookError::ErrCode(code) => unsafe {
-                pg_sys::GUC_check_errcode(*code);
-            },
-            GucHookError::Message(text) => unsafe {
-                // Do the work of GUC_check_errmsg.
-                pg_sys::pre_format_elog_string(0, std::ptr::null());
-                pg_sys::GUC_check_errmsg_string = pg_sys::format_elog_string(text.as_ptr());
-            },
-            GucHookError::Detail(text) => unsafe {
-                // Do the work of GUC_check_errdetail.
-                pg_sys::pre_format_elog_string(0, std::ptr::null());
-                pg_sys::GUC_check_errdetail_string = pg_sys::format_elog_string(text.as_ptr());
-            },
-            GucHookError::Hint(text) => unsafe {
-                // Do the work of GUC_check_errhint.
-                pg_sys::pre_format_elog_string(0, std::ptr::null());
-                pg_sys::GUC_check_errhint_string = pg_sys::format_elog_string(text.as_ptr());
-            },
+    fn detail(text: CString) {
+        unsafe {
+            // Do the work of GUC_check_errdetail.
+            pg_sys::pre_format_elog_string(0, std::ptr::null());
+            pg_sys::GUC_check_errdetail_string = pg_sys::format_elog_string(text.as_ptr());
+        }
+    }
+
+    #[allow(dead_code)]
+    fn hint(text: CString) {
+        unsafe {
+            // Do the work of GUC_check_errhint.
+            pg_sys::pre_format_elog_string(0, std::ptr::null());
+            pg_sys::GUC_check_errhint_string = pg_sys::format_elog_string(text.as_ptr());
+        }
+    }
+
+    #[allow(dead_code)]
+    fn message(text: CString) {
+        unsafe {
+            // Do the work of GUC_check_errmsg.
+            pg_sys::pre_format_elog_string(0, std::ptr::null());
+            pg_sys::GUC_check_errmsg_string = pg_sys::format_elog_string(text.as_ptr());
         }
     }
 }
 
-pub fn define() {
+pub fn define_guc_variables() {
+    debug_assert!(crate::assert_postmaster_startup());
+
     use pgrx::{GucContext, GucFlags, GucRegistry, pg_sys::GucSource};
 
-    struct Context {}
+    struct Context;
     impl Context {
         /// startup or config; requires reload
         const SERVER_RELOAD: GucContext = GucContext::Sighup;
@@ -124,7 +143,7 @@ pub fn define() {
         const SHOW_ONLY: GucContext = GucContext::Internal;
     }
 
-    struct Options {}
+    struct Options;
     impl Options {
         /// input can be in list format
         const LIST: GucFlags = GucFlags::from_bits_retain(pg_sys::GUC_LIST_INPUT as i32);
@@ -161,7 +180,7 @@ pub fn define() {
         );
 
         /// Called when a GUC value is proposed.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn check(
             next: *mut *mut c_char,
             _extra: *mut pgrx::void_mut_ptr,
@@ -172,28 +191,21 @@ pub fn define() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match ExportSignalSet::from_ptr(&raw) {
-                Ok(_) => true,
-                Err(err) => {
-                    guc_check_hook_error(&[GucHookError::Detail(
-                        CString::new(err.to_string()).unwrap(),
-                    )]);
-                    return false;
-                }
+            if let Err(err) = super::ExportSignalSet::from_ptr(&raw) {
+                HookError::detail(CString::new(err.to_string()).unwrap());
+                false
+            } else {
+                true
             }
         }
 
         /// Called after all proposed GUC values are valid.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn assign(next: *const c_char, _extra: pgrx::void_mut_ptr) {
             let mut singleton = PARSED_EXPORTS.write().unwrap();
 
-            *singleton = if next.is_null() {
-                ExportSignalSet::empty()
-            } else {
-                ExportSignalSet::try_from(unsafe { CStr::from_ptr(next) })
-                    .expect("check ensures this is valid text")
-            };
+            *singleton =
+                super::ExportSignalSet::from_ptr(&next).expect("check ensures this is valid text");
         }
     }
 
@@ -218,7 +230,7 @@ pub fn define() {
         );
 
         /// Called when a GUC value is proposed.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn check(
             next: *mut *mut c_char,
             _extra: *mut pgrx::void_mut_ptr,
@@ -229,15 +241,11 @@ pub fn define() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match ExportCompression::from_ptr(&raw) {
-                Ok(None) => true,
-                Ok(_) => true,
-                Err(err) => {
-                    guc_check_hook_error(&[GucHookError::Detail(
-                        CString::new(err.to_string()).unwrap(),
-                    )]);
-                    return false;
-                }
+            if let Err(err) = super::ExportCompression::from_ptr(&raw) {
+                HookError::detail(CString::new(err.to_string()).unwrap());
+                false
+            } else {
+                true
             }
         }
     }
@@ -257,7 +265,7 @@ pub fn define() {
         );
 
         /// Called when a GUC value is proposed.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn check(
             next: *mut *mut c_char,
             _extra: *mut pgrx::void_mut_ptr,
@@ -268,15 +276,13 @@ pub fn define() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match ExportEndpoint::from_ptr(&raw) {
+            match super::ExportEndpoint::from_ptr(&raw) {
                 // Allow null only during initialiazation
                 Ok(None) => unsafe { pg_sys::process_shared_preload_libraries_in_progress },
                 Ok(_) => true,
                 Err(err) => {
-                    guc_check_hook_error(&[GucHookError::Detail(
-                        CString::new(err.to_string()).unwrap(),
-                    )]);
-                    return false;
+                    HookError::detail(CString::new(err.to_string()).unwrap());
+                    false
                 }
             }
         }
@@ -297,7 +303,7 @@ pub fn define() {
         );
 
         /// Called when a GUC value is proposed.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn check(
             next: *mut *mut c_char,
             _extra: *mut pgrx::void_mut_ptr,
@@ -308,15 +314,13 @@ pub fn define() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match ExportProtocol::from_ptr(&raw) {
+            match super::ExportProtocol::from_ptr(&raw) {
                 // Allow null only during initialiazation
                 Ok(None) => unsafe { pg_sys::process_shared_preload_libraries_in_progress },
                 Ok(_) => true,
                 Err(err) => {
-                    guc_check_hook_error(&[GucHookError::Detail(
-                        CString::new(err.to_string()).unwrap(),
-                    )]);
-                    return false;
+                    HookError::detail(CString::new(err.to_string()).unwrap());
+                    false
                 }
             }
         }
@@ -350,7 +354,7 @@ pub fn define() {
         );
 
         /// Called when a GUC value is proposed.
-        #[pg_guard]
+        #[pgrx::pg_guard]
         extern "C-unwind" fn check(
             next: *mut *mut c_char,
             _extra: *mut pgrx::void_mut_ptr,
@@ -362,24 +366,21 @@ pub fn define() {
             let raw: *const c_char = unsafe { *next };
 
             if raw.is_null() || unsafe { CStr::from_ptr(raw) }.is_empty() {
-                guc_check_hook_error(&[GucHookError::Detail(
+                HookError::detail(
                     CString::new(format!(
                         "resource attribute {:?} cannot be blank",
                         "service.name"
                     ))
                     .unwrap(),
-                )]);
+                );
                 return false;
             }
 
-            match unsafe { CStr::from_ptr(raw) }.to_str() {
-                Ok(_) => true,
-                Err(err) => {
-                    guc_check_hook_error(&[GucHookError::Detail(
-                        CString::new(err.to_string()).unwrap(),
-                    )]);
-                    return false;
-                }
+            if let Err(err) = unsafe { CStr::from_ptr(raw) }.to_str() {
+                HookError::detail(CString::new(err.to_string()).unwrap());
+                false
+            } else {
+                true
             }
         }
     }
