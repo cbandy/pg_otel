@@ -49,3 +49,11 @@ pub enum Error {
     #[error("unknown signal: {0:?}")]
     ExportSignal(String),
 }
+
+pub trait FromStr<'a, T = Self>
+where
+    T: std::str::FromStr<Err = Error>,
+    T: std::convert::TryFrom<&'a std::ffi::CStr, Error = Error>,
+{
+    fn try_from_ptr(raw: &*const std::ffi::c_char) -> Result<Option<T>, Error>;
+}

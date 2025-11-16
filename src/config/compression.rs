@@ -2,21 +2,12 @@
 
 use super::Error;
 use opentelemetry_otlp as otlp;
-use std::ffi::CStr;
-use std::{convert, fmt, str};
+use std::{convert, ffi, fmt, str};
 
 #[derive(PartialEq)]
 pub struct ExportCompression(otlp::Compression);
 
 impl ExportCompression {
-    pub fn from_ptr(raw: &*const std::ffi::c_char) -> Result<Option<Self>, Error> {
-        match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
-            None => Ok(None),
-            Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().map(Some),
-        }
-    }
-
     fn new(raw: &str) -> Result<Self, Error> {
         let lower = raw.to_lowercase();
 
@@ -44,17 +35,17 @@ impl str::FromStr for ExportCompression {
     }
 }
 
-impl convert::TryFrom<&CStr> for ExportCompression {
+impl convert::TryFrom<&ffi::CStr> for ExportCompression {
     type Error = Error;
 
-    fn try_from(raw: &CStr) -> Result<Self, Error> {
+    fn try_from(raw: &ffi::CStr) -> Result<Self, Error> {
         raw.to_str()?.parse()
     }
 }
 
 impl convert::From<otlp::Compression> for ExportCompression {
-    fn from(raw: otlp::Compression) -> Self {
-        Self(raw)
+    fn from(value: otlp::Compression) -> Self {
+        Self(value)
     }
 }
 
@@ -64,9 +55,19 @@ impl convert::From<ExportCompression> for otlp::Compression {
     }
 }
 
+impl super::FromStr<'_> for ExportCompression {
+    fn try_from_ptr(raw: &*const ffi::c_char) -> Result<Option<Self>, Error> {
+        match (!raw.is_null()).then(|| unsafe { ffi::CStr::from_ptr(*raw) }) {
+            None => Ok(None),
+            Some(cstr) if cstr.is_empty() => Ok(None),
+            Some(cstr) => cstr.try_into().map(Some),
+        }
+    }
+}
+
 #[cfg(test)]
-mod test {
-    use super::ExportCompression;
+mod tests {
+    use super::{super::FromStr, ExportCompression};
     use googletest::prelude::*;
     use opentelemetry_otlp::Compression as otlp;
     use rstest::rstest;
@@ -94,27 +95,6 @@ mod test {
     }
 
     #[rstest]
-    #[case::empty(c"".as_ptr())]
-    #[case::null(std::ptr::null())]
-    fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_that!(ExportCompression::from_ptr(&input), ok(none()));
-    }
-
-    #[rstest]
-    #[case::wrong(c"other")]
-    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
-    fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportCompression::from_ptr(&input.as_ptr()), err(anything()));
-    }
-
-    #[rstest]
-    #[case::correct(c"gzip")]
-    #[case::correct(c"zstd")]
-    fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportCompression::from_ptr(&input.as_ptr()), ok(some(anything())));
-    }
-
-    #[rstest]
     #[case::empty("")]
     #[case::wrong("other")]
     fn parse_invalid(#[case] input: &str) {
@@ -128,5 +108,26 @@ mod test {
     #[case("ZStd", otlp::Zstd)]
     fn parse_valid(#[case] input: &str, #[case] expected: otlp) {
         assert_that!(input.parse::<ExportCompression>(), ok(eq(&ExportCompression(expected))));
+    }
+
+    #[rstest]
+    #[case::empty(c"".as_ptr())]
+    #[case::null(std::ptr::null())]
+    fn try_from_ptr_none(#[case] input: *const std::ffi::c_char) {
+        assert_that!(ExportCompression::try_from_ptr(&input), ok(none()));
+    }
+
+    #[rstest]
+    #[case::wrong(c"other")]
+    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
+    fn try_from_ptr_invalid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportCompression::try_from_ptr(&input.as_ptr()), err(anything()));
+    }
+
+    #[rstest]
+    #[case::correct(c"gzip")]
+    #[case::correct(c"zstd")]
+    fn try_from_ptr_valid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportCompression::try_from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 }

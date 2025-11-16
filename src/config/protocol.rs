@@ -2,21 +2,12 @@
 
 use super::Error;
 use opentelemetry_otlp as otlp;
-use std::ffi::CStr;
-use std::{convert, fmt, str};
+use std::{convert, ffi, fmt, str};
 
 #[derive(PartialEq)]
 pub struct ExportProtocol(otlp::Protocol);
 
 impl ExportProtocol {
-    pub fn from_ptr(raw: &*const std::ffi::c_char) -> Result<Option<Self>, Error> {
-        match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
-            None => Ok(None),
-            Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().map(Some),
-        }
-    }
-
     fn new(raw: &str) -> Result<Self, Error> {
         let lower = raw.to_lowercase();
 
@@ -54,8 +45,8 @@ impl str::FromStr for ExportProtocol {
 }
 
 impl convert::From<otlp::Protocol> for ExportProtocol {
-    fn from(raw: otlp::Protocol) -> Self {
-        Self(raw)
+    fn from(value: otlp::Protocol) -> Self {
+        Self(value)
     }
 }
 
@@ -65,17 +56,27 @@ impl convert::From<ExportProtocol> for otlp::Protocol {
     }
 }
 
-impl convert::TryFrom<&CStr> for ExportProtocol {
+impl convert::TryFrom<&ffi::CStr> for ExportProtocol {
     type Error = Error;
 
-    fn try_from(raw: &CStr) -> Result<Self, Self::Error> {
+    fn try_from(raw: &ffi::CStr) -> Result<Self, Self::Error> {
         raw.to_str()?.parse()
     }
 }
 
+impl super::FromStr<'_> for ExportProtocol {
+    fn try_from_ptr(raw: &*const ffi::c_char) -> Result<Option<Self>, Error> {
+        match (!raw.is_null()).then(|| unsafe { ffi::CStr::from_ptr(*raw) }) {
+            None => Ok(None),
+            Some(cstr) if cstr.is_empty() => Ok(None),
+            Some(cstr) => cstr.try_into().map(Some),
+        }
+    }
+}
+
 #[cfg(test)]
-mod test {
-    use super::ExportProtocol;
+mod tests {
+    use super::{super::FromStr, ExportProtocol};
     use googletest::prelude::*;
     use opentelemetry_otlp::Protocol as otlp;
     use rstest::rstest;
@@ -106,28 +107,6 @@ mod test {
     }
 
     #[rstest]
-    #[case::empty(c"".as_ptr())]
-    #[case::null(std::ptr::null())]
-    fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_that!(ExportProtocol::from_ptr(&input), ok(none()));
-    }
-
-    #[rstest]
-    #[case::wrong(c"other")]
-    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
-    fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportProtocol::from_ptr(&input.as_ptr()), err(anything()));
-    }
-
-    #[rstest]
-    #[case::correct(c"grpc")]
-    #[case::correct(c"http/json")]
-    #[case::correct(c"http/protobuf")]
-    fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportProtocol::from_ptr(&input.as_ptr()), ok(some(anything())));
-    }
-
-    #[rstest]
     #[case::empty("")]
     #[case::wrong("other")]
     fn parse_invalid(#[case] input: &str) {
@@ -142,5 +121,27 @@ mod test {
     #[case("http/protobuf", otlp::HttpBinary)]
     fn parse_valid(#[case] input: &str, #[case] expected: otlp) {
         assert_that!(input.parse::<ExportProtocol>(), ok(eq(&ExportProtocol(expected))));
+    }
+
+    #[rstest]
+    #[case::empty(c"".as_ptr())]
+    #[case::null(std::ptr::null())]
+    fn try_from_ptr_none(#[case] input: *const std::ffi::c_char) {
+        assert_that!(ExportProtocol::try_from_ptr(&input), ok(none()));
+    }
+
+    #[rstest]
+    #[case::wrong(c"other")]
+    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
+    fn try_from_ptr_invalid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportProtocol::try_from_ptr(&input.as_ptr()), err(anything()));
+    }
+
+    #[rstest]
+    #[case::correct(c"grpc")]
+    #[case::correct(c"http/json")]
+    #[case::correct(c"http/protobuf")]
+    fn try_from_ptr_valid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportProtocol::try_from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 }

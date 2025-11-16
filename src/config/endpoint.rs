@@ -2,21 +2,12 @@
 
 use super::Error;
 use http::uri;
-use std::ffi::CStr;
-use std::{convert, fmt, str};
+use std::{convert, ffi, fmt, str};
 
 #[derive(PartialEq)]
 pub struct ExportEndpoint(uri::Uri);
 
 impl ExportEndpoint {
-    pub fn from_ptr(raw: &*const std::ffi::c_char) -> Result<Option<Self>, Error> {
-        match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
-            None => Ok(None),
-            Some(cstr) if cstr.is_empty() => Ok(None),
-            Some(cstr) => cstr.try_into().map(Some),
-        }
-    }
-
     fn new(raw: &str) -> Result<Self, Error> {
         use uri::Scheme;
 
@@ -56,17 +47,27 @@ impl str::FromStr for ExportEndpoint {
     }
 }
 
-impl convert::TryFrom<&CStr> for ExportEndpoint {
+impl convert::TryFrom<&ffi::CStr> for ExportEndpoint {
     type Error = Error;
 
-    fn try_from(raw: &CStr) -> Result<Self, Error> {
+    fn try_from(raw: &ffi::CStr) -> Result<Self, Error> {
         raw.to_str()?.parse()
     }
 }
 
+impl super::FromStr<'_> for ExportEndpoint {
+    fn try_from_ptr(raw: &*const ffi::c_char) -> Result<Option<Self>, Error> {
+        match (!raw.is_null()).then(|| unsafe { ffi::CStr::from_ptr(*raw) }) {
+            None => Ok(None),
+            Some(cstr) if cstr.is_empty() => Ok(None),
+            Some(cstr) => cstr.try_into().map(Some),
+        }
+    }
+}
+
 #[cfg(test)]
-mod test {
-    use super::ExportEndpoint;
+mod tests {
+    use super::{super::FromStr, ExportEndpoint};
     use googletest::prelude::*;
     use rstest::rstest;
 
@@ -85,28 +86,6 @@ mod test {
     }
 
     #[rstest]
-    #[case::empty(c"".as_ptr())]
-    #[case::null(std::ptr::null())]
-    fn from_ptr_none(#[case] input: *const std::ffi::c_char) {
-        assert_that!(ExportEndpoint::from_ptr(&input), ok(none()));
-    }
-
-    #[rstest]
-    #[case::not_url(c"other")]
-    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
-    #[case::wrong_scheme(c"ftp://localhost")]
-    fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportEndpoint::from_ptr(&input.as_ptr()), err(anything()));
-    }
-
-    #[rstest]
-    #[case::correct(c"http://localhost")]
-    #[case::correct(c"https://[::1]:9999")]
-    fn from_ptr_valid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportEndpoint::from_ptr(&input.as_ptr()), ok(some(anything())));
-    }
-
-    #[rstest]
     #[case::empty("")]
     #[case::not_url("other")]
     #[case::wrong_scheme("ftp://localhost")]
@@ -119,5 +98,27 @@ mod test {
     #[case::correct("https://[::1]:9999")]
     fn parse_valid(#[case] input: &str) {
         assert_that!(input.parse::<ExportEndpoint>(), ok(anything()));
+    }
+
+    #[rstest]
+    #[case::empty(c"".as_ptr())]
+    #[case::null(std::ptr::null())]
+    fn try_from_ptr_none(#[case] input: *const std::ffi::c_char) {
+        assert_that!(ExportEndpoint::try_from_ptr(&input), ok(none()));
+    }
+
+    #[rstest]
+    #[case::not_url(c"other")]
+    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
+    #[case::wrong_scheme(c"ftp://localhost")]
+    fn try_from_ptr_invalid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportEndpoint::try_from_ptr(&input.as_ptr()), err(anything()));
+    }
+
+    #[rstest]
+    #[case::correct(c"http://localhost")]
+    #[case::correct(c"https://[::1]:9999")]
+    fn try_from_ptr_valid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportEndpoint::try_from_ptr(&input.as_ptr()), ok(some(anything())));
     }
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: ISC
 
+use super::FromStr;
 use opentelemetry_otlp as otlp;
 use opentelemetry_sdk as sdk;
 use pgrx::pg_sys;
@@ -191,7 +192,7 @@ pub fn define_guc_variables() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            if let Err(err) = super::ExportSignalSet::from_ptr(&raw) {
+            if let Err(err) = super::ExportSignalSet::try_from_ptr(&raw) {
                 HookError::detail(CString::new(err.to_string()).unwrap());
                 false
             } else {
@@ -204,8 +205,8 @@ pub fn define_guc_variables() {
         extern "C-unwind" fn assign(next: *const c_char, _extra: pgrx::void_mut_ptr) {
             let mut singleton = PARSED_EXPORTS.write().unwrap();
 
-            *singleton =
-                super::ExportSignalSet::from_ptr(&next).expect("check ensures this is valid text");
+            *singleton = super::ExportSignalSet::try_from_ptr(&next)
+                .expect("check ensures this is valid text");
         }
     }
 
@@ -241,7 +242,7 @@ pub fn define_guc_variables() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            if let Err(err) = super::ExportCompression::from_ptr(&raw) {
+            if let Err(err) = super::ExportCompression::try_from_ptr(&raw) {
                 HookError::detail(CString::new(err.to_string()).unwrap());
                 false
             } else {
@@ -276,7 +277,7 @@ pub fn define_guc_variables() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match super::ExportEndpoint::from_ptr(&raw) {
+            match super::ExportEndpoint::try_from_ptr(&raw) {
                 // Allow null only during initialiazation
                 Ok(None) => unsafe { pg_sys::process_shared_preload_libraries_in_progress },
                 Ok(_) => true,
@@ -314,7 +315,7 @@ pub fn define_guc_variables() {
             // SAFETY: dereference is safe because the pointer is never null.
             let raw: *const c_char = unsafe { *next };
 
-            match super::ExportProtocol::from_ptr(&raw) {
+            match super::ExportProtocol::try_from_ptr(&raw) {
                 // Allow null only during initialiazation
                 Ok(None) => unsafe { pg_sys::process_shared_preload_libraries_in_progress },
                 Ok(_) => true,

@@ -2,8 +2,7 @@
 
 use super::Error;
 use enumset::EnumSet;
-use std::ffi::CStr;
-use std::{convert, str};
+use std::{convert, ffi, str};
 
 #[derive(Debug, enumset::EnumSetType)]
 #[non_exhaustive]
@@ -24,8 +23,8 @@ impl ExportSignalSet {
         ExportSignalSet(EnumSet::empty())
     }
 
-    pub fn from_ptr(raw: &*const std::ffi::c_char) -> Result<Self, Error> {
-        match (!raw.is_null()).then(|| unsafe { CStr::from_ptr(*raw) }) {
+    pub fn try_from_ptr(raw: &*const ffi::c_char) -> Result<Self, Error> {
+        match (!raw.is_null()).then(|| unsafe { ffi::CStr::from_ptr(*raw) }) {
             None => Ok(Self::empty()),
             Some(cstr) => cstr.try_into(),
         }
@@ -64,16 +63,16 @@ impl str::FromStr for ExportSignalSet {
     }
 }
 
-impl convert::TryFrom<&CStr> for ExportSignalSet {
+impl convert::TryFrom<&ffi::CStr> for ExportSignalSet {
     type Error = Error;
 
-    fn try_from(raw: &CStr) -> Result<Self, Self::Error> {
+    fn try_from(raw: &ffi::CStr) -> Result<Self, Self::Error> {
         raw.to_str()?.parse()
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::{ExportSignal::*, ExportSignalSet};
     use enumset::EnumSet;
     use googletest::prelude::*;
@@ -108,26 +107,6 @@ mod test {
     }
 
     #[rstest]
-    #[case::all_wrong(c"other")]
-    #[case::one_wrong(c"logs, other")]
-    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
-    fn from_ptr_invalid(#[case] input: &std::ffi::CStr) {
-        assert_that!(ExportSignalSet::from_ptr(&input.as_ptr()), err(anything()));
-    }
-
-    #[rstest]
-    #[case::null(std::ptr::null(), EnumSet::empty())]
-    #[case::empty(c"".as_ptr(), EnumSet::empty())]
-    #[case(c"logs".as_ptr(), EnumSet::empty() | Logs)]
-    #[case(c"log, logs".as_ptr(), EnumSet::empty() | Logs)]
-    fn from_ptr_valid(
-        #[case] input: *const std::ffi::c_char,
-        #[case] expected: EnumSet<super::ExportSignal>,
-    ) {
-        assert_that!(ExportSignalSet::from_ptr(&input), ok(eq(&ExportSignalSet::from(expected))));
-    }
-
-    #[rstest]
     #[case::all_wrong("other")]
     #[case::one_wrong("logs, other")]
     fn parse_invalid(#[case] input: &str) {
@@ -143,5 +122,28 @@ mod test {
     #[case("log, log, log", EnumSet::empty() | Logs)]
     fn parse_valid(#[case] input: &str, #[case] expected: EnumSet<super::ExportSignal>) {
         assert_that!(input.parse::<ExportSignalSet>(), ok(eq(&ExportSignalSet::from(expected))));
+    }
+
+    #[rstest]
+    #[case::all_wrong(c"other")]
+    #[case::one_wrong(c"logs, other")]
+    #[case::not_utf8(c"\xf0\x28\x8c\x28")]
+    fn try_from_ptr_invalid(#[case] input: &std::ffi::CStr) {
+        assert_that!(ExportSignalSet::try_from_ptr(&input.as_ptr()), err(anything()));
+    }
+
+    #[rstest]
+    #[case::null(std::ptr::null(), EnumSet::empty())]
+    #[case::empty(c"".as_ptr(), EnumSet::empty())]
+    #[case(c"logs".as_ptr(), EnumSet::empty() | Logs)]
+    #[case(c"log, logs".as_ptr(), EnumSet::empty() | Logs)]
+    fn try_from_ptr_valid(
+        #[case] input: *const std::ffi::c_char,
+        #[case] expected: EnumSet<super::ExportSignal>,
+    ) {
+        assert_that!(
+            ExportSignalSet::try_from_ptr(&input),
+            ok(eq(&ExportSignalSet::from(expected)))
+        );
     }
 }
