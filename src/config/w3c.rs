@@ -32,12 +32,12 @@ impl Baggage {
             }
 
             let Some((k, v)) = item.split_once('=') else {
-                return Err(Error::Baggage(format!("missing value for key {item:?}")));
+                return Err(Error::Baggage(format!("key-value {item:?} has no '=' and no value")));
             };
 
             let k = k.trim();
             if k.is_empty() {
-                return Err(Error::Baggage(format!("missing key in {item:?}")));
+                return Err(Error::Baggage(format!("key-value {item:?} has no key")));
             }
 
             inner.push(otel::KeyValue::new(k.to_owned(), v.trim().to_owned()));

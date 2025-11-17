@@ -13,10 +13,10 @@ pub use self::postgres::{define_guc_variables, exporting, loaded};
 pub use self::protocol::*;
 pub use self::signals::{ExportSignal::*, *};
 pub use self::w3c::*;
+pub use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
 
 use opentelemetry_otlp as otlp;
 use opentelemetry_sdk as sdk;
-use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -29,14 +29,14 @@ pub struct Config {
 pub struct OTLP {
     pub compression: Option<otlp::Compression>,
     pub endpoint: String,
-    pub metadata: HashMap<String, String>,
+    pub headers: http::HeaderMap,
     pub protocol: otlp::Protocol,
     pub timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("malformed baggage: {0}")]
+    #[error("{0}")]
     Baggage(String),
 
     #[error(transparent)]

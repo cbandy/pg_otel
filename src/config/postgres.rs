@@ -4,7 +4,6 @@ use super::FromStr;
 use opentelemetry_otlp as otlp;
 use opentelemetry_sdk as sdk;
 use pgrx::pg_sys;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
@@ -17,10 +16,12 @@ type ParameterStr = pgrx::GucSetting<Option<CString>>;
 
 static OTEL_ATTRIBUTE_COUNT_LIMIT: ParameterInt = ParameterInt::new(128);
 static OTEL_EXPORTS: ParameterStr = ParameterStr::new(None);
+static OTEL_RESOURCE_ATTRIBUTES: ParameterStr = ParameterStr::new(None);
 static OTEL_SERVICE_NAME: ParameterStr = ParameterStr::new(Some(c"postgresql"));
 
 static OTEL_OTLP_COMPRESSION: ParameterStr = ParameterStr::new(None);
 static OTEL_OTLP_ENDPOINT: ParameterStr = ParameterStr::new(None); // populated during [`define_guc_variables()`]
+static OTEL_OTLP_HEADERS: ParameterStr = ParameterStr::new(None);
 static OTEL_OTLP_PROTOCOL: ParameterStr = ParameterStr::new(None); // populated during [`define_guc_variables()`]
 static OTEL_OTLP_TIMEOUT_MS: ParameterInt = ParameterInt::new(1); // populated during [`define_guc_variables()`]
 
@@ -34,7 +35,7 @@ static PARSED_EXPORTS: LazyLock<RwLock<super::ExportSignalSet>> =
 pub fn exporting(signal: super::ExportSignal) -> bool {
     match PARSED_EXPORTS.read() {
         Ok(exports) => exports.contains(signal),
-        Err(_) => false,
+        _ => false,
     }
 }
 
@@ -43,32 +44,37 @@ pub fn exporting(signal: super::ExportSignal) -> bool {
 /// # Safety
 ///
 /// This can only be called from the main thread because it reads from Postgres GUC variables.
-pub fn loaded() -> super::Config {
+pub unsafe fn loaded() -> super::Config {
     let export = super::OTLP {
         compression: match OTEL_OTLP_COMPRESSION.get() {
             None => None,
             Some(v) if v.is_empty() => None,
             Some(v) => Some(
                 super::ExportCompression::try_from(v.as_c_str())
-                    .expect("check ensures this is valid text")
+                    .unwrap()
                     .into(),
             ),
         },
         endpoint: match OTEL_OTLP_ENDPOINT.get() {
             None => otlp::OTEL_EXPORTER_OTLP_ENDPOINT_DEFAULT.into(),
             Some(v) => super::ExportEndpoint::try_from(v.as_c_str())
-                .expect("check ensures this is valid text")
+                .unwrap()
                 .to_string(),
         },
-        // TODO: validate as gRPC ASCII
-        metadata: HashMap::new(),
+        headers: match OTEL_OTLP_HEADERS.get() {
+            None => http::HeaderMap::new(),
+            Some(v) => super::Baggage::try_from(v.as_c_str())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        },
         protocol: match OTEL_OTLP_PROTOCOL.get() {
             None => otlp::OTEL_EXPORTER_OTLP_PROTOCOL_DEFAULT
                 .parse::<super::ExportProtocol>()
                 .unwrap()
                 .into(),
             Some(v) => super::ExportProtocol::try_from(v.as_c_str())
-                .expect("check ensures this is valid text")
+                .unwrap()
                 .into(),
         },
         timeout: match OTEL_OTLP_TIMEOUT_MS.get() {
@@ -77,18 +83,18 @@ pub fn loaded() -> super::Config {
         },
     };
 
-    // TODO: with_attributes()
     // TODO: with_schema_url()
 
     // Start with only the SDK name and version.
     let mut resource = sdk::Resource::builder_empty()
         .with_detector(Box::new(sdk::resource::TelemetryResourceDetector));
 
+    if let Some(v) = OTEL_RESOURCE_ATTRIBUTES.get() {
+        resource = resource.with_attributes(super::Baggage::try_from(v.as_c_str()).unwrap());
+    }
+
     if let Some(cstr) = OTEL_SERVICE_NAME.get() {
-        resource = resource.with_service_name(
-            cstr.into_string()
-                .expect("check ensures this is valid text"),
-        );
+        resource = resource.with_service_name(cstr.clone().into_string().unwrap());
     }
 
     super::Config {
@@ -166,12 +172,12 @@ pub fn define_guc_variables() {
         Options::NONE,
     );
 
-    // SAFETY: GUC hooks *must* be defined with #[pg_guard].
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.export",                 // name
             c"Signals to export over OTLP", // short
-            c"May be empty or \"logs\".",   // long
+            cr#"May be empty or "logs"."#,  // long
             &OTEL_EXPORTS,
             Context::SERVER_RELOAD,
             Options::LIST | Options::NAME,
@@ -210,18 +216,18 @@ pub fn define_guc_variables() {
         }
     }
 
-    // SAFETY: GUC hooks *must* be defined with #[pg_guard].
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
     #[cfg(any(feature = "gzip", feature = "zstd"))]
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.otlp_compression",                             // name
             c"Compression with which the exporter sends signals", // short
             #[cfg(all(feature = "gzip", feature = "zstd"))]
-            c"May be empty, \"gzip\" or \"zstd\".", // long
+            cr#"May be empty, "gzip" or "zstd"."#, // long
             #[cfg(all(feature = "gzip", not(feature = "zstd")))]
-            c"May be empty or \"gzip\".", // long
+            cr#"May be empty or "gzip"."#, // long
             #[cfg(all(not(feature = "gzip"), feature = "zstd"))]
-            c"May be empty or \"zstd\".", // long
+            cr#"May be empty or "zstd"."#, // long
             &OTEL_OTLP_COMPRESSION,
             Context::SERVER_RELOAD,
             Options::NONE,
@@ -251,7 +257,7 @@ pub fn define_guc_variables() {
         }
     }
 
-    // SAFETY: GUC hooks *must* be defined with #[pg_guard].
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.otlp_endpoint",                               // name
@@ -289,7 +295,43 @@ pub fn define_guc_variables() {
         }
     }
 
-    // SAFETY: GUC hooks *must* be defined with #[pg_guard].
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
+    unsafe {
+        GucRegistry::define_string_guc_with_hooks(
+            c"otel.otlp_headers",                        // name
+            c"Key-value pairs included in OTLP headers", // short
+            c"Formatted as W3C Baggage",                 // long
+            &OTEL_OTLP_HEADERS,
+            Context::SERVER_RELOAD,
+            Options::NONE,
+            Some(check), // check
+            None,        // assign
+            None,        // show
+        );
+
+        /// Called when a GUC value is proposed.
+        #[pgrx::pg_guard]
+        extern "C-unwind" fn check(
+            next: *mut *mut c_char,
+            _extra: *mut pgrx::void_mut_ptr,
+            _source: GucSource::Type,
+        ) -> bool {
+            debug_assert!(!next.is_null(), "expected value in check hook");
+
+            // SAFETY: dereference is safe because the pointer is never null.
+            let raw: *const c_char = unsafe { *next };
+
+            match super::Baggage::try_from_ptr(&raw).map(TryInto::<http::HeaderMap>::try_into) {
+                Ok(_) => true,
+                Err(err) => {
+                    HookError::detail(CString::new(err.to_string()).unwrap());
+                    false
+                }
+            }
+        }
+    }
+
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.otlp_protocol",              // name
@@ -338,9 +380,43 @@ pub fn define_guc_variables() {
         Options::UNIT_MS,       // milliseconds
     );
 
-    //todo!("string, hooks: otel.resource_attributes");
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
+    unsafe {
+        GucRegistry::define_string_guc_with_hooks(
+            c"otel.resource_attributes",                          // name
+            c"Key-value pairs to be used as resource attributes", // short
+            c"Formatted as W3C Baggage",                          // long
+            &OTEL_RESOURCE_ATTRIBUTES,
+            Context::SERVER_RELOAD,
+            Options::NONE,
+            Some(check), // check
+            None,        // assign
+            None,        // show
+        );
 
-    // SAFETY: GUC hooks *must* be defined with #[pg_guard].
+        /// Called when a GUC value is proposed.
+        #[pgrx::pg_guard]
+        extern "C-unwind" fn check(
+            next: *mut *mut c_char,
+            _extra: *mut pgrx::void_mut_ptr,
+            _source: GucSource::Type,
+        ) -> bool {
+            debug_assert!(!next.is_null(), "expected value in check hook");
+
+            // SAFETY: dereference is safe because the pointer is never null.
+            let raw: *const c_char = unsafe { *next };
+
+            match super::Baggage::try_from_ptr(&raw) {
+                Ok(_) => true,
+                Err(err) => {
+                    HookError::detail(CString::new(err.to_string()).unwrap());
+                    false
+                }
+            }
+        }
+    }
+
+    // SAFETY: GUC hooks *must* be defined with the [`pgrx::pg_guard`] attribute.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.service_name",            // name
@@ -368,11 +444,7 @@ pub fn define_guc_variables() {
 
             if raw.is_null() || unsafe { CStr::from_ptr(raw) }.is_empty() {
                 HookError::detail(
-                    CString::new(format!(
-                        "resource attribute {:?} cannot be blank",
-                        "service.name"
-                    ))
-                    .unwrap(),
+                    CString::new(r#"resource attribute "service.name" cannot be blank"#).unwrap(),
                 );
                 return false;
             }
@@ -464,6 +536,7 @@ pub fn define_guc_variables() {
 
         // https://opentelemetry.io/docs/specs/otel/protocol/exporter
         read(c"otel.otlp_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT");
+        read(c"otel.otlp_headers", "OTEL_EXPORTER_OTLP_HEADERS");
         read(c"otel.otlp_protocol", "OTEL_EXPORTER_OTLP_PROTOCOL");
         read(c"otel.otlp_timeout", "OTEL_EXPORTER_OTLP_TIMEOUT");
 
