@@ -140,12 +140,33 @@ impl HookError {
 pub fn define_guc_variables() {
     debug_assert!(crate::assert_postmaster_startup());
 
+    // Assign compile-time defaults stored in OpenTelemetry crates.
+    // [`GucRegistry`] expects static variables contain their default value when being registered.
+    //
+    // SAFETY: These pointers refer to values inside these static variables and are safe to dereference.
+    unsafe {
+        *OTEL_OTLP_ENDPOINT.as_ptr() =
+            pgrx::StringInfo::from(otlp::OTEL_EXPORTER_OTLP_ENDPOINT_DEFAULT)
+                .into_char_ptr()
+                .cast_mut();
+
+        *OTEL_OTLP_PROTOCOL.as_ptr() =
+            pgrx::StringInfo::from(otlp::OTEL_EXPORTER_OTLP_PROTOCOL_DEFAULT)
+                .into_char_ptr()
+                .cast_mut();
+
+        *OTEL_OTLP_TIMEOUT_MS.as_ptr() =
+            otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT.as_millis() as i32;
+    }
+
     use pgrx::{GucContext, GucFlags, GucRegistry, pg_sys::GucSource};
 
     struct Context;
     impl Context {
         /// startup or config; requires reload
         const SERVER_RELOAD: GucContext = GucContext::Sighup;
+        /// startup or config; requires restart
+        const _SERVER_RESTART: GucContext = GucContext::Postmaster;
         /// cannot be set, only shown
         const SHOW_ONLY: GucContext = GucContext::Internal;
     }
@@ -466,39 +487,6 @@ pub fn define_guc_variables() {
 
         #[cfg(not(any(feature = "pg13", feature = "pg14")))]
         pg_sys::MarkGUCPrefixReserved(c"otel".as_ptr());
-    }
-
-    // Assign defaults compiled into OpenTelemetry crates.
-    // SAFETY: SetConfigOption copies its inputs into a GUC memory context.
-    unsafe {
-        pg_sys::SetConfigOption(
-            c"otel.otlp_endpoint".as_ptr(),
-            CString::new(otlp::OTEL_EXPORTER_OTLP_ENDPOINT_DEFAULT)
-                .unwrap()
-                .as_ptr(),
-            pg_sys::GucContext::PGC_POSTMASTER,
-            pg_sys::GucSource::PGC_S_DEFAULT,
-        );
-        pg_sys::SetConfigOption(
-            c"otel.otlp_protocol".as_ptr(),
-            CString::new(otlp::OTEL_EXPORTER_OTLP_PROTOCOL_DEFAULT)
-                .unwrap()
-                .as_ptr(),
-            pg_sys::GucContext::PGC_POSTMASTER,
-            pg_sys::GucSource::PGC_S_DEFAULT,
-        );
-        pg_sys::SetConfigOption(
-            c"otel.otlp_timeout".as_ptr(),
-            CString::new(
-                otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
-                    .as_millis()
-                    .to_string(),
-            )
-            .unwrap()
-            .as_ptr(),
-            pg_sys::GucContext::PGC_POSTMASTER,
-            pg_sys::GucSource::PGC_S_DEFAULT,
-        );
     }
 
     // Read OpenTelemetry configuration from the environment.
