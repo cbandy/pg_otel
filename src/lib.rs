@@ -48,11 +48,13 @@ pub extern "C-unwind" fn _PG_init() {
     crate::config::define_guc_variables();
 }
 
-// This module must be visible at the root of the crate to configure `cargo pgrx test`.
+// This module must be visible at the root of the crate for `#[pg_test]` functions.
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {}
+    /// Each `#[pg_test]` function calls this from the Rust test binary before initializing Postgres.
+    pub fn setup(_attributes: Vec<&str>) {}
 
+    /// Each `#[pg_test]` function calls this while initializing Postgres.
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         assert_eq!(super::PG_OTEL_LIBRARY, "pg_otel");
         vec!["shared_preload_libraries = 'pg_otel'"]

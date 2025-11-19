@@ -11,32 +11,36 @@ crate-type = ["cdylib", "lib"]
 name = "pgrx_embed_pg_otel"
 path = "./src/bin/pgrx_embed.rs"
 
-# https://www.postgresql.org/support/versioning
 [features]
 default = ["pg17", "tls", "zstd"]
 
+# https://www.postgresql.org/support/versioning
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = []
 
 tls = ["opentelemetry-otlp/tls"]
 gzip = ["opentelemetry-otlp/gzip-http", "opentelemetry-otlp/gzip-tonic"]
 zstd = ["opentelemetry-otlp/zstd-http", "opentelemetry-otlp/zstd-tonic"]
 
+# tests annotated with `#[pgrx::pg_test]` are installed into a local Postgres by building this crate with the "pg_test" feature enabled.
+pg_test = ["dep:googletest"]
+
 [dependencies]
+http = { version = "1", default-features = false }
 libc = { version = "0", default-features = false }
 pgrx = { version = "0.16.1", default-features = false }
 
-opentelemetry_sdk = { version = "*", default-features = false }
+bincode = { version = "2", default-features = false, features = ["derive", "std"] }
+enumset = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false }
 
-bincode = "2"
-enumset = "1"
-http = "*"
-thiserror = "2"
+googletest = { version = "*", optional = true }
+opentelemetry = { version = "*", default-features = false }
+opentelemetry_sdk = { version = "*", default-features = false }
 
 [dependencies.opentelemetry-otlp]
 default-features = false
@@ -44,9 +48,13 @@ features = ["logs", "metrics", "trace", "grpc-tonic", "http-json", "http-proto"]
 version = "~0.31.0"
 
 [dev-dependencies]
-googletest = "*"
-pgrx-tests = { version = "0.16.1", default-features = false }
+googletest = { version = "*" }
+pgrx-tests = { version = "*", default-features = false }
 rstest = { version = "*", default-features = false }
+
+
+# All profiles must panic=unwind to interact properly with Postgres error handling.
+# - https://github.com/pgcentralfoundation/pgrx/blob/-/docs/src/ffi-error-handling.md
 
 [profile.dev]
 panic = "unwind"

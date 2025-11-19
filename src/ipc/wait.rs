@@ -121,6 +121,7 @@ impl WaitEventSet {
 #[pgrx::pg_schema]
 mod tests {
     use super::WaitEventSet;
+    use googletest::prelude::*;
     use pgrx::pg_sys;
 
     #[pgrx::pg_test]
@@ -146,8 +147,8 @@ mod tests {
         unsafe { pg_sys::MemoryContextMemConsumed(ctx.value(), counters.as_ptr()) };
         after = *counters;
 
-        assert_eq!(after.nblocks, during.nblocks);
-        assert!(after.freechunks > during.freechunks);
+        assert_that!(after.nblocks, eq(during.nblocks));
+        assert_that!(after.freechunks, gt(during.freechunks));
     }
 
     #[pgrx::pg_test]
@@ -167,6 +168,6 @@ mod tests {
             .wait(Some(std::time::Duration::from_secs(1)))
             .expect("no timeout");
 
-        assert_eq!(event.events & pg_sys::WL_SOCKET_READABLE, pg_sys::WL_SOCKET_READABLE);
+        assert_that!(event.events & pg_sys::WL_SOCKET_READABLE, not(eq(0)));
     }
 }
