@@ -5,11 +5,7 @@ edition = "2024"
 license-file = "LICENSE"
 
 [lib]
-crate-type = ["cdylib", "lib"]
-
-[[bin]]
-name = "pgrx_embed_pg_otel"
-path = "./src/bin/pgrx_embed.rs"
+crate-type = ["cdylib"]
 
 [features]
 default = ["pg17", "tls", "zstd"]
@@ -32,7 +28,7 @@ pg_test = ["dep:googletest"]
 [dependencies]
 http = { version = "1", default-features = false }
 libc = { version = "0", default-features = false }
-pgrx = { version = "0.16.1", default-features = false }
+pgrx = { version = "0.18.0", default-features = false }
 
 bincode = { version = "2", default-features = false, features = ["derive", "std"] }
 enumset = { version = "1", default-features = false }

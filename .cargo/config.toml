@@ -1,3 +1,5 @@
+# https://doc.rust-lang.org/cargo/reference/config.html
+
 [target.'cfg(target_os="macos")']
 # Postgres symbols won't be available until runtime
 rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
