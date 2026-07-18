@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+
+comment = 'pg_otel: FIXME'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_otel'
+relocatable = false
+superuser = true
+trusted = false

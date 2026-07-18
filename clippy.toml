@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+#
+# https://doc.rust-lang.org/stable/clippy/configuration.html
+
+check-private-items = true

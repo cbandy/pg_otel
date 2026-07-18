@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+
+[workspace]
+members = ["pg_otel"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+
+[workspace.dependencies]
+eyre = "0.6.12"
+googletest = "*"
+opentelemetry-proto = { version = "0.32.0", default-features = false }
+pgrx = "0.19.1"
+pgrx-tests = "0.19.1"
+prost = "0.14.4"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
