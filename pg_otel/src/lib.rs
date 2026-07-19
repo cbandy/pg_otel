@@ -2,6 +2,7 @@
 
 mod logging;
 mod otlp;
+mod shmem;
 
 pub(crate) use prost::bytes::BytesMut;
 
