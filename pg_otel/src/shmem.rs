@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use core::{mem, ptr};
+use core::{ffi, mem, ptr};
+use pgrx::pg_sys;
 
 #[inline]
 const fn align_upward(size: usize) -> usize {
@@ -15,10 +16,44 @@ pub enum PushError {
     TooLarge,
 }
 
+pub struct Queue {
+    header: &'static QueueHeader,
+    payload: *mut u8,
+    capacity: usize,
+}
+
+// QueueBuilder populates the `OnceLock` with a `Queue` of the requested size in shared memory.
+pub struct QueueBuilder {
+    pub queue: &'static std::sync::OnceLock<Queue>,
+    pub name: &'static ffi::CStr,
+    pub size: fn() -> usize,
+}
+impl pgrx::PgSharedMemoryInitialization for QueueBuilder {
+    type Value = ();
+
+    unsafe fn on_shmem_request(&'static self) {
+        let size = (self.size)();
+        unsafe { pg_sys::RequestAddinShmemSpace(size) };
+    }
+
+    unsafe fn on_shmem_startup(&'static self, _value: Self::Value) {
+        self.queue.get_or_init(|| {
+            let mut found = false;
+            let size = (self.size)();
+            let ptr = unsafe { pg_sys::ShmemInitStruct(self.name.as_ptr(), size, &mut found) };
+            if found {
+                unsafe { Queue::attach(ptr.cast(), size) }
+            } else {
+                unsafe { Queue::create(ptr.cast(), size) }
+            }
+        });
+    }
+}
+
 /// The shared memory header. Derives Default to cleanly reset all fields to zero.
 #[derive(Default)]
 #[repr(C)]
-pub struct QueueHeader {
+struct QueueHeader {
     head: AtomicUsize,
     tail: AtomicUsize,
     dropped: AtomicUsize,
@@ -28,14 +63,14 @@ pub struct QueueHeader {
 
 /// Header prepended to every item inside the ring buffer.
 #[repr(C)]
-pub struct SlotHeader {
+struct SlotHeader {
     status: AtomicU32,
     len: u32,
 }
 
 #[repr(u32)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum SlotStatus {
+enum SlotStatus {
     Free = 0,
     Committed = 1,
     Padding = 2,
@@ -43,7 +78,7 @@ pub enum SlotStatus {
 
 impl SlotHeader {
     /// Read the commit status atomically with Acquire ordering.
-    pub fn status(&self) -> Result<SlotStatus, u32> {
+    fn status(&self) -> Result<SlotStatus, u32> {
         let raw = self.status.load(Ordering::Acquire);
         match raw {
             0 => Ok(SlotStatus::Free),
@@ -54,20 +89,19 @@ impl SlotHeader {
     }
 
     /// Write the commit status atomically with Release ordering.
-    pub fn set_status(&self, status: SlotStatus) {
+    fn set_status(&self, status: SlotStatus) {
         self.status.store(status as u32, Ordering::Release);
     }
 }
 
-pub struct Queue {
-    header: &'static QueueHeader,
-    payload: *mut u8,
-    capacity: usize,
-}
+// SAFETY: Queue access is process-safe and atomic across shared memory segments.
+unsafe impl Send for Queue {}
+unsafe impl Sync for Queue {}
 
 impl Queue {
     /// Initialize a new shared memory queue; called once by Postmaster at startup.
-    pub unsafe fn create(raw_ptr: *mut u8, total_size: usize) -> Self {
+    unsafe fn create(raw_ptr: *mut u8, total_size: usize) -> Self {
+        assert!(raw_ptr.is_aligned());
         assert!(total_size > mem::size_of::<QueueHeader>());
 
         unsafe {
@@ -78,7 +112,7 @@ impl Queue {
     }
 
     /// Attach to an existing shared memory queue; called by backends and background workers.
-    pub unsafe fn attach(raw_ptr: *mut u8, total_size: usize) -> Self {
+    unsafe fn attach(raw_ptr: *mut u8, total_size: usize) -> Self {
         let header_size = mem::size_of::<QueueHeader>();
         assert!(total_size > header_size);
 
@@ -117,18 +151,28 @@ impl Queue {
         self.header.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn get_latch(&self) -> usize {
+    fn get_latch(&self) -> usize {
         self.header.latch.load(Ordering::Acquire)
     }
     pub fn set_latch(&self, v: usize) {
         self.header.latch.store(v, Ordering::Release);
     }
 
-    pub fn get_sleeping(&self) -> bool {
+    fn is_waiting(&self) -> bool {
         self.header.sleeping.load(Ordering::Acquire)
     }
-    pub fn set_sleeping(&self, v: bool) {
+    pub fn set_waiting(&self, v: bool) {
         self.header.sleeping.store(v, Ordering::Release);
+    }
+
+    /// Notify the background consumer process if it is currently waiting.
+    pub fn notify(&self) {
+        if self.is_waiting() {
+            let latch_ptr = self.get_latch() as *mut pg_sys::Latch;
+            if latch_ptr.is_null() {
+                unsafe { pg_sys::SetLatch(latch_ptr) };
+            }
+        }
     }
 
     /// Push telemetry bytes to the queue.
@@ -247,12 +291,6 @@ impl Queue {
         }
     }
 }
-
-// SAFETY: Allow threading to test concurrency.
-#[cfg(test)]
-unsafe impl Send for Queue {}
-#[cfg(test)]
-unsafe impl Sync for Queue {}
 
 #[cfg(test)]
 mod tests {
