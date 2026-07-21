@@ -9,6 +9,7 @@ edition = "2024"
 version = "0.0.0"
 
 [workspace.dependencies]
+atoi = "3.1"
 eyre = "0.6.12"
 googletest = "*"
 opentelemetry-proto = { version = "0.32.0", default-features = false }
