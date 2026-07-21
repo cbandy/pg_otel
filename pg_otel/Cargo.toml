@@ -20,6 +20,7 @@ pg19 = ["pgrx/pg19", "pgrx-tests/pg19" ]
 pg_test = []
 
 [dependencies]
+atoi.workspace = true
 eyre.workspace = true
 pgrx.workspace = true
 prost.workspace = true

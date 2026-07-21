@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+mod exporter;
 mod logging;
 mod otlp;
 mod shmem;
@@ -7,7 +8,6 @@ mod shmem;
 pub(crate) use prost::bytes::BytesMut;
 
 use pgrx::pg_sys;
-use std::time::Duration;
 
 const PG_OTEL_LIBRARY: &str = env!("CARGO_PKG_NAME");
 const PG_OTEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,43 +42,11 @@ const fn unlikely<T>(v: T) -> T {
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
-    use std::time::Duration;
-
     // Panic if the extension is loaded after Postgres startup.
     assert!(assert_postmaster_startup());
 
-    // Set the "extra" value so hooks know when they are running inside this worker.
-    BackgroundWorkerBuilder::new("OpenTelemetry exporter")
-        .set_start_time(BgWorkerStartTime::PostmasterStart)
-        .set_restart_time(Some(Duration::from_secs(1)))
-        .set_function("exporter_worker_main")
-        .set_library(PG_OTEL_LIBRARY)
-        .set_extra("E")
-        .load();
-
+    crate::exporter::install_hooks();
     crate::logging::install_hooks();
-}
-
-#[unsafe(no_mangle)]
-#[pgrx::pg_guard]
-pub extern "C-unwind" fn exporter_worker_main(_arg: pg_sys::Datum) {
-    use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
-
-    // Immediately register handlers and unblock signals.
-    // These handlers set MyLatch, ConfigReloadPending, and ShutdownRequestPending.
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-
-    pgrx::log!("{} is starting", BackgroundWorker::get_name(),);
-
-    // wake up every 10s or if we received a SIGTERM
-    while BackgroundWorker::wait_latch(Some(Duration::from_secs(10))) {
-        if BackgroundWorker::sighup_received() {
-            // on SIGHUP, you might want to reload some external configuration or something
-        }
-    }
-
-    pgrx::log!("{} stopped", BackgroundWorker::get_name());
 }
 
 // This module must be visible at the root of the crate for `#[pg_test]` functions.
