@@ -24,6 +24,7 @@ atoi.workspace = true
 eyre.workspace = true
 pgrx.workspace = true
 prost.workspace = true
+url.workspace = true
 
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
 
