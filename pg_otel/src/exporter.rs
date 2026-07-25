@@ -150,6 +150,67 @@ pub fn send_one(data: &crate::BytesMut) {
     send(&data, true);
 }
 
+/// Export an accumulated batch of OTLP log records.
+fn export_batch(batch: &[Vec<u8>]) {
+    use crate::otlp::*;
+    use prost::Message;
+
+    let records: Vec<LogRecord> = batch
+        .iter()
+        .filter_map(|bytes| LogRecord::decode(bytes.as_slice()).ok())
+        .collect();
+
+    if records.is_empty() {
+        return;
+    }
+
+    let scope = InstrumentationScope::build()
+        .name(crate::PG_OTEL_LIBRARY)
+        .version(crate::PG_OTEL_VERSION)
+        .finish();
+
+    let scope_logs = ScopeLogs::new(scope, records);
+    let resource_logs = ResourceLogs::new(None, vec![scope_logs]);
+    let service_request = ExportLogsServiceRequest::new(vec![resource_logs]);
+
+    let mut body = Vec::new();
+    if let Err(error) = service_request.encode(&mut body) {
+        return pgrx::warning!("pg_otel: failed to encode OTLP request: {error}");
+    }
+
+    let endpoint = config::Endpoint::from(&GUC_ENDPOINT).unwrap();
+    let timeout = time::Duration::from_millis(GUC_TIMEOUT_MS.get().max(1) as u64);
+
+    let mut request = match reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+    {
+        Ok(client) => client.post(endpoint.join("v1/logs").unwrap().as_str()),
+        Err(error) => {
+            return pgrx::warning!("pg_otel: failed to build HTTP client: {error}");
+        }
+    };
+
+    for (k, v) in config::Headers::from(&GUC_HEADERS) {
+        request = request.header(k, v);
+    }
+
+    let result = request
+        .header("Content-Type", "application/x-protobuf")
+        .body(body)
+        .send();
+
+    if let Err(error) = result {
+        return pgrx::warning!("pg_otel: failed to send OTLP log batch: {error}");
+    }
+    if let Ok(response) = result
+        && let status = response.status()
+        && !status.is_success()
+    {
+        return pgrx::warning!("pg_otel: export HTTP request failed with status: {status}");
+    }
+}
+
 #[unsafe(no_mangle)]
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
@@ -157,29 +218,57 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     // These handlers set MyLatch, ConfigReloadPending, and ShutdownRequestPending.
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    pgrx::log!("{} is starting", BackgroundWorker::get_name(),);
+    pgrx::log!("{} is starting", BackgroundWorker::get_name());
 
+    let mut batch = Vec::new();
+    let mut limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
     let incoming = QUEUE.get().unwrap();
     unsafe { incoming.set_latch(pg_sys::MyLatch as usize) };
+    unsafe { pg_sys::SetLatch(pg_sys::MyLatch) };
 
-    // wake up every 10s or if we received a SIGTERM or latch signal
-    while BackgroundWorker::wait_latch(Some(time::Duration::from_secs(10))) {
+    // Wake every time (1) GUC_BATCH_MAX_DELAY_MS passes, (2) the latch is set by a QUEUE producer,
+    // or (3) the latch is set by a SIGHUP or SIGTERM handler. Zero here waits forever, so clamp it
+    // to at least one.
+    while BackgroundWorker::wait_latch(Some({
+        time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get().max(1) as u64)
+    })) {
         if BackgroundWorker::sighup_received() {
-            // on SIGHUP, reload configuration if needed
+            // SAFETY: This is safe to call from the main thread.
+            unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
         }
 
         incoming.set_waiting(false);
+        limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
 
-        let mut count = 0;
-        while let Some(_data) = incoming.pop() {
-            count += 1;
+        while let Some(data) = incoming.pop() {
+            batch.push(data);
+
+            if batch.len() >= limit {
+                export_batch(&batch);
+                batch.clear();
+            }
         }
-
-        if count > 0 {
-            pgrx::log!("exporter worker popped {} log records", count);
+        if !batch.is_empty() {
+            export_batch(&batch);
+            batch.clear();
         }
 
         incoming.set_waiting(true);
+    }
+    incoming.set_waiting(false);
+
+    // Received a SIGTERM; gracefully shutdown by draining the queue.
+    while let Some(data) = incoming.pop() {
+        batch.push(data);
+
+        if batch.len() >= limit {
+            export_batch(&batch);
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        export_batch(&batch);
+        batch.clear();
     }
 
     pgrx::log!("{} stopped", BackgroundWorker::get_name());

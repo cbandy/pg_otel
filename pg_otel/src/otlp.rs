@@ -4,6 +4,7 @@ pub use self::ext::*;
 use std::ffi;
 
 pub use opentelemetry_proto::tonic::{
+    collector::logs::v1::ExportLogsServiceRequest,
     common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList},
     logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs, SeverityNumber as LogSeverity},
     resource::v1::Resource,
@@ -292,6 +293,16 @@ pub mod ext {
             }
         }
     }
+
+    impl ExportLogsServiceRequestExt for ExportLogsServiceRequest {}
+    pub trait ExportLogsServiceRequestExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn new<T: IntoIterator<Item = ResourceLogs>>(resource_logs: T) -> ExportLogsServiceRequest {
+            ExportLogsServiceRequest {
+                resource_logs: resource_logs.into_iter().collect(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +398,13 @@ mod tests {
             logs_data.resource_logs[0].scope_logs[0].schema_url,
             "http://schema.url"
         );
+    }
+
+    #[test]
+    fn test_export_logs_service_request() {
+        let resource = Resource::build().finish();
+        let resource_logs = ResourceLogs::new(resource, Vec::<ScopeLogs>::new());
+        let request = ExportLogsServiceRequest::new(vec![resource_logs]);
+        assert_eq!(request.resource_logs.len(), 1);
     }
 }
