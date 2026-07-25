@@ -45,6 +45,7 @@ pub extern "C-unwind" fn _PG_init() {
     // Panic if the extension is loaded after Postgres startup.
     assert!(assert_postmaster_startup());
 
+    crate::exporter::define_guc_variables();
     crate::exporter::install_hooks();
     crate::logging::install_hooks();
 }
