@@ -223,7 +223,7 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     let mut batch = Vec::new();
     let mut limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
     let incoming = QUEUE.get().unwrap();
-    unsafe { incoming.set_latch(pg_sys::MyLatch as usize) };
+    unsafe { incoming.set_latch(pg_sys::MyLatch) };
     unsafe { pg_sys::SetLatch(pg_sys::MyLatch) };
 
     // Wake every time (1) GUC_BATCH_MAX_DELAY_MS passes, (2) the latch is set by a QUEUE producer,
