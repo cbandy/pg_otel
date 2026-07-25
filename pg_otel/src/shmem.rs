@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::{ffi, mem, ptr};
 use pgrx::pg_sys;
 
@@ -57,7 +57,7 @@ struct QueueHeader {
     head: AtomicUsize,
     tail: AtomicUsize,
     dropped: AtomicUsize,
-    latch: AtomicUsize,
+    latch: AtomicPtr<pg_sys::Latch>,
     sleeping: AtomicBool,
 }
 
@@ -151,10 +151,10 @@ impl Queue {
         self.header.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn get_latch(&self) -> usize {
+    fn get_latch(&self) -> *mut pg_sys::Latch {
         self.header.latch.load(Ordering::Acquire)
     }
-    pub fn set_latch(&self, v: usize) {
+    pub fn set_latch(&self, v: *mut pg_sys::Latch) {
         self.header.latch.store(v, Ordering::Release);
     }
 
@@ -168,8 +168,8 @@ impl Queue {
     /// Notify the background consumer process if it is currently waiting.
     pub fn notify(&self) {
         if self.is_waiting() {
-            let latch_ptr = self.get_latch() as *mut pg_sys::Latch;
-            if latch_ptr.is_null() {
+            let latch_ptr = self.get_latch();
+            if !latch_ptr.is_null() {
                 unsafe { pg_sys::SetLatch(latch_ptr) };
             }
         }
@@ -297,6 +297,29 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn test_align_upward() {
+        let alignment = mem::align_of::<usize>();
+
+        // aligned values do not change.
+        assert_eq!(align_upward(0), 0);
+        assert_eq!(align_upward(alignment), alignment);
+        assert_eq!(align_upward(2 * alignment), 2 * alignment);
+        assert_eq!(align_upward(10 * alignment), 10 * alignment);
+
+        // rounds upward to the next aligned.
+        assert_eq!(align_upward(1), alignment);
+        assert_eq!(align_upward(alignment - 1), alignment);
+        assert_eq!(align_upward(alignment + 1), 2 * alignment);
+
+        for size in 0..100 {
+            let aligned = align_upward(size);
+            assert_eq!(aligned % alignment, 0, "always aligned");
+            assert!(aligned >= size, "always upward");
+            assert!(aligned - size < alignment, "always one step");
+        }
+    }
 
     #[test]
     fn test_basic_push_pop() {
