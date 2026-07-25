@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-use pgrx::guc::{GucCheckError, GucSetting};
+use pgrx::guc;
 use std::ffi;
 use url::Url as URL;
 
-pub type GucInt32 = GucSetting<i32>;
-pub type GucString = GucSetting<Option<ffi::CString>>;
+pub type GucInt32 = guc::GucSetting<i32>;
+pub type GucString = guc::GucSetting<Option<ffi::CString>>;
 
 pub struct Endpoint;
 
