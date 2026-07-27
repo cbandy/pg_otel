@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::{ffi, mem, ptr};
 use pgrx::pg_sys;
 
@@ -16,108 +16,78 @@ pub enum PushError {
     TooLarge,
 }
 
-pub struct Queue {
-    header: &'static QueueHeader,
+pub trait Queue {
+    fn push(&self, data: &[u8]) -> Result<(), PushError>;
+    fn pop(&self) -> Option<Vec<u8>>;
+    fn notify(&self);
+
+    fn get_dropped(&self) -> usize;
+    fn set_latch(&self, latch: *mut pg_sys::Latch);
+}
+
+/// [QueueAtomic] is a thread-safe [Queue] that uses atomics.
+struct QueueAtomic {
+    header: &'static QueueAtomicHeader,
     payload: *mut u8,
     capacity: usize,
 }
 
-// QueueBuilder populates the `OnceLock` with a `Queue` of the requested size in shared memory.
-pub struct QueueBuilder {
-    pub queue: &'static std::sync::OnceLock<Queue>,
-    pub name: &'static ffi::CStr,
-    pub size: fn() -> usize,
-}
-impl pgrx::PgSharedMemoryInitialization for QueueBuilder {
-    type Value = ();
-
-    unsafe fn on_shmem_request(&'static self) {
-        let size = (self.size)();
-        unsafe { pg_sys::RequestAddinShmemSpace(size) };
-    }
-
-    unsafe fn on_shmem_startup(&'static self, _value: Self::Value) {
-        self.queue.get_or_init(|| {
-            let mut found = false;
-            let size = (self.size)();
-            let ptr = unsafe { pg_sys::ShmemInitStruct(self.name.as_ptr(), size, &mut found) };
-            if found {
-                unsafe { Queue::attach(ptr.cast(), size) }
-            } else {
-                unsafe { Queue::create(ptr.cast(), size) }
-            }
-        });
-    }
-}
-
-/// The shared memory header. Derives Default to cleanly reset all fields to zero.
+/// The atomic fields of [QueueAtomic]. Derives [Default] to easily reset all fields to zero.
 #[derive(Default)]
 #[repr(C)]
-struct QueueHeader {
+struct QueueAtomicHeader {
     head: AtomicUsize,
     tail: AtomicUsize,
     dropped: AtomicUsize,
     latch: AtomicPtr<pg_sys::Latch>,
-    sleeping: AtomicBool,
 }
 
-/// Header prepended to every item inside the ring buffer.
-#[repr(C)]
-struct SlotHeader {
-    status: AtomicU32,
-    len: u32,
-}
+// SAFETY: QueueAtomic access is process-safe and atomic across shared memory segments.
+unsafe impl Send for QueueAtomic {}
+unsafe impl Sync for QueueAtomic {}
 
-#[repr(u32)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum SlotStatus {
-    Free = 0,
-    Committed = 1,
-    Padding = 2,
-}
+impl QueueAtomic {
+    /// Create a new queue allocated in Rust.
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        let align = mem::align_of::<QueueAtomicHeader>();
+        let size = capacity + mem::size_of::<QueueAtomicHeader>();
 
-impl SlotHeader {
-    /// Read the commit status atomically with Acquire ordering.
-    fn status(&self) -> Result<SlotStatus, u32> {
-        let raw = self.status.load(Ordering::Acquire);
-        match raw {
-            0 => Ok(SlotStatus::Free),
-            1 => Ok(SlotStatus::Committed),
-            2 => Ok(SlotStatus::Padding),
-            _ => Err(raw),
-        }
+        let layout = std::alloc::Layout::from_size_align(size, align).unwrap();
+        unsafe { Self::create(std::alloc::alloc(layout), size) }
     }
 
-    /// Write the commit status atomically with Release ordering.
-    fn set_status(&self, status: SlotStatus) {
-        self.status.store(status as u32, Ordering::Release);
-    }
-}
-
-// SAFETY: Queue access is process-safe and atomic across shared memory segments.
-unsafe impl Send for Queue {}
-unsafe impl Sync for Queue {}
-
-impl Queue {
-    /// Initialize a new shared memory queue; called once by Postmaster at startup.
+    /// Initialize a new queue.
+    ///
+    /// # Safety
+    ///
+    /// The memory at `raw_ptr` must be at least `total_size` bytes.
     unsafe fn create(raw_ptr: *mut u8, total_size: usize) -> Self {
-        assert!(raw_ptr.is_aligned());
-        assert!(total_size > mem::size_of::<QueueHeader>());
+        assert!(raw_ptr.is_aligned() && !raw_ptr.is_null());
+        assert!(total_size > mem::size_of::<QueueAtomicHeader>());
 
         unsafe {
             ptr::write_bytes(raw_ptr, 0, total_size);
-            ptr::write(raw_ptr as *mut QueueHeader, QueueHeader::default());
-            Queue::attach(raw_ptr, total_size)
+            ptr::write(
+                raw_ptr as *mut QueueAtomicHeader,
+                QueueAtomicHeader::default(),
+            );
+            QueueAtomic::attach(raw_ptr, total_size)
         }
     }
 
-    /// Attach to an existing shared memory queue; called by backends and background workers.
+    /// Attach to an existing queue.
+    ///
+    /// # Safety
+    ///
+    /// The memory at `raw_ptr` must be an initialized [QueueAtomic] occupying `total_size` bytes.
     unsafe fn attach(raw_ptr: *mut u8, total_size: usize) -> Self {
-        let header_size = mem::size_of::<QueueHeader>();
+        let header_size = mem::size_of::<QueueAtomicHeader>();
+        assert!(raw_ptr.is_aligned() && !raw_ptr.is_null());
         assert!(total_size > header_size);
 
         let capacity = total_size - header_size;
-        let header = unsafe { &*(raw_ptr as *const QueueHeader) };
+        let header = unsafe { &*(raw_ptr as *const QueueAtomicHeader) };
         let payload = unsafe { raw_ptr.add(header_size) };
 
         Self {
@@ -144,39 +114,24 @@ impl Queue {
             .is_ok()
     }
 
-    pub fn get_dropped(&self) -> usize {
-        self.header.dropped.load(Ordering::Acquire)
-    }
     fn increment_dropped(&self) {
         self.header.dropped.fetch_add(1, Ordering::Relaxed);
     }
-
     fn get_latch(&self) -> *mut pg_sys::Latch {
         self.header.latch.load(Ordering::Acquire)
     }
-    pub fn set_latch(&self, v: *mut pg_sys::Latch) {
+}
+
+impl Queue for QueueAtomic {
+    fn get_dropped(&self) -> usize {
+        self.header.dropped.load(Ordering::Acquire)
+    }
+    fn set_latch(&self, v: *mut pg_sys::Latch) {
         self.header.latch.store(v, Ordering::Release);
     }
 
-    fn is_waiting(&self) -> bool {
-        self.header.sleeping.load(Ordering::Acquire)
-    }
-    pub fn set_waiting(&self, v: bool) {
-        self.header.sleeping.store(v, Ordering::Release);
-    }
-
-    /// Notify the background consumer process if it is currently waiting.
-    pub fn notify(&self) {
-        if self.is_waiting() {
-            let latch_ptr = self.get_latch();
-            if !latch_ptr.is_null() {
-                unsafe { pg_sys::SetLatch(latch_ptr) };
-            }
-        }
-    }
-
-    /// Push telemetry bytes to the queue.
-    pub fn push(&self, data: &[u8]) -> Result<(), PushError> {
+    /// Push a message into the queue.
+    fn push(&self, data: &[u8]) -> Result<(), PushError> {
         let data_len = data.len();
         let header_size = mem::size_of::<SlotHeader>();
 
@@ -239,8 +194,8 @@ impl Queue {
         }
     }
 
-    /// Read the next available telemetry message from the queue.
-    pub fn pop(&self) -> Option<Vec<u8>> {
+    /// Read the next available message from the queue.
+    fn pop(&self) -> Option<Vec<u8>> {
         let header_size = mem::size_of::<SlotHeader>();
 
         // Loop to handle retries during wrap around.
@@ -290,6 +245,115 @@ impl Queue {
             }
         }
     }
+
+    /// Notify the queue consumer.
+    fn notify(&self) {
+        let latch_ptr = self.get_latch();
+        if !latch_ptr.is_null() {
+            unsafe { pg_sys::SetLatch(latch_ptr) };
+        }
+    }
+}
+
+/// [QueueSharedMemory] is a thread-safe [Queue] that resides in Postgres shared memory. Create a
+/// static instance using [QueueSharedMemory::new], then pass it to [pgrx::pg_shmem_init!] to hook
+/// it into Postgres shared memory callbacks.
+pub struct QueueSharedMemory {
+    name: &'static ffi::CStr,
+    size: std::sync::LazyLock<usize>,
+    inner: std::sync::OnceLock<QueueAtomic>,
+}
+
+impl pgrx::PgSharedMemoryInitialization for QueueSharedMemory {
+    type Value = ();
+
+    unsafe fn on_shmem_request(&'static self) {
+        unsafe { pg_sys::RequestAddinShmemSpace(*self.size) };
+    }
+
+    unsafe fn on_shmem_startup(&'static self, _value: Self::Value) {
+        self.queue();
+    }
+}
+
+impl QueueSharedMemory {
+    pub const fn new(name: &'static ffi::CStr, size: fn() -> usize) -> Self {
+        Self {
+            name,
+            size: std::sync::LazyLock::new(size),
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn queue(&self) -> &QueueAtomic {
+        self.inner.get_or_init(|| {
+            let mut found = false;
+            let size = *self.size;
+            let ptr = unsafe { pg_sys::ShmemInitStruct(self.name.as_ptr(), size, &mut found) };
+            if found {
+                // SAFETY: Postgres returned a pointer to `size` bytes.
+                unsafe { QueueAtomic::attach(ptr.cast(), size) }
+            } else {
+                // SAFETY: Postgres returned a pointer to `size` bytes.
+                unsafe { QueueAtomic::create(ptr.cast(), size) }
+            }
+        })
+    }
+}
+
+impl Queue for QueueSharedMemory {
+    fn push(&self, data: &[u8]) -> Result<(), PushError> {
+        self.queue().push(data)
+    }
+
+    fn pop(&self) -> Option<Vec<u8>> {
+        self.queue().pop()
+    }
+
+    fn notify(&self) {
+        self.queue().notify()
+    }
+
+    fn get_dropped(&self) -> usize {
+        self.queue().get_dropped()
+    }
+
+    fn set_latch(&self, latch: *mut pg_sys::Latch) {
+        self.queue().set_latch(latch)
+    }
+}
+
+/// Header prepended to every item inside the [QueueAtomic] ring buffer.
+#[repr(C)]
+struct SlotHeader {
+    status: AtomicU32,
+    len: u32,
+}
+
+#[repr(u32)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum SlotStatus {
+    Free = 0,
+    Committed = 1,
+    Padding = 2,
+}
+
+impl SlotHeader {
+    /// Read the commit status atomically with Acquire ordering.
+    fn status(&self) -> Result<SlotStatus, u32> {
+        let raw = self.status.load(Ordering::Acquire);
+        match raw {
+            0 => Ok(SlotStatus::Free),
+            1 => Ok(SlotStatus::Committed),
+            2 => Ok(SlotStatus::Padding),
+            _ => Err(raw),
+        }
+    }
+
+    /// Write the commit status atomically with Release ordering.
+    fn set_status(&self, status: SlotStatus) {
+        self.status.store(status as u32, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -322,9 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_push_pop() {
-        let mut mem = vec![0u8; 128]; // QueueHeader is 40 bytes + 88 bytes capacity
-        let queue = unsafe { Queue::create(mem.as_mut_ptr(), 128) };
+    fn test_queue_atomic_basic_push_pop() {
+        let queue = QueueAtomic::with_capacity(88);
 
         assert_eq!(queue.push(b"hello"), Ok(()));
         assert_eq!(queue.push(b"world"), Ok(()));
@@ -335,11 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_and_padding() {
-        let mut mem = vec![0u8; 80]; // 40 bytes header + 40 bytes capacity
-        let queue = unsafe { Queue::create(mem.as_mut_ptr(), 80) };
+    fn test_queue_atomic_wrap_and_padding() {
+        let queue = QueueAtomic::with_capacity(40);
 
-        // capacity is 40.
         // Message of 8 bytes requires: 8 (header) + 8 (data) = 16 bytes.
         assert_eq!(queue.push(b"12345678"), Ok(())); // occupies offset 0..16
 
@@ -356,9 +417,8 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrency() {
-        let mut mem = vec![0u8; 1024]; // 40 bytes header + 984 bytes capacity
-        let queue = Arc::new(unsafe { Queue::create(mem.as_mut_ptr(), 1024) });
+    fn test_queue_atomic_concurrency() {
+        let queue = Arc::new(QueueAtomic::with_capacity(984));
 
         let q_producer = queue.clone();
         let writer = thread::spawn(move || {
