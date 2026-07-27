@@ -3,10 +3,11 @@
 mod config;
 
 use self::config::{GucInt32, GucString};
+use crate::shmem::{Queue, QueueSharedMemory};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use pgrx::pg_sys;
-use std::{ffi, sync, time};
+use std::{ffi, time};
 use url::Url as URL;
 
 static GUC_BATCH_MAX_DELAY_MS: GucInt32 = GucInt32::new(1000);
@@ -18,7 +19,9 @@ static GUC_PROTOCOL: GucString = GucString::new(Some(c"http/protobuf"));
 static GUC_TIMEOUT_MS: GucInt32 = GucInt32::new(10000);
 
 // IPC queue in shared memory.
-static QUEUE: sync::OnceLock<crate::shmem::Queue> = sync::OnceLock::new();
+static QUEUE: QueueSharedMemory = QueueSharedMemory::new(c"pg_otel_exporter_queue", || {
+    1024 * 1024 // TODO: make configurable, PGC_POSTMASTER
+});
 
 pub fn define_guc_variables() {
     use pgrx::guc::{GucCheckError, GucContext, GucFlags, GucRegistry};
@@ -130,24 +133,18 @@ pub fn install_hooks() {
         .load();
 
     use pgrx::pg_guard;
-    pgrx::pg_shmem_init!(QUEUE_HOOK);
-    static QUEUE_HOOK: crate::shmem::QueueBuilder = crate::shmem::QueueBuilder {
-        name: c"pg_otel_exporter_queue",
-        queue: &QUEUE,
-        size: || 1024 * 1024, // TODO: make configurable, PGC_POSTMASTER
-    };
+    pgrx::pg_shmem_init!(QUEUE);
 }
 
 pub fn send(data: &crate::BytesMut, notify: bool) {
-    let outgoing = QUEUE.get().unwrap();
-    let result = outgoing.push(&data);
+    let result = QUEUE.push(data);
     if notify && result.is_ok() {
-        outgoing.notify();
+        QUEUE.notify();
     }
 }
 
 pub fn send_one(data: &crate::BytesMut) {
-    send(&data, true);
+    send(data, true);
 }
 
 /// Export an accumulated batch of OTLP log records.
@@ -222,8 +219,7 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
 
     let mut batch = Vec::new();
     let mut limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
-    let incoming = QUEUE.get().unwrap();
-    unsafe { incoming.set_latch(pg_sys::MyLatch) };
+    QUEUE.set_latch(unsafe { pg_sys::MyLatch });
     unsafe { pg_sys::SetLatch(pg_sys::MyLatch) };
 
     // Wake every time (1) GUC_BATCH_MAX_DELAY_MS passes, (2) the latch is set by a QUEUE producer,
@@ -237,11 +233,9 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
             unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
         }
 
-        incoming.set_waiting(false);
         limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
-
-        while let Some(data) = incoming.pop() {
-            batch.push(data);
+        while let Some(item) = QUEUE.pop() {
+            batch.push(item);
 
             if batch.len() >= limit {
                 export_batch(&batch);
@@ -252,23 +246,6 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
             export_batch(&batch);
             batch.clear();
         }
-
-        incoming.set_waiting(true);
-    }
-    incoming.set_waiting(false);
-
-    // Received a SIGTERM; gracefully shutdown by draining the queue.
-    while let Some(data) = incoming.pop() {
-        batch.push(data);
-
-        if batch.len() >= limit {
-            export_batch(&batch);
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        export_batch(&batch);
-        batch.clear();
     }
 
     pgrx::log!("{} stopped", BackgroundWorker::get_name());
