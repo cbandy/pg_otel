@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::PG_OTEL_LIBRARY;
-use pgrx::{PgBox, pg_sys};
+use pgrx::pg_sys;
 use std::{ffi, time};
 
 pub fn install_hooks() {
@@ -59,10 +59,8 @@ pub fn install_hooks() {
 
         // Gather context and send the log message to the background worker.
         // When logging breaks down, print to STDERR as a last resort.
-        //
-        // SAFETY: The edata value is owned by Postgres, usually in ErrorContext.
-        let record = unsafe { PgBox::from_pg(edata) };
-        if !record.is_null()
+        if edata.is_aligned()
+            && let Some(record) = unsafe { edata.as_ref() }
             && record.output_to_server
             && let Err(error) = export_log_record(&now, &record)
         {
@@ -81,10 +79,7 @@ pub fn install_hooks() {
 
 /// Combines timestamp, edata, and Postgres process metadata into an OTLP LogsData payload
 /// and pushes it into the shared memory queue.
-fn export_log_record(
-    timestamp: &time::SystemTime,
-    edata: &PgBox<pg_sys::ErrorData>,
-) -> eyre::Result<()> {
+fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) -> eyre::Result<()> {
     use crate::otlp::*;
 
     // TODO: let encoding = unsafe { pg_sys::GetMessageEncoding() };
@@ -236,4 +231,58 @@ fn export_log_record(
     let mut buffer = crate::BytesMut::new();
     prost::Message::encode(&record.finish(), &mut buffer)?;
     Ok(crate::exporter::send_one(&buffer))
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use crate::otlp::*;
+    use googletest::prelude::*;
+    use prost::Message;
+    use std::{thread, time};
+
+    #[pgrx::pg_test]
+    fn e2e_otlp_export() {
+        crate::acquire_test_lock();
+
+        // setup: clear the mock collector
+        let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
+        reqwest::blocking::get(&endpoint).unwrap();
+
+        pgrx::warning!("integration test log record message");
+
+        let start = time::Instant::now();
+        let mut data = Vec::new();
+        let mut done = false;
+
+        // retrieve records from the collector with timeout
+        while !done && start.elapsed() < time::Duration::from_secs(1) {
+            thread::sleep(time::Duration::from_millis(50));
+
+            let body = reqwest::blocking::get(&endpoint).unwrap().bytes().unwrap();
+            done = body.len() == 0 && data.len() > 0;
+            data.extend(LogsData::decode(body).unwrap().resource_logs);
+        }
+
+        assert_that!(
+            data,
+            contains(matches_pattern!(crate::otlp::ResourceLogs {
+                scope_logs: contains(matches_pattern!(crate::otlp::ScopeLogs {
+                    log_records: contains(matches_pattern!(crate::otlp::LogRecord {
+                        attributes: contains(eq(&crate::otlp::KeyValue::new(
+                            "process.pid",
+                            AnyValue::new_int(unsafe { pgrx::pg_sys::MyProcPid }),
+                        ))),
+                        body: some(eq(&AnyValue::new_string(
+                            "integration test log record message"
+                        ))),
+                        severity_text: eq("WARNING"),
+                        ..
+                    })),
+                    ..
+                })),
+                ..
+            })),
+        );
+    }
 }

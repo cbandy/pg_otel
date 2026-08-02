@@ -50,28 +50,50 @@ pub extern "C-unwind" fn _PG_init() {
     crate::logging::install_hooks();
 }
 
-// This module must be visible at the root of the crate for `#[pg_test]` functions.
+/// This module must be visible at the root of the crate for `#[pg_test]` functions. The Rust test
+/// binary uses it to initialize Postgres.
+///
+/// The Rust test binary is built with `#[cfg(all(test, feature = "pg_test"))]`.
+/// The library loaded into Postgres by `pgrx test` is built with `#[cfg(feature = "pg_test")]`.
+/// The library built by `pgrx package` has neither.
+///
+/// Every function annotated with `#[pg_test]` MUST be inside a module named "tests" with these
+/// attributes:
+///
+/// ```rust
+/// #[cfg(any(test, feature = "pg_test"))]
+/// #[pgrx::pg_schema]
+/// mod tests {}
+/// ```
+///
+/// https://github.com/pgcentralfoundation/pgrx/issues/1259
+/// https://github.com/pgcentralfoundation/pgrx/issues/1612
 #[cfg(test)]
 pub mod pg_test {
     /// Each `#[pg_test]` function calls this from the Rust test binary before initializing Postgres.
+    /// Comma-separated arguments to the macro arrive in the `Vec` here, e.g. `#[pg_test(A, B, C)]`.
     pub fn setup(_attributes: Vec<&str>) {}
 
-    /// Each `#[pg_test]` function calls this while initializing Postgres.
+    /// The first `#[pg_test]` function to run calls this (once) from the Rust test binary.
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        assert_eq!(super::PG_OTEL_LIBRARY, "pg_otel");
-        vec!["shared_preload_libraries = 'pg_otel'"]
-    }
+        let addr = crate::exporter::tests::HTTP_OTLP_SERVER.clone();
+        let endpoint = format!("pg_otel.endpoint = 'http://{}'", addr);
+        let preload = format!("shared_preload_libraries = '{}'", crate::PG_OTEL_LIBRARY);
 
-    // Every function annotated with `#[pg_test]` MUST be inside a module named "tests" with
-    // these attributes:
-    //
-    // ```rust
-    // #[cfg(any(test, feature = "pg_test"))]
-    // #[pgrx::pg_schema]
-    // mod tests {}
-    // ```
-    //
-    // https://github.com/pgcentralfoundation/pgrx/issues/1259
-    // https://github.com/pgcentralfoundation/pgrx/issues/1612
+        vec![
+            "pg_otel.batch_max_delay = '10ms'",
+            "pg_otel.timeout = '5s'",
+            Box::leak(endpoint.into_boxed_str()),
+            Box::leak(preload.into_boxed_str()),
+        ]
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn acquire_test_lock() {
+    const FNV: u64 = 0x922B03880484F257; // FNV-1a of "pg_otel"
+    const KEY: i64 = FNV as i64;
+    pgrx::Spi::get_one::<()>(&format!("SELECT pg_advisory_xact_lock({KEY})"))
+        .expect("failed to acquire pg_advisory_xact_lock");
 }

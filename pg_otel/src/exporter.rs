@@ -108,7 +108,7 @@ pub fn define_guc_variables() {
         1,
         i32::MAX,
         GucContext::Sighup, // server reload
-        GucFlags::empty(),  // none
+        GucFlags::UNIT_MS,
     );
     GucRegistry::define_string_guc(
         c"pg_otel.compression",
@@ -220,20 +220,21 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     let mut batch = Vec::new();
     let mut limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
     QUEUE.set_latch(unsafe { pg_sys::MyLatch });
-    unsafe { pg_sys::SetLatch(pg_sys::MyLatch) };
 
-    // Wake every time (1) GUC_BATCH_MAX_DELAY_MS passes, (2) the latch is set by a QUEUE producer,
-    // or (3) the latch is set by a SIGHUP or SIGTERM handler. Zero here waits forever, so clamp it
-    // to at least one.
-    while BackgroundWorker::wait_latch(Some({
-        time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get().max(1) as u64)
-    })) {
-        if BackgroundWorker::sighup_received() {
-            // SAFETY: This is safe to call from the main thread.
+    let mut shutdown_deadline: Option<time::Instant> = None;
+    let max_shutdown_delay = time::Duration::from_secs(5);
+
+    loop {
+        // Check for configuration changes before doing any work.
+        // SAFETY: This is set atomically by the SIGHUP handler and is safe to read here.
+        if unsafe { pg_sys::ConfigReloadPending } != 0 {
+            // Reset the signal flag then load the config file.
+            // SAFETY: These are safe to call from the main thread.
+            unsafe { pg_sys::ConfigReloadPending = 0 };
             unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
-        }
 
-        limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
+            limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
+        }
 
         while let Some(data) = QUEUE.pop() {
             batch.push(data);
@@ -247,6 +248,35 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
             export_batch(&batch);
             batch.clear();
         }
+
+        // When this process as been signaled to terminate, check for work more frequently and exit
+        // only after other backends have stopped.
+        //
+        // SAFETY: This is set atomically by the SIGTERM handler and is safe to read here.
+        let next_wait = if unsafe { pg_sys::ShutdownRequestPending } != 0 {
+            let now = time::Instant::now();
+            let deadline = *shutdown_deadline.get_or_insert_with(|| now + max_shutdown_delay);
+
+            // Continue exporting telemetry until all client backends and workers have terminated.
+            // Auxiliary processes (checkpointer, bgwriter, walwriter) are ignored/excluded here
+            // because they are not signaled until AFTER all background workers terminate.
+            //
+            // SAFETY: `CountDBBackends` acquires `ProcArrayLock` internally.
+            if now >= deadline || unsafe { pg_sys::CountDBBackends(pg_sys::InvalidOid) } <= 0 {
+                break;
+            }
+
+            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+                .min(deadline.saturating_duration_since(now))
+                .min(time::Duration::from_millis(100))
+        } else {
+            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+        };
+
+        // Sleep until (1) `next_wait` elapses, (2) the latch is set by a `QUEUE` producer, or (3)
+        // the latch is set by a SIGHUP or SIGTERM handler. Zero here waits forever, so clamp the
+        // value to at least one.
+        BackgroundWorker::wait_latch(Some(next_wait.max(time::Duration::from_millis(1))));
     }
 
     // Received a SIGTERM; gracefully shutdown by draining the queue.
@@ -264,4 +294,125 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     }
 
     pgrx::log!("{} stopped", BackgroundWorker::get_name());
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn endpoint() -> String {
+    GUC_ENDPOINT
+        .get()
+        .as_deref()
+        .map(ffi::CStr::to_string_lossy)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+pub mod tests {
+    use prost::Message;
+    use std::sync::LazyLock;
+    use tiny_http::*;
+
+    /// Mock OTLP collector for integration testing.
+    ///
+    /// The Rust test binary invokes this constructor once before initializing Postgres.
+    /// The server here listens for OTLP requests on a random port until the Rust test binary exits.
+    ///
+    /// NOTE: The `[pg_test]` macro (1) turns the function body into a SQL function annotated with
+    /// `#[cfg(feature = "pg_test")]` and (2) changes the test function into one remote call of that
+    /// SQL function.
+    ///
+    /// For the test function body to validate the OTLP requests sent to this listener, it must
+    /// reach (back) from the Postgres process to the test runner process.
+    pub static HTTP_OTLP_SERVER: LazyLock<ListenAddr> = LazyLock::new(|| {
+        let addr = ConfigListenAddr::from_socket_addrs("127.0.0.1:0").unwrap();
+        let config = ServerConfig { addr, ssl: None };
+        let server = Server::new(config).unwrap();
+        let mut sink = OTLP::default();
+        let bound = server.server_addr();
+
+        std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                sink.handle(request);
+            }
+        });
+
+        bound
+    });
+
+    #[derive(Default)]
+    struct OTLP {
+        logs: Vec<crate::otlp::ResourceLogs>,
+    }
+
+    impl OTLP {
+        fn handle(&mut self, request: Request) {
+            match (request.method(), request.url()) {
+                // https://opentelemetry.io/docs/specs/otlp#otlphttp
+                (Method::Post, "/v1/logs") => self.handle_otlp_logs(request),
+
+                // Returns some or all of a requested signal; "/test/{signal}[/{count}]"
+                (Method::Get, url) if url.starts_with("/test/") => {
+                    let path = url.strip_prefix("/test/").unwrap();
+                    let (signal, count) = path.split_once('/').unwrap_or((path, ""));
+                    let (signal, count) = (signal.to_owned(), Self::number(Some(count)));
+                    self.handle_test(request, signal, count);
+                }
+                _ => self.reject(request, None),
+            }
+        }
+
+        fn number(s: Option<&str>) -> Option<usize> {
+            s.map(str::as_bytes).and_then(atoi::atoi)
+        }
+
+        fn handle_otlp_logs(&mut self, mut request: Request) {
+            let n = request.body_length().unwrap_or(0);
+            let mut body = crate::BytesMut::zeroed(n);
+            let _ = request.as_reader().read_exact(body.as_mut());
+
+            match crate::otlp::ExportLogsServiceRequest::decode(body) {
+                Err(error) => self.reject(request, Some(error.into())),
+                Ok(export) => {
+                    self.logs.extend(export.resource_logs);
+                    let _ = request.respond(Response::empty(200));
+                }
+            }
+        }
+
+        fn handle_test(&mut self, request: Request, signal: String, count: Option<usize>) {
+            use crate::otlp::*;
+
+            let body = match signal.as_str() {
+                "logs" => {
+                    let n = count.map_or(self.logs.len(), |n| n.min(self.logs.len()));
+                    LogsData::new(self.logs.drain(..n)).encode_to_vec()
+                }
+                _ => {
+                    return self.reject(request, None);
+                }
+            };
+
+            let proto: Header = "Content-Type: application/x-protobuf".parse().unwrap();
+            let _ = request.respond(
+                Response::empty(200)
+                    .with_header(proto)
+                    .with_data(&body[..], Some(body.len())),
+            );
+        }
+
+        fn reject(&self, request: Request, error: Option<eyre::Error>) {
+            if let Some(error) = error {
+                let body = error.to_string();
+                let _ = request.respond(Response::new(
+                    StatusCode(400),
+                    Vec::new(),
+                    body.as_bytes(),
+                    Some(body.len()),
+                    None,
+                ));
+            } else {
+                let _ = request.respond(Response::empty(400));
+            }
+        }
+    }
 }
