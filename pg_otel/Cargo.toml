@@ -2,22 +2,11 @@
 
 [package]
 name = "pg_otel"
-edition.workspace = true
 version.workspace = true
+edition.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
-
-[features]
-default = ["pg13"]
-pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
-pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
-pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
-pg19 = ["pgrx/pg19", "pgrx-tests/pg19" ]
-pg_test = []
 
 [dependencies]
 atoi.workspace = true
@@ -27,8 +16,26 @@ prost.workspace = true
 reqwest.workspace = true
 url.workspace = true
 
-opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
+opentelemetry-proto = {
+  workspace = true,
+  features = ["gen-tonic-messages", "logs", "metrics", "trace"]
+}
+
+# [pg_test] dependencies
+googletest = { workspace = true, optional = true }
 
 [dev-dependencies]
 googletest.workspace = true
 pgrx-tests.workspace = true
+tiny_http.workspace = true
+
+[features]
+default = ["pg13"]
+pg_test = ["dep:googletest"]
+pg13 = ["pgrx-tests/pg13", "pgrx/pg13"]
+pg14 = ["pgrx-tests/pg14", "pgrx/pg14"]
+pg15 = ["pgrx-tests/pg15", "pgrx/pg15"]
+pg16 = ["pgrx-tests/pg16", "pgrx/pg16"]
+pg17 = ["pgrx-tests/pg17", "pgrx/pg17"]
+pg18 = ["pgrx-tests/pg18", "pgrx/pg18"]
+pg19 = ["pgrx-tests/pg19", "pgrx/pg19"]

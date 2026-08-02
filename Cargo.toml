@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 
 [workspace]
-members = ["pg_otel"]
 resolver = "3"
+members = ["pg_otel"]
 
 [workspace.package]
-edition = "2024"
 version = "0.0.0"
+edition = "2024"
 
 [workspace.dependencies]
 atoi = "3.1"
@@ -17,13 +17,14 @@ pgrx = "0.19.1"
 pgrx-tests = "0.19.1"
 prost = "0.14.4"
 reqwest = { version = "0.12", features = ["blocking"] }
+tiny_http = "0.12"
 url = "2.5"
 
 [profile.dev]
 panic = "unwind"
 
 [profile.release]
-panic = "unwind"
 opt-level = 3
 lto = "fat"
+panic = "unwind"
 codegen-units = 1
