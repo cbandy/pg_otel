@@ -58,7 +58,7 @@ sequenceDiagram
 ### General Extension Hook Points at Startup
 
 *   **`_PG_init()`**: Called by Postmaster immediately when the extension's `.so` or `.dll` library is loaded. Extensions use this entrypoint to define custom GUC variables (`DefineCustomIntVariable`), register background workers (`RegisterBackgroundWorker`), and set up hook function pointers.
-*   **`shmem_request_hook` *(PG15+)***: Executed during Postmaster shared memory size estimation, **before** OS memory allocation. Extensions call `RequestAddinShmemSpace(bytes)` and `RequestNamedLWLockTranche()` here. *(In PG13/14, `RequestAddinShmemSpace` was called in `_PG_init`)*.
+*   **`shmem_request_hook` _(PG15+)_**: Executed during Postmaster shared memory size estimation, **before** OS memory allocation. Extensions call `RequestAddinShmemSpace(bytes)` and `RequestNamedLWLockTranche()` here. *(In PG13/14, `RequestAddinShmemSpace` was called in `_PG_init`)*.
 *   **`shmem_startup_hook`**: Executed after OS shared memory is allocated. Extensions call `ShmemInitStruct("name", size, &mut found)` to initialize or attach to their shared memory structures.
 
 ---
@@ -132,16 +132,20 @@ sequenceDiagram
 
 ### Backend Lifecycles & Diagnostic Hooks
 
-*   **Query Lifecycle:** Queries transition through `Parse` $\rightarrow$ `Analyze` $\rightarrow$ `Plan` $\rightarrow$ `Execute` $\rightarrow$ `Commit`/`Abort`.
+*   **Query Lifecycle**: Queries transition through `Parse` $\rightarrow$ `Analyze` $\rightarrow$ `Plan` $\rightarrow$ `Execute` $\rightarrow$ `Commit`/`Abort`.
 *   **`emit_log_hook`**: Executed whenever PostgreSQL's internal `ereport()` or `elog()` macros write a log, warning, error, or debug message. Extensions can inspect or suppress `ErrorData` fields (e.g. SQLSTATE, error message, severity, line number).
-*   **Transaction Aborts (`ERROR` / `FATAL`):** When a transaction fails, PostgreSQL aborts the transaction and rolls back database state. Shared memory writes (IPC queues) are independent of database transaction rollbacks and remain intact.
-*   **Backend Crashes (SIGSEGV / Panic):** If a backend process crashes, Postmaster catches `SIGCHLD`, sends `SIGQUIT` to all other backends to stop execution, resets shared memory, and runs crash recovery.
+*   **Transaction Aborts**: (`ERROR` / `FATAL`) When a transaction fails, PostgreSQL aborts the transaction and rolls back database state. Shared memory writes (IPC queues) are independent of database transaction rollbacks and remain intact.
+*   **Backend Crashes**: (SIGSEGV / Panic) If a backend process crashes, Postmaster catches `SIGCHLD`, sends `SIGQUIT` to all other backends to stop execution, resets shared memory, and runs crash recovery.
 
 ---
 
 ## 3. Signal Handling, Config Reloads, and Shutdown
 
 PostgreSQL processes communicate shutdown requests and configuration reloads via UNIX signals and Latch primitives.
+
+### Latch Synchronization (`WaitLatch` / `SetLatch`)
+
+In PostgreSQL's process architecture, background workers sleep using `WaitLatch()`. When another process (a backend or Postmaster) needs to wake up the worker, it calls `SetLatch(&worker->latch)`. This provides a zero-overhead, event-driven sleeping and waking mechanism without polling.
 
 ### Shutdown & Signal Handling Diagram
 
@@ -172,9 +176,16 @@ sequenceDiagram
 | Shutdown Mode | Signal | Behavior |
 | :--- | :--- | :--- |
 | **Smart Shutdown** | `SIGINT` | Disallows new connections; waits for existing client sessions and background workers to finish. |
-| **Fast Shutdown** *(Default)* | `SIGTERM` | Terminates active client sessions, rolls back active transactions, signals background workers, and shuts down immediately. |
+| **Fast Shutdown** _(Default)_ | `SIGTERM` | Terminates active client sessions, rolls back active transactions, signals background workers, and shuts down immediately. |
 | **Immediate Shutdown** | `SIGQUIT` | Postmaster terminates all child processes immediately without clean shutdown, requiring crash recovery on next startup. |
 
-### Latch Synchronization (`WaitLatch` / `SetLatch`)
+### PostgreSQL Shutdown Phase Ordering
 
-In PostgreSQL's process architecture, background workers sleep using `WaitLatch()`. When another process (a backend or Postmaster) needs to wake up the worker, it calls `SetLatch(&worker->latch)`. This provides a zero-overhead, event-driven sleeping and waking mechanism without polling.
+During server shutdown (`Fast` or `Smart`), PostgreSQL manages process termination in distinct phases to ensure data integrity:
+
+1.  **Phase 1**: `PM_WAIT_BACKENDS`
+    *   Postmaster sends `SIGTERM` to all **client backends**, **autovacuum launcher/workers**, **parallel query workers**, and custom **background workers**.
+    *   Postmaster waits for all Phase 1 processes to exit.
+2.  **Phase 2**: `PM_SHUTDOWN`
+    *   Postmaster intentionally keeps auxiliary processes (**checkpointer**, **background writer**, **WAL writer**) running throughout Phase 1 so those backends and workers can finish logging WAL and flushing pages.
+    *   Postmaster signals auxiliary processes to execute the final shutdown checkpoint and exit **only after all Phase 1 processes have exited**.

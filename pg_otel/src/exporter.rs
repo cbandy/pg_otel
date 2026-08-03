@@ -220,21 +220,20 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     let mut batch = Vec::new();
     QUEUE.set_latch(unsafe { pg_sys::MyLatch });
 
-    unsafe { pg_sys::SetLatch(pg_sys::MyLatch) };
+    let mut shutdown_deadline: Option<time::Instant> = None;
+    let max_shutdown_delay = time::Duration::from_secs(5);
 
-    // Wake every time (1) GUC_BATCH_MAX_DELAY_MS passes, (2) the latch is set by a QUEUE producer,
-    // or (3) the latch is set by a SIGHUP or SIGTERM handler. Zero here waits forever, so clamp it
-    // to at least one.
-    while BackgroundWorker::wait_latch(Some({
-        time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get().max(1) as u64)
-    })) {
-        if BackgroundWorker::sighup_received() {
-            // SAFETY: This is safe to call from the main thread.
+    loop {
+        // Check for configuration changes before doing any work.
+        // SAFETY: This is set atomically by the SIGHUP handler and is safe to read here.
+        if unsafe { pg_sys::ConfigReloadPending } != 0 {
+            // Reset the signal flag then load the config file.
+            // SAFETY: These are safe to call from the main thread.
+            unsafe { pg_sys::ConfigReloadPending = 0 };
             unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
         }
 
         let limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
-
         while let Some(item) = QUEUE.pop() {
             batch.push(item);
 
@@ -247,6 +246,35 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
             export_batch(&batch);
             batch.clear();
         }
+
+        // When this process as been signaled to terminate, check for work more frequently and exit
+        // only after other backends have stopped.
+        //
+        // SAFETY: This is set atomically by the SIGTERM handler and is safe to read here.
+        let next_wait = if unsafe { pg_sys::ShutdownRequestPending } != 0 {
+            let now = time::Instant::now();
+            let deadline = *shutdown_deadline.get_or_insert_with(|| now + max_shutdown_delay);
+
+            // Continue exporting telemetry until all client backends and workers have terminated.
+            // Auxiliary processes (checkpointer, bgwriter, walwriter) are ignored/excluded here
+            // because they are not signalled until AFTER all background workers terminate.
+            //
+            // SAFETY: `CountDBBackends` acquires `ProcArrayLock` internally.
+            if now >= deadline || unsafe { pg_sys::CountDBBackends(pg_sys::InvalidOid) } <= 0 {
+                break;
+            }
+
+            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+                .min(deadline.saturating_duration_since(now))
+                .min(time::Duration::from_millis(100))
+        } else {
+            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+        };
+
+        // Sleep until (1) `next_wait` elapses, (2) the latch is set by a `QUEUE` producer, or (3)
+        // the latch is set by a SIGHUP or SIGTERM handler. Zero here waits forever, so clamp the
+        // value to at least one.
+        BackgroundWorker::wait_latch(Some(next_wait.max(time::Duration::from_millis(1))));
     }
 
     pgrx::log!("{} stopped", BackgroundWorker::get_name());
