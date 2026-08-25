@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["pg_otel"]
+members = ["pg_otel", "sequencing"]
 
 [workspace.package]
 version = "0.0.0"
@@ -13,8 +13,9 @@ atoi = "3.1"
 eyre = "0.6.12"
 googletest = "*"
 opentelemetry-proto = { version = "0.32.0", default-features = false }
-pgrx = "0.19.1"
-pgrx-tests = "0.19.1"
+pgrx = "0.19.2"
+pgrx-tests = "0.19.2"
+postgres = "0.19"
 prost = "0.14.4"
 reqwest = { version = "0.12", features = ["blocking"] }
 tiny_http = "0.12"
