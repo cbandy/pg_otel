@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+
+comment = 'Document the execution of PostgreSQL hooks as tests'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/sequencing'
+relocatable = false
+superuser = true
+trusted = false
