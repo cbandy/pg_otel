@@ -2,8 +2,8 @@
 
 mod config;
 
-use self::config::{GucInt32, GucString};
 use crate::shmem::{Queue, QueueSharedMemory};
+use crate::{GucInt32, GucString};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use pgrx::pg_sys;
@@ -86,7 +86,7 @@ pub fn define_guc_variables() {
         c"Maximum number of log records exported in a single HTTP batch.",
         &GUC_BATCH_MAX_ITEMS,
         1,
-        i32::MAX,
+        i32::MAX / 4,
         GucContext::Sighup, // server reload
         GucFlags::empty(),  // none
     );
@@ -96,7 +96,7 @@ pub fn define_guc_variables() {
         c"Maximum duration (in milliseconds) the exporter waits before flushing.",
         &GUC_BATCH_MAX_DELAY_MS,
         0,
-        i32::MAX,
+        time::Duration::from_hours(1).as_millis() as i32,
         GucContext::Sighup, // server reload
         GucFlags::UNIT_MS,
     );
@@ -132,6 +132,7 @@ pub fn install_hooks() {
         .set_extra("E")
         .load();
 
+    // https://github.com/pgcentralfoundation/pgrx/issues/2370
     use pgrx::pg_guard;
     pgrx::pg_shmem_init!(QUEUE);
 }
@@ -147,34 +148,57 @@ pub fn send_one(data: &crate::BytesMut) {
     send(data, true);
 }
 
-/// Export an accumulated batch of OTLP log records.
+/// Export an accumulated batch of OTLP data.
 fn export_batch(batch: &[Vec<u8>]) {
     use crate::otlp::*;
-    use prost::Message;
-
-    let records: Vec<LogRecord> = batch
-        .iter()
-        .filter_map(|bytes| LogRecord::decode(bytes.as_slice()).ok())
-        .collect();
-
-    if records.is_empty() {
-        return;
-    }
 
     let scope = InstrumentationScope::build()
         .name(crate::PG_OTEL_LIBRARY)
         .version(crate::PG_OTEL_VERSION)
         .finish();
 
-    let scope_logs = ScopeLogs::new(scope, records);
-    let resource_logs = ResourceLogs::new(None, vec![scope_logs]);
-    let service_request = ExportLogsServiceRequest::new(vec![resource_logs]);
+    let records: Vec<LogRecord> = batch
+        .iter()
+        .filter_map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
+        .collect();
 
-    let mut body = Vec::new();
-    if let Err(error) = service_request.encode(&mut body) {
-        return pgrx::warning!("pg_otel: failed to encode OTLP request: {error}");
+    if !records.is_empty() {
+        let path = "v1/logs";
+
+        let scope_logs = ScopeLogs::new(scope.clone(), records);
+        let resource_logs = ResourceLogs::new(None, vec![scope_logs]);
+        let service_request = ExportLogsServiceRequest::new(vec![resource_logs]);
+
+        let mut body = Vec::new();
+        if let Err(error) = prost::Message::encode(&service_request, &mut body) {
+            pgrx::warning!("pg_otel: failed to encode OTLP {path} request: {error}");
+        } else {
+            export_otlp(path, "application/x-protobuf", body);
+        }
     }
 
+    let spans: Vec<Span> = batch
+        .iter()
+        .filter_map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
+        .collect();
+
+    if !spans.is_empty() {
+        let path = "v1/traces";
+
+        let scope_spans = ScopeSpans::new(scope.clone(), spans);
+        let resource_spans = ResourceSpans::create(None, vec![scope_spans]);
+        let service_request = ExportTraceServiceRequest::new(vec![resource_spans]);
+
+        let mut body = Vec::new();
+        if let Err(error) = prost::Message::encode(&service_request, &mut body) {
+            pgrx::warning!("pg_otel: failed to encode OTLP {path} request: {error}");
+        } else {
+            export_otlp(path, "application/x-protobuf", body);
+        }
+    }
+}
+
+fn export_otlp(path: &str, content: &str, body: Vec<u8>) {
     let endpoint = config::Endpoint::from(&GUC_ENDPOINT).unwrap();
     let timeout = time::Duration::from_millis(GUC_TIMEOUT_MS.get().max(1) as u64);
 
@@ -182,7 +206,7 @@ fn export_batch(batch: &[Vec<u8>]) {
         .timeout(timeout)
         .build()
     {
-        Ok(client) => client.post(endpoint.join("v1/logs").unwrap().as_str()),
+        Ok(client) => client.post(endpoint.join(path).unwrap().as_str()),
         Err(error) => {
             return pgrx::warning!("pg_otel: failed to build HTTP client: {error}");
         }
@@ -192,19 +216,17 @@ fn export_batch(batch: &[Vec<u8>]) {
         request = request.header(k, v);
     }
 
-    let result = request
-        .header("Content-Type", "application/x-protobuf")
-        .body(body)
-        .send();
+    let response = match request.header("Content-Type", content).body(body).send() {
+        Ok(response) => response,
+        Err(error) => {
+            return pgrx::warning!("pg_otel: failed to send OTLP {path} batch: {error}");
+        }
+    };
 
-    if let Err(error) = result {
-        return pgrx::warning!("pg_otel: failed to send OTLP log batch: {error}");
-    }
-    if let Ok(response) = result
-        && let status = response.status()
+    if let status = response.status()
         && !status.is_success()
     {
-        return pgrx::warning!("pg_otel: export HTTP request failed with status: {status}");
+        return pgrx::warning!("pg_otel: export HTTP {path} failed with status: {status}");
     }
 }
 
@@ -326,6 +348,7 @@ pub mod tests {
     #[derive(Default)]
     struct OTLP {
         logs: Vec<crate::otlp::ResourceLogs>,
+        traces: Vec<crate::otlp::ResourceSpans>,
     }
 
     impl OTLP {
@@ -333,6 +356,7 @@ pub mod tests {
             match (request.method(), request.url()) {
                 // https://opentelemetry.io/docs/specs/otlp#otlphttp
                 (Method::Post, "/v1/logs") => self.handle_otlp_logs(request),
+                (Method::Post, "/v1/traces") => self.handle_otlp_traces(request),
 
                 // Returns some or all of a requested signal; "/test/{signal}[/{count}]"
                 (Method::Get, url) if url.starts_with("/test/") => {
@@ -363,13 +387,31 @@ pub mod tests {
             }
         }
 
+        fn handle_otlp_traces(&mut self, mut request: Request) {
+            let n = request.body_length().unwrap_or(0);
+            let mut body = crate::BytesMut::zeroed(n);
+            let _ = request.as_reader().read_exact(body.as_mut());
+
+            match crate::otlp::ExportTraceServiceRequest::decode(body) {
+                Err(error) => self.reject(request, Some(error.into())),
+                Ok(export) => {
+                    self.traces.extend(export.resource_spans);
+                    let _ = request.respond(Response::empty(200));
+                }
+            }
+        }
+
         fn handle_test(&mut self, request: Request, signal: String, count: Option<usize>) {
             use crate::otlp::*;
 
             let body = match signal.as_str() {
                 "logs" => {
                     let n = count.map_or(self.logs.len(), |n| n.min(self.logs.len()));
-                    LogsData::new(self.logs.drain(..n)).encode_to_vec()
+                    prost::Message::encode_to_vec(&LogsData::new(self.logs.drain(..n)))
+                }
+                "traces" => {
+                    let n = count.map_or(self.traces.len(), |n| n.min(self.traces.len()));
+                    prost::Message::encode_to_vec(&TracesData::new(self.traces.drain(..n)))
                 }
                 _ => {
                     return self.reject(request, None);

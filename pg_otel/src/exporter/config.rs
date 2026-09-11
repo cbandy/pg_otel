@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-use pgrx::guc;
 use std::ffi;
 use url::Url as URL;
-
-pub type GucInt32 = guc::GucSetting<i32>;
-pub type GucString = guc::GucSetting<Option<ffi::CString>>;
 
 pub struct Endpoint;
 
 impl Endpoint {
-    pub fn from(trusted: &GucString) -> Option<URL> {
+    pub fn from(trusted: &crate::GucString) -> Option<URL> {
         trusted.get().map(|v| v.to_string_lossy().parse().unwrap())
     }
 
@@ -28,7 +24,7 @@ impl Endpoint {
 pub struct Headers;
 
 impl Headers {
-    pub fn from(trusted: &GucString) -> Vec<(String, String)> {
+    pub fn from(trusted: &crate::GucString) -> Vec<(String, String)> {
         trusted
             .get()
             .map(|v| Self::parse(&v.to_string_lossy()).unwrap())

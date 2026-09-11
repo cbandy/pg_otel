@@ -42,12 +42,10 @@ pub fn install_hooks() {
         let worker = unsafe { !pg_sys::MyBgworkerEntry.is_null() };
         let exporter = worker && BackgroundWorker::get_extra() == "E";
 
-        let log_exports_enabled = true;
-
         // Export log messages when configured to do so. Sending messages *from* the exporter *to* the
         // exporter could cause a feedback loop, so don't do that. These messages still go to the next
         // log processor which is usually Postgres' built-in logging collector or stderr.
-        if exporter || !log_exports_enabled {
+        if exporter || !crate::ENABLED.get().logs() {
             return call_remaining_hooks(edata);
         }
 
@@ -203,7 +201,6 @@ fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) ->
 
         // WARNING_CLIENT_ONLY is available since Postgres 14.
         // The log hook is not called for this severity, but it is included here for completeness.
-        #[cfg(not(feature = "pg13"))]
         pg_sys::WARNING_CLIENT_ONLY => crate::unlikely(Some(("WARNING", LogSeverity::Warn))),
 
         // FATAL_CLIENT_ONLY is available since Postgres 19.
@@ -249,6 +246,7 @@ mod tests {
         let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
         reqwest::blocking::get(&endpoint).unwrap();
 
+        pgrx::Spi::run("SET LOCAL pg_otel.export = 'logs'").unwrap();
         pgrx::warning!("integration test log record message");
 
         let start = time::Instant::now();

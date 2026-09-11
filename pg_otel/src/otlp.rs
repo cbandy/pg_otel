@@ -5,9 +5,15 @@ use std::ffi;
 
 pub use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
+    collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList},
     logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs, SeverityNumber as LogSeverity},
     resource::v1::Resource,
+    trace::v1::{
+        ResourceSpans, ScopeSpans, Span, Status as SpanStatus, TracesData,
+        span::{Link, SpanKind},
+        status::StatusCode as SpanStatusCode,
+    },
 };
 
 pub fn new_str_unchecked(v: *const ffi::c_char) -> AnyValue {
@@ -97,7 +103,66 @@ pub mod ext {
         }
     }
 
+    impl ExportLogsServiceRequestExt for ExportLogsServiceRequest {}
+    pub trait ExportLogsServiceRequestExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn new<T: IntoIterator<Item = ResourceLogs>>(resource_logs: T) -> ExportLogsServiceRequest {
+            ExportLogsServiceRequest {
+                resource_logs: resource_logs.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ExportTraceServiceRequestExt for ExportTraceServiceRequest {}
+    pub trait ExportTraceServiceRequestExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn new<T: IntoIterator<Item = ResourceSpans>>(
+            resource_spans: T,
+        ) -> ExportTraceServiceRequest {
+            ExportTraceServiceRequest {
+                resource_spans: resource_spans.into_iter().collect(),
+            }
+        }
+    }
+
+    impl InstrumentationScopeExt for InstrumentationScope {}
+    pub trait InstrumentationScopeExt {
+        fn build() -> InstrumentationScopeBuilder {
+            InstrumentationScopeBuilder::default()
+        }
+    }
+
+    #[derive(Default)]
+    pub struct InstrumentationScopeBuilder(InstrumentationScope);
+    #[allow(dead_code)]
+    impl InstrumentationScopeBuilder {
+        pub fn name(mut self, v: impl Into<String>) -> Self {
+            self.0.name = v.into();
+            self
+        }
+
+        pub fn version(mut self, v: impl Into<String>) -> Self {
+            self.0.version = v.into();
+            self
+        }
+
+        pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
+            self.0.attributes = v.into_iter().collect();
+            self
+        }
+
+        pub fn dropped_attributes_count(mut self, v: u32) -> Self {
+            self.0.dropped_attributes_count = v;
+            self
+        }
+
+        pub fn finish(self) -> InstrumentationScope {
+            self.0
+        }
+    }
+
     impl KeyValueExt for KeyValue {}
+    #[allow(dead_code)]
     pub trait KeyValueExt {
         #[allow(clippy::new_ret_no_self)]
         fn new<K: Into<String>>(k: K, v: AnyValue) -> KeyValue {
@@ -106,6 +171,34 @@ pub mod ext {
                 value: Some(v),
                 key_strindex: 0,
             }
+        }
+
+        fn new_int<K: Into<String>, V: Into<i64>>(k: K, v: V) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_int(v))
+        }
+
+        fn new_double<K: Into<String>>(k: K, v: f64) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_double(v))
+        }
+
+        fn new_bool<K: Into<String>>(k: K, v: bool) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_bool(v))
+        }
+
+        fn new_string<K: Into<String>, V: Into<String>>(k: K, v: V) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_string(v))
+        }
+
+        fn new_bytes<K: Into<String>, V: Into<Vec<u8>>>(k: K, v: V) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_bytes(v))
+        }
+
+        fn new_kvlist<K: Into<String>, V: IntoIterator<Item = KeyValue>>(k: K, v: V) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_kvlist(v))
+        }
+
+        fn new_array<K: Into<String>, V: IntoIterator<Item = AnyValue>>(k: K, v: V) -> KeyValue {
+            KeyValue::new(k.into(), AnyValue::new_array(v))
         }
     }
 
@@ -116,6 +209,52 @@ pub mod ext {
             KeyValueList {
                 values: values.into_iter().collect(),
             }
+        }
+    }
+
+    impl LinkExt for Link {}
+    pub trait LinkExt {
+        fn build() -> LinkBuilder {
+            LinkBuilder::default()
+        }
+    }
+
+    #[derive(Default)]
+    pub struct LinkBuilder(Link);
+    #[allow(dead_code)]
+    impl LinkBuilder {
+        pub fn trace_id(mut self, v: impl Into<Vec<u8>>) -> Self {
+            self.0.trace_id = v.into();
+            self
+        }
+
+        pub fn span_id(mut self, v: impl Into<Vec<u8>>) -> Self {
+            self.0.span_id = v.into();
+            self
+        }
+
+        pub fn trace_state(mut self, v: impl Into<String>) -> Self {
+            self.0.trace_state = v.into();
+            self
+        }
+
+        pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
+            self.0.attributes = v.into_iter().collect();
+            self
+        }
+
+        pub fn dropped_attributes_count(mut self, v: u32) -> Self {
+            self.0.dropped_attributes_count = v;
+            self
+        }
+
+        pub fn flags(mut self, v: impl Into<u32>) -> Self {
+            self.0.flags = v.into();
+            self
+        }
+
+        pub fn finish(self) -> Link {
+            self.0
         }
     }
 
@@ -190,6 +329,16 @@ pub mod ext {
         }
     }
 
+    impl LogsDataExt for LogsData {}
+    pub trait LogsDataExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn new<T: IntoIterator<Item = ResourceLogs>>(resource_logs: T) -> LogsData {
+            LogsData {
+                resource_logs: resource_logs.into_iter().collect(),
+            }
+        }
+    }
+
     impl ResourceExt for Resource {}
     pub trait ResourceExt {
         fn build() -> ResourceBuilder {
@@ -216,39 +365,35 @@ pub mod ext {
         }
     }
 
-    impl InstrumentationScopeExt for InstrumentationScope {}
-    pub trait InstrumentationScopeExt {
-        fn build() -> InstrumentationScopeBuilder {
-            InstrumentationScopeBuilder::default()
+    impl ResourceLogsExt for ResourceLogs {}
+    pub trait ResourceLogsExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn new<R, T>(resource: R, scope_logs: T) -> ResourceLogs
+        where
+            R: Into<Option<Resource>>,
+            T: IntoIterator<Item = ScopeLogs>,
+        {
+            ResourceLogs {
+                resource: resource.into(),
+                scope_logs: scope_logs.into_iter().collect(),
+                schema_url: String::new(),
+            }
         }
     }
 
-    #[derive(Default)]
-    pub struct InstrumentationScopeBuilder(InstrumentationScope);
-    #[allow(dead_code)]
-    impl InstrumentationScopeBuilder {
-        pub fn name(mut self, v: impl Into<String>) -> Self {
-            self.0.name = v.into();
-            self
-        }
-
-        pub fn version(mut self, v: impl Into<String>) -> Self {
-            self.0.version = v.into();
-            self
-        }
-
-        pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
-            self.0.attributes = v.into_iter().collect();
-            self
-        }
-
-        pub fn dropped_attributes_count(mut self, v: u32) -> Self {
-            self.0.dropped_attributes_count = v;
-            self
-        }
-
-        pub fn finish(self) -> InstrumentationScope {
-            self.0
+    impl ResourceSpansExt for ResourceSpans {}
+    pub trait ResourceSpansExt {
+        #[allow(clippy::new_ret_no_self)]
+        fn create<R, T>(resource: R, scope_spans: T) -> ResourceSpans
+        where
+            R: Into<Option<Resource>>,
+            T: IntoIterator<Item = ScopeSpans>,
+        {
+            ResourceSpans {
+                resource: resource.into(),
+                scope_spans: scope_spans.into_iter().collect(),
+                schema_url: String::new(),
+            }
         }
     }
 
@@ -268,38 +413,104 @@ pub mod ext {
         }
     }
 
-    impl ResourceLogsExt for ResourceLogs {}
-    pub trait ResourceLogsExt {
+    impl ScopeSpansExt for ScopeSpans {}
+    pub trait ScopeSpansExt {
         #[allow(clippy::new_ret_no_self)]
-        fn new<R, T>(resource: R, scope_logs: T) -> ResourceLogs
+        fn new<S, T>(scope: S, spans: T) -> ScopeSpans
         where
-            R: Into<Option<Resource>>,
-            T: IntoIterator<Item = ScopeLogs>,
+            S: Into<Option<InstrumentationScope>>,
+            T: IntoIterator<Item = Span>,
         {
-            ResourceLogs {
-                resource: resource.into(),
-                scope_logs: scope_logs.into_iter().collect(),
+            ScopeSpans {
+                scope: scope.into(),
+                spans: spans.into_iter().collect(),
                 schema_url: String::new(),
             }
         }
     }
 
-    impl LogsDataExt for LogsData {}
-    pub trait LogsDataExt {
-        #[allow(clippy::new_ret_no_self)]
-        fn new<T: IntoIterator<Item = ResourceLogs>>(resource_logs: T) -> LogsData {
-            LogsData {
-                resource_logs: resource_logs.into_iter().collect(),
-            }
+    impl SpanExt for Span {}
+    pub trait SpanExt {
+        fn build() -> SpanBuilder {
+            SpanBuilder::default()
         }
     }
 
-    impl ExportLogsServiceRequestExt for ExportLogsServiceRequest {}
-    pub trait ExportLogsServiceRequestExt {
+    #[derive(Default)]
+    pub struct SpanBuilder(Span);
+    #[allow(dead_code)]
+    impl SpanBuilder {
+        pub fn trace_id(mut self, v: impl Into<Vec<u8>>) -> Self {
+            self.0.trace_id = v.into();
+            self
+        }
+
+        pub fn span_id(mut self, v: impl Into<Vec<u8>>) -> Self {
+            self.0.span_id = v.into();
+            self
+        }
+
+        pub fn parent_span_id(mut self, v: impl Into<Vec<u8>>) -> Self {
+            self.0.parent_span_id = v.into();
+            self
+        }
+
+        pub fn name(mut self, v: impl Into<String>) -> Self {
+            self.0.name = v.into();
+            self
+        }
+
+        pub fn kind(mut self, v: impl Into<i32>) -> Self {
+            self.0.kind = v.into();
+            self
+        }
+
+        pub fn start_time_unix_nano(mut self, v: u64) -> Self {
+            self.0.start_time_unix_nano = v;
+            self
+        }
+
+        pub fn end_time_unix_nano(mut self, v: u64) -> Self {
+            self.0.end_time_unix_nano = v;
+            self
+        }
+
+        pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
+            self.0.attributes = v.into_iter().collect();
+            self
+        }
+
+        pub fn flags(mut self, v: impl Into<u32>) -> Self {
+            self.0.flags = v.into();
+            self
+        }
+
+        pub fn trace_state(mut self, v: impl Into<String>) -> Self {
+            self.0.trace_state = v.into();
+            self
+        }
+
+        pub fn status(mut self, v: SpanStatus) -> Self {
+            self.0.status = Some(v);
+            self
+        }
+
+        pub fn links(mut self, v: impl IntoIterator<Item = Link>) -> Self {
+            self.0.links = v.into_iter().collect();
+            self
+        }
+
+        pub fn finish(self) -> Span {
+            self.0
+        }
+    }
+
+    impl TracesDataExt for TracesData {}
+    pub trait TracesDataExt {
         #[allow(clippy::new_ret_no_self)]
-        fn new<T: IntoIterator<Item = ResourceLogs>>(resource_logs: T) -> ExportLogsServiceRequest {
-            ExportLogsServiceRequest {
-                resource_logs: resource_logs.into_iter().collect(),
+        fn new<T: IntoIterator<Item = ResourceSpans>>(resource_spans: T) -> TracesData {
+            TracesData {
+                resource_spans: resource_spans.into_iter().collect(),
             }
         }
     }
@@ -342,6 +553,17 @@ mod tests {
     }
 
     #[test]
+    fn test_instrumentation_scope_builder() {
+        let scope = InstrumentationScope::build()
+            .name("my-scope")
+            .version("1.0.0")
+            .finish();
+
+        assert_eq!(scope.name, "my-scope");
+        assert_eq!(scope.version, "1.0.0");
+    }
+
+    #[test]
     fn test_log_record_builder() {
         let record = LogRecord::build()
             .time_unix_nano(100)
@@ -359,17 +581,6 @@ mod tests {
             record.body.unwrap().value,
             Some(Value::StringValue("test log message".to_string()))
         );
-    }
-
-    #[test]
-    fn test_instrumentation_scope_builder() {
-        let scope = InstrumentationScope::build()
-            .name("my-scope")
-            .version("1.0.0")
-            .finish();
-
-        assert_eq!(scope.name, "my-scope");
-        assert_eq!(scope.version, "1.0.0");
     }
 
     #[test]
@@ -406,5 +617,24 @@ mod tests {
         let resource_logs = ResourceLogs::new(resource, Vec::<ScopeLogs>::new());
         let request = ExportLogsServiceRequest::new(vec![resource_logs]);
         assert_eq!(request.resource_logs.len(), 1);
+    }
+
+    #[test]
+    fn test_link_builder() {
+        let link = Link::build()
+            .trace_id(vec![1, 2, 3, 4])
+            .span_id(vec![5, 6, 7, 8])
+            .trace_state("state")
+            .attributes(vec![KeyValue::new("k", AnyValue::new_string("v"))])
+            .dropped_attributes_count(2)
+            .flags(1u32)
+            .finish();
+
+        assert_eq!(link.trace_id, vec![1, 2, 3, 4]);
+        assert_eq!(link.span_id, vec![5, 6, 7, 8]);
+        assert_eq!(link.trace_state, "state");
+        assert_eq!(link.attributes.len(), 1);
+        assert_eq!(link.dropped_attributes_count, 2);
+        assert_eq!(link.flags, 1);
     }
 }
