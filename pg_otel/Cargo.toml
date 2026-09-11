@@ -16,6 +16,7 @@ prost.workspace = true
 reqwest.workspace = true
 url.workspace = true
 
+opentelemetry = { workspace = true }
 opentelemetry-proto = {
   workspace = true,
   features = ["gen-tonic-messages", "logs", "metrics", "trace"]
@@ -23,17 +24,17 @@ opentelemetry-proto = {
 
 # [pg_test] dependencies
 googletest = { workspace = true, optional = true }
+postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 googletest.workspace = true
 pgrx-tests.workspace = true
+postgres.workspace = true
 tiny_http.workspace = true
 
 [features]
-default = ["pg13"]
-pg_test = ["dep:googletest"]
-pg13 = ["pgrx-tests/pg13", "pgrx/pg13"]
-pg14 = ["pgrx-tests/pg14", "pgrx/pg14"]
+default = ["pg15"]
+pg_test = ["dep:googletest", "dep:postgres"]
 pg15 = ["pgrx-tests/pg15", "pgrx/pg15"]
 pg16 = ["pgrx-tests/pg16", "pgrx/pg16"]
 pg17 = ["pgrx-tests/pg17", "pgrx/pg17"]
