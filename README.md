@@ -20,7 +20,7 @@ OpenTelemetry recommends running its [collector][] as an [agent][] on the same
 machine as the application generating telemetry data. If that is how your
 system is arranged, this module's default settings are for you!
 
-If your collector is somewhere else, you need put its URL in `otel.otlp_endpoint`.
+If your collector is somewhere else, you need to put its URL in `otel.otlp_endpoint`.
 
 ```sql
 ALTER SYSTEM SET otel.otlp_endpoint TO 'https://my-collector:4318';
@@ -45,7 +45,7 @@ ALTER SYSTEM RESET otel.export;
 SELECT pg_reload_conf();
 ```
 
-[agent]: https://opentelemetry.io/docs/collector/deployment/
+[agent]: https://opentelemetry.io/docs/collector/deploy
 [reload]: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL
 [reset]: https://www.postgresql.org/docs/current/sql-altersystem.html
 [shared_preload_libraries]: https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SHARED-PRELOAD-LIBRARIES
@@ -75,5 +75,4 @@ The following settings cannot be changed at this time:
  otel.otlp_protocol         | http/protobuf         |      | The exporter transport protocol
 ```
 
-[sdk-env]: https://opentelemetry.io/docs/reference/specification/sdk-environment-variables/
-
+[sdk-env]: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables
