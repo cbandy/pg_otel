@@ -4,7 +4,8 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 1. PostgreSQL DBA / Platform Engineer
+## PostgreSQL DBA / Platform Engineer
+<a name="platform-engineer"/>
 
 - **Profile**: Responsible for database availability, performance, stability, and fleet-wide configuration (`postgresql.conf`, `shared_preload_libraries`).
 - **Goals**:
@@ -23,7 +24,8 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 2. Observability / SRE Engineer
+## Observability / SRE Engineer
+<a name="site-reliability-engineer"/>
 
 - **Profile**: Operates monitoring pipelines, OpenTelemetry collectors, and downstream telemetry backends.
 - **Goals**:
@@ -41,7 +43,8 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 3. Application Developer / Query Author
+## Application Developer / Query Author
+<a name="application-developer"/>
 
 - **Profile**: Builds client services that query PostgreSQL (via ORMs or raw SQL drivers) and diagnoses end-to-end latency in distributed architectures.
 - **Goals**:
@@ -58,7 +61,8 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 4. Database Developer / Procedural SQL Developer
+## Database Developer / Procedural SQL Developer
+<a name="database-developer"/>
 
 - **Profile**: Designs and maintains in-database business logic, including stored procedures, user-defined functions, triggers, and complex views.
 - **Goals**:
@@ -74,7 +78,8 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 5. Security & Compliance Engineer
+## Security & Compliance Engineer
+<a name="security-engineer"/>
 
 - **Profile**: Ensures database access adheres to regulatory frameworks and monitors for unauthorized data access, privilege abuse, and breaches.
 - **Goals**:
@@ -89,7 +94,9 @@ This document describes the key personas that `pg_otel` is designed to serve, in
 
 ---
 
-## 6. Data / Analytics Engineer
+## Data / Analytics Engineer
+<a name="analytics-engineer"/>
+<a name="data-engineer"/>
 
 - **Profile**: Builds and operates data pipelines, orchestrates batch transformations, and runs analytical queries.
 - **Goals**:
