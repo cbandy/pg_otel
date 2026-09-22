@@ -27,7 +27,7 @@ impl TracingHarness {
     /// Drains any residual spans from the mock collector and sets `otel.export = 'traces'`.
     fn enable_tracing(&mut self) -> Result<(), postgres::Error> {
         let _ = reqwest::blocking::get(&self.endpoint);
-        self.client.batch_execute("SET pg_otel.export = 'traces'")
+        self.client.batch_execute("SET otel.export = 'traces'")
     }
 
     fn collect_spans_until<F>(&self, timeout: time::Duration, mut condition: F) -> Vec<Span>

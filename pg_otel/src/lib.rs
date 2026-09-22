@@ -67,7 +67,7 @@ fn define_guc_variables() {
     static GUC_SIGNALS_ENABLED: GucString = GucString::new(None);
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
-            c"pg_otel.export",
+            c"otel.export",
             c"Telemetry signals to export",
             c"Comma-separated list of signals to export (traces, logs).",
             &GUC_SIGNALS_ENABLED,
@@ -160,12 +160,12 @@ pub mod pg_test {
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         let addr = crate::exporter::tests::HTTP_OTLP_SERVER.clone();
-        let endpoint = format!("pg_otel.endpoint = 'http://{}'", addr);
+        let endpoint = format!("otel.otlp_endpoint = 'http://{}'", addr);
         let preload = format!("shared_preload_libraries = '{}'", crate::PG_OTEL_LIBRARY);
 
         vec![
-            "pg_otel.batch_max_delay = '10ms'",
-            "pg_otel.timeout = '5s'",
+            "otel.otlp_batch_max_delay = '10ms'",
+            "otel.otlp_timeout = '5s'",
             Box::leak(endpoint.into_boxed_str()),
             Box::leak(preload.into_boxed_str()),
         ]

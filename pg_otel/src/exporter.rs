@@ -29,7 +29,7 @@ pub fn define_guc_variables() {
     // SAFETY: GUC hooks must have `#[pgrx::pg_guard]` or `#[pgrx::pg_guc_hook]`.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
-            c"pg_otel.endpoint",
+            c"otel.otlp_endpoint",
             c"Base OTLP collector endpoint URL",
             c"Base URL of an OpenTelemetry collector.",
             &GUC_ENDPOINT,
@@ -51,7 +51,7 @@ pub fn define_guc_variables() {
     // SAFETY: GUC hooks must have `#[pgrx::pg_guard]` or `#[pgrx::pg_guc_hook]`.
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
-            c"pg_otel.headers",
+            c"otel.otlp_headers",
             c"OTLP headers for all signals (superuser only)",
             c"Headers sent with OTLP export requests. May contain sensitive credentials. Restricted to superusers.",
             &GUC_HEADERS,
@@ -72,7 +72,7 @@ pub fn define_guc_variables() {
     }
 
     GucRegistry::define_string_guc(
-        c"pg_otel.protocol",
+        c"otel.otlp_protocol",
         c"OTLP transport protocol",
         c"Exporter protocol (http/protobuf or http/json).",
         &GUC_PROTOCOL,
@@ -81,9 +81,9 @@ pub fn define_guc_variables() {
     );
 
     GucRegistry::define_int_guc(
-        c"pg_otel.batch_max_items",
-        c"Max items per HTTP export batch",
-        c"Maximum number of log records exported in a single HTTP batch.",
+        c"otel.otlp_batch_max_items",
+        c"Max items per OTLP export batch",
+        c"Maximum number of logs or spans exported in a single OTLP batch.",
         &GUC_BATCH_MAX_ITEMS,
         1,
         i32::MAX / 4,
@@ -91,7 +91,7 @@ pub fn define_guc_variables() {
         GucFlags::empty(),  // none
     );
     GucRegistry::define_int_guc(
-        c"pg_otel.batch_max_delay",
+        c"otel.otlp_batch_max_delay",
         c"Max wait time before exporting a batch",
         c"Maximum duration (in milliseconds) the exporter waits before flushing.",
         &GUC_BATCH_MAX_DELAY_MS,
@@ -101,7 +101,7 @@ pub fn define_guc_variables() {
         GucFlags::UNIT_MS,
     );
     GucRegistry::define_int_guc(
-        c"pg_otel.timeout",
+        c"otel.otlp_timeout",
         c"Send timeout",
         c"Request timeout duration in milliseconds.",
         &GUC_TIMEOUT_MS,
@@ -111,7 +111,7 @@ pub fn define_guc_variables() {
         GucFlags::UNIT_MS,
     );
     GucRegistry::define_string_guc(
-        c"pg_otel.compression",
+        c"otel.otlp_compression",
         c"HTTP payload compression",
         c"Payload compression algorithm (none, gzip, or zstd).",
         &GUC_COMPRESSION,

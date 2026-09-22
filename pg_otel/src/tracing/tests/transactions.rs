@@ -290,27 +290,27 @@ mod tests {
         for sqls in [
             // A connection pooler might use GUC *before* the transaction
             &[
-                "SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "BEGIN",
                 "SELECT 1",
                 "COMMIT",
                 "SELECT 2",
             ][..],
             &[
-                "SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "BEGIN; SELECT 1; COMMIT",
                 "SELECT 2",
             ][..],
             // A client that allows properties on a transaction might use GUC *in* the transaction
             &[
                 "BEGIN",
-                "SET LOCAL pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "SELECT 1",
                 "COMMIT",
                 "SELECT 2",
             ][..],
             &[
-                "BEGIN; SET LOCAL pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; COMMIT",
+                "BEGIN; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; COMMIT",
                 "SELECT 2",
             ][..],
         ] {
@@ -393,7 +393,7 @@ mod tests {
             "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */",
         )?;
         harness.client.batch_execute(
-            "SET LOCAL pg_otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
+            "SET LOCAL otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
         )?;
         harness.client.batch_execute("SELECT 1")?;
         harness.client.batch_execute("SELECT 2")?;

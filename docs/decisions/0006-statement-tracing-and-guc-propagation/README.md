@@ -32,7 +32,7 @@ informed: []
 * **Option B1: Custom Fixed Shared Memory Array**
   Allocate `[ParallelSlot; MaxBackends]` in Postmaster shared memory during startup.
 * **Option B2: Dual-Purpose GUC Inheritance with Single-Use `.take()` Auto-Clearing (Chosen)**
-  Register `pg_otel.traceparent` / `pg_otel.tracestate` as PostgreSQL GUC parameters (`GUC_Userset`) with an `assign` hook and single-use `.take()` consumption.
+  Register `otel.traceparent` / `otel.tracestate` as PostgreSQL GUC parameters (`GUC_Userset`) with an `assign` hook and single-use `.take()` consumption.
 
 ## Decision Outcome
 
@@ -58,30 +58,30 @@ Chosen options: **Option A1 (4-Hook Minimal Foundation)** and **Option B2 (Dual-
 
 ### 3. Dual-Purpose GUC Interface
 
-`pg_otel.traceparent` and `pg_otel.tracestate` are registered as PostgreSQL GUC parameters the user can set at any time.
+`otel.traceparent` and `otel.tracestate` are registered as PostgreSQL GUC parameters the user can set at any time.
 These do not behave entirely like regular parameters, so we must take care to make them intuitive. These will consistently follow a few principles:
 
 #### Single-Use
-Whenever `pg_otel` initializes a span, it **clears** `pg_otel.traceparent` to ensure it is used exactly once.
+Whenever `pg_otel` initializes a span, it **clears** `otel.traceparent` to ensure it is used exactly once.
 This prevents the `traceparent` context from "leaking" to a subsequent statement, transaction, or connection pool.
 
 #### Set Context (on or) Before
 A user may assign a `traceparent` context to a statement in 2 ways:
 * **SQLCommenter**: `SELECT … /* traceparent='00-1111…-2222…-01' */;` — this is how auto-instrumentation or an ORM might behave
-* **`SET` or `SET LOCAL` before**: `SET pg_otel.traceparent = '00-1111…-2222…-01''; SELECT …` — this is how a connection pooler might behave
+* **`SET` or `SET LOCAL` before**: `SET otel.traceparent = '00-1111…-2222…-01''; SELECT …` — this is how a connection pooler might behave
 
 Doing this sets the `trace_id` and `parent_id` of the statement's span and attaches a **Span Link** back to the original parent span, if any.
 
 #### First Context Affects the Transaction
 The **first** `traceparent` context received for a transaction block sets the `TRANSACTION` span's identity. This first context can arrive in any of 3 ways:
 * **SQLCommenter on `BEGIN`**: `BEGIN /* traceparent='00-3333…-4444…-01' */;`
-* **`SET` before `BEGIN`**: `SET pg_otel.traceparent = '00-3333…-4444…-01'; BEGIN`
-* **`SET LOCAL` after `BEGIN`**: `BEGIN; SET LOCAL pg_otel.traceparent = '00-3333…-4444…-01';`
+* **`SET` before `BEGIN`**: `SET otel.traceparent = '00-3333…-4444…-01'; BEGIN`
+* **`SET LOCAL` after `BEGIN`**: `BEGIN; SET LOCAL otel.traceparent = '00-3333…-4444…-01';`
   — this looks like an exception to the prior principle, but it's the natural way to affect a transaction in SQL
 
 ### 4. Parallel Worker Propagation Architecture
 
-1. **GUC Setup**: When `qd.plannedstmt.parallelModeNeeded == true`, the leader backend sets `pg_otel.traceparent = <statement_span_context>` in `ExecutorStart_hook`.
-2. **Automatic Inheritance**: PostgreSQL's native `SerializeGUCState()` / `RestoreGUCState()` carries `pg_otel.traceparent` into spawned parallel worker processes.
-3. **Worker Execution**: Workers inspect `IsParallelWorker() == true` in `ExecutorStart_hook`, read `pg_otel.traceparent` via `.take()`, emit worker child spans under the leader's trace, and clean up automatically upon completion.
+1. **GUC Setup**: When `qd.plannedstmt.parallelModeNeeded == true`, the leader backend sets `otel.traceparent = <statement_span_context>` in `ExecutorStart_hook`.
+2. **Automatic Inheritance**: PostgreSQL's native `SerializeGUCState()` / `RestoreGUCState()` carries `otel.traceparent` into spawned parallel worker processes.
+3. **Worker Execution**: Workers inspect `IsParallelWorker() == true` in `ExecutorStart_hook`, read `otel.traceparent` via `.take()`, emit worker child spans under the leader's trace, and clean up automatically upon completion.
 

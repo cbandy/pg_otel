@@ -46,7 +46,7 @@ pub fn define_guc_variables() {
 
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
-            c"pg_otel.traceparent",
+            c"otel.traceparent",
             c"W3C traceparent context",
             c"W3C traceparent header for distributed tracing context propagation.",
             &GUC_TRACEPARENT,
@@ -58,7 +58,7 @@ pub fn define_guc_variables() {
         );
 
         GucRegistry::define_string_guc_with_hooks(
-            c"pg_otel.tracestate",
+            c"otel.tracestate",
             c"W3C tracestate context",
             c"W3C tracestate header for distributed tracing context propagation.",
             &GUC_TRACESTATE,
@@ -138,7 +138,7 @@ fn clear_guc_traceparent() {
     IN_GUC_UPDATE.set(true);
     unsafe {
         pg_sys::SetConfigOption(
-            c"pg_otel.traceparent".as_ptr(),
+            c"otel.traceparent".as_ptr(),
             c"".as_ptr(),
             pg_sys::GucContext::PGC_USERSET,
             pg_sys::GucSource::PGC_S_SESSION,
@@ -526,7 +526,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         unsafe {
             let val = ffi::CString::new(tp).unwrap();
             pg_sys::SetConfigOption(
-                c"pg_otel.traceparent".as_ptr(),
+                c"otel.traceparent".as_ptr(),
                 val.as_ptr(),
                 pg_sys::GucContext::PGC_USERSET,
                 pg_sys::GucSource::PGC_S_SESSION,

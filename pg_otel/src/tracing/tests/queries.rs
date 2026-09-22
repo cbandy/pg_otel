@@ -55,13 +55,13 @@ mod tests {
         for sqls in [
             // Three Query ('Q') messages
             &[
-                "SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "SELECT 1",
                 "SELECT 2",
             ][..],
             // One Query ('Q') message with three statements
             &[
-                "SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; SELECT 2",
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; SELECT 2",
             ][..],
         ] {
             scoped_trace!("{sqls:?}");

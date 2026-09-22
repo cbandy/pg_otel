@@ -118,7 +118,7 @@ Feature: Tracing and Spans
     The second query here has different Span ID and Trace ID and no parent.
 
     Given I am authenticated
-    When I execute: SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
     When I execute: SELECT 1
     When I execute: SELECT 2
     Then I should see a span with:
@@ -374,7 +374,7 @@ Feature: Tracing and Spans
     Context applies only to immediately following statement or transaction.
 
     Given I am authenticated
-    When I execute: SET pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
     When I execute: BEGIN
     When I execute: SELECT 1
     When I execute: COMMIT
@@ -413,7 +413,7 @@ Feature: Tracing and Spans
 
     Given I am authenticated
     When I execute: BEGIN
-    When I execute: SET LOCAL pg_otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
     When I execute: SELECT 1
     When I execute: COMMIT
     When I execute: SELECT 2
@@ -452,7 +452,7 @@ Feature: Tracing and Spans
 
     Given I am authenticated
     When I execute: BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */
-    When I execute: SET LOCAL pg_otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'
+    When I execute: SET LOCAL otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'
     When I execute: SELECT 1
     When I execute: SELECT 2
     When I execute: COMMIT

@@ -264,7 +264,7 @@ mod tests {
         let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
         reqwest::blocking::get(&endpoint).unwrap();
 
-        pgrx::Spi::run("SET LOCAL pg_otel.export = 'logs'").unwrap();
+        pgrx::Spi::run("SET LOCAL otel.export = 'logs'").unwrap();
         pgrx::warning!("integration test log record message");
 
         let start = time::Instant::now();
