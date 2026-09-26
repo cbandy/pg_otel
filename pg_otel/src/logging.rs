@@ -51,7 +51,9 @@ pub fn install_hooks() {
             if let Ok(state_str) = unsafe { ffi::CStr::from_ptr(state).to_str() } {
                 let query = unsafe {
                     if !pg_sys::debug_query_string.is_null() {
-                        ffi::CStr::from_ptr(pg_sys::debug_query_string).to_str().ok()
+                        ffi::CStr::from_ptr(pg_sys::debug_query_string)
+                            .to_str()
+                            .ok()
                     } else {
                         None
                     }
@@ -240,7 +242,11 @@ fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) ->
         );
 
     if let Some((t, n)) = severity {
-        record = record.severity_number(n).severity_text(t)
+        record = record.severity_number(n).severity_text(t);
+    }
+
+    if let Some((trace_id, span_id)) = crate::tracing::current_span_context() {
+        record = record.trace_id(trace_id).span_id(span_id);
     }
 
     let mut buffer = crate::BytesMut::new();

@@ -182,8 +182,6 @@ mod tests {
 
         let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
 
-        let _ = harness.client.batch_execute("DROP TABLE t_par");
-
         verify_that!(all_spans, len(eq(2)))?;
 
         let leader_span = all_spans

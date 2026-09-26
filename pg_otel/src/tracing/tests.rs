@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 mod errors;
+mod nested;
 mod queries;
 mod transactions;
 mod utility;
@@ -24,10 +25,64 @@ impl TracingHarness {
         Ok(Self { client, endpoint })
     }
 
+    /// Drains any residual telemetry for the specified signals from the mock collector
+    /// and sets `otel.export = …`.
+    fn enable_telemetry(&mut self, signals: &str) -> Result<(), postgres::Error> {
+        let base = crate::exporter::endpoint();
+        if signals.contains("trace") || signals.contains("span") {
+            let _ = reqwest::blocking::get(format!("{base}/test/traces"));
+        }
+        if signals.contains("log") {
+            let _ = reqwest::blocking::get(format!("{base}/test/logs"));
+        }
+        self.client
+            .batch_execute(&format!("SET otel.export = '{signals}'"))
+    }
+
     /// Drains any residual spans from the mock collector and sets `otel.export = 'traces'`.
     fn enable_tracing(&mut self) -> Result<(), postgres::Error> {
-        let _ = reqwest::blocking::get(&self.endpoint);
-        self.client.batch_execute("SET otel.export = 'traces'")
+        self.enable_telemetry("traces")
+    }
+
+    fn collect_logs_until<F>(&self, timeout: time::Duration, mut condition: F) -> Vec<LogRecord>
+    where
+        F: FnMut(&[LogRecord], bool) -> bool,
+    {
+        let start = time::Instant::now();
+        let mut data = Vec::new();
+        let mut done = false;
+        let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
+
+        while !done && start.elapsed() < timeout {
+            thread::sleep(time::Duration::from_millis(50));
+
+            if let Ok(response) = reqwest::blocking::get(&endpoint)
+                && let Ok(body) = response.bytes()
+            {
+                let is_empty = body.is_empty();
+                if let Ok(decoded) = LogsData::decode(body) {
+                    data.extend(decoded.resource_logs);
+                }
+
+                let logs: Vec<LogRecord> = data
+                    .iter()
+                    .flat_map(|rl| &rl.scope_logs)
+                    .flat_map(|sl| &sl.log_records)
+                    .cloned()
+                    .collect();
+
+                done = condition(&logs, is_empty);
+            }
+        }
+
+        data.into_iter()
+            .flat_map(|rl| rl.scope_logs)
+            .flat_map(|sl| sl.log_records)
+            .collect()
+    }
+
+    fn collect_logs_count(&self, count: usize, timeout: time::Duration) -> Vec<LogRecord> {
+        self.collect_logs_until(timeout, |logs, _| logs.len() >= count)
     }
 
     fn collect_spans_until<F>(&self, timeout: time::Duration, mut condition: F) -> Vec<Span>

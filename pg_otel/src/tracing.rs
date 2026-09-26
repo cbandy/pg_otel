@@ -3,19 +3,88 @@
 mod context;
 
 use self::context::{Headers, SpanContext};
-use crate::GucString;
 use crate::otlp::*;
+use crate::{GucInt32, GucString};
 use pgrx::pg_sys;
+use pgrx::pg_sys::PgNode;
 use std::cell::{Cell, RefCell};
 use std::{ffi, time};
 
-thread_local! {
-    static EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static GUC_TRACE_CONTEXT: RefCell<Option<SpanContext<'static>>> = const { RefCell::new(None) };
-    static IN_GUC_UPDATE: Cell<bool> = const { Cell::new(false) };
-    static ACTIVE_STATEMENT_SPAN: RefCell<Option<Span>> = const { RefCell::new(None) };
-    static TRANSACTION_SPAN: RefCell<Option<TransactionSpanState>> = const { RefCell::new(None) };
-    static LAST_ERROR: RefCell<Option<ErrorRecord>> = const { RefCell::new(None) };
+static GUC_MAX_NESTED_STATEMENTS: GucInt32 = GucInt32::new(50);
+static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
+
+#[derive(Debug)]
+struct ActiveStatement {
+    span: Span,
+    depth: usize,
+    scope_budget: Cell<i32>,
+}
+
+#[derive(Debug)]
+struct TransactionSpanState {
+    span: Span,
+    has_received_context: bool,
+    error_code: Option<String>,
+}
+
+#[derive(Debug)]
+enum StackSpan {
+    Transaction(TransactionSpanState),
+    Statement(ActiveStatement),
+}
+
+impl StackSpan {
+    fn span(&self) -> &Span {
+        match self {
+            StackSpan::Transaction(t) => &t.span,
+            StackSpan::Statement(s) => &s.span,
+        }
+    }
+
+    fn span_mut(&mut self) -> &mut Span {
+        match self {
+            StackSpan::Transaction(t) => &mut t.span,
+            StackSpan::Statement(s) => &mut s.span,
+        }
+    }
+
+    fn depth(&self) -> usize {
+        match self {
+            StackSpan::Transaction(_) => 0,
+            StackSpan::Statement(s) => s.depth,
+        }
+    }
+
+    fn is_transaction(&self) -> bool {
+        matches!(self, StackSpan::Transaction(_))
+    }
+
+    fn is_statement(&self) -> bool {
+        matches!(self, StackSpan::Statement(_))
+    }
+}
+
+fn resolve_parent_and_links(
+    own_ctx: Option<&SpanContext>,
+    parent_entry: Option<(&[u8], &[u8])>,
+) -> (Vec<u8>, Vec<u8>, Vec<Link>) {
+    let mut links = Vec::new();
+    let (trace_id, parent_span_id) = if let Some(ctx) = own_ctx {
+        if let Some((p_trace_id, p_span_id)) = parent_entry {
+            links.push(
+                Link::build()
+                    .trace_id(p_trace_id.to_vec())
+                    .span_id(p_span_id.to_vec())
+                    .finish(),
+            );
+        }
+        (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
+    } else if let Some((p_trace_id, p_span_id)) = parent_entry {
+        (p_trace_id.to_vec(), p_span_id.to_vec())
+    } else {
+        (random_bytes::<16>().to_vec(), vec![])
+    };
+    (trace_id, parent_span_id, links)
 }
 
 struct ErrorRecord {
@@ -23,10 +92,23 @@ struct ErrorRecord {
     query: Option<String>,
 }
 
-struct TransactionSpanState {
-    span: Span,
-    has_received_context: bool,
-    error_code: Option<String>,
+thread_local! {
+    static EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static GUC_TRACE_CONTEXT: RefCell<Option<SpanContext<'static>>> = const { RefCell::new(None) };
+    static IN_GUC_UPDATE: Cell<bool> = const { Cell::new(false) };
+    static SPAN_STACK: RefCell<Vec<StackSpan>> = const { RefCell::new(Vec::new()) };
+    static REMAINING_BUDGET: Cell<i32> = const { Cell::new(0) };
+    static DROPPED_NESTED_STATEMENTS: Cell<usize> = const { Cell::new(0) };
+    static LAST_ERROR: RefCell<Option<ErrorRecord>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn current_span_context() -> Option<(Vec<u8>, Vec<u8>)> {
+    SPAN_STACK.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|entry| (entry.span().trace_id.clone(), entry.span().span_id.clone()))
+    })
 }
 
 pub(crate) fn record_error(sqlstate: &str, query: Option<&str>) {
@@ -43,6 +125,28 @@ pub fn define_guc_variables() {
 
     static GUC_TRACEPARENT: GucString = GucString::new(None);
     static GUC_TRACESTATE: GucString = GucString::new(None);
+
+    GucRegistry::define_int_guc(
+        c"otel.max_nested_statements",
+        c"Maximum nested statement span limit",
+        c"Maximum number of nested statement spans that may be emitted across a statement.",
+        &GUC_MAX_NESTED_STATEMENTS,
+        0,
+        i32::MAX / 4,
+        GucContext::Suset,
+        GucFlags::empty(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"otel.trace_nested_statements",
+        c"Requested nested statement span budget",
+        c"Requested number of nested statement spans to emit for procedures and triggers.",
+        &GUC_TRACE_NESTED_STATEMENTS,
+        0,
+        i32::MAX / 4,
+        GucContext::Userset,
+        GucFlags::empty(),
+    );
 
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
@@ -107,14 +211,14 @@ fn assign_traceparent(value: Option<ffi::CString>) {
     let ctx_owned = ctx.into_owned();
 
     let mut applied_to_xact = false;
-    TRANSACTION_SPAN.with(|ts| {
-        if let Some(xact) = ts.borrow_mut().as_mut() {
-            if !xact.has_received_context {
-                xact.span.trace_id = ctx_owned.trace.id.to_bytes().to_vec();
-                xact.span.parent_span_id = ctx_owned.id.to_bytes().to_vec();
-                xact.has_received_context = true;
-                applied_to_xact = true;
-            }
+    SPAN_STACK.with(|stack| {
+        if let Some(StackSpan::Transaction(xact)) = stack.borrow_mut().first_mut()
+            && !xact.has_received_context
+        {
+            xact.span.trace_id = ctx_owned.trace.id.to_bytes().to_vec();
+            xact.span.parent_span_id = ctx_owned.id.to_bytes().to_vec();
+            xact.has_received_context = true;
+            applied_to_xact = true;
         }
     });
 
@@ -208,19 +312,31 @@ fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) ->
     }
 
     if let Some(s) = sql {
-        let mut text = s.trim();
-        while !text.is_empty() {
-            if text.starts_with("/*") {
-                if let Some((_, rest)) = text.split_once("*/") {
-                    text = rest.trim();
-                    continue;
-                }
+        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let slice = if stmt_begin >= 0 {
+            let start = stmt_begin as usize;
+            if stmt_len > 0 {
+                s.get(start..start + stmt_len as usize)
+                    .unwrap_or(&s[start..])
+            } else {
+                s.get(start..).unwrap_or(s)
             }
-            if text.starts_with("--") {
-                if let Some((_, rest)) = text.split_once('\n') {
-                    text = rest.trim();
-                    continue;
-                }
+        } else {
+            s
+        };
+        let mut text = slice.trim();
+        while !text.is_empty() {
+            if text.starts_with("/*")
+                && let Some((_, rest)) = text.split_once("*/")
+            {
+                text = rest.trim();
+                continue;
+            }
+            if text.starts_with("--")
+                && let Some((_, rest)) = text.split_once('\n')
+            {
+                text = rest.trim();
+                continue;
             }
             break;
         }
@@ -253,15 +369,24 @@ fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) ->
 
 fn is_variable_set(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) -> bool {
     if let Some(ps) = pstmt
-        && !ps.utilityStmt.is_null()
-        && unsafe { (ps.utilityStmt as *const pg_sys::Node).as_ref() }
-            .map(|n| n.type_ == pg_sys::NodeTag::T_VariableSetStmt)
-            .unwrap_or(false)
+        && let Some(node) = unsafe { ps.utilityStmt.as_ref() }
     {
-        return true;
+        return node.try_as::<pg_sys::VariableSetStmt>().is_some();
     }
     if let Some(s) = sql {
-        let mut text = s.trim();
+        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let slice = if stmt_begin >= 0 {
+            let start = stmt_begin as usize;
+            if stmt_len > 0 {
+                s.get(start..start + stmt_len as usize)
+                    .unwrap_or(&s[start..])
+            } else {
+                s.get(start..).unwrap_or(s)
+            }
+        } else {
+            s
+        };
+        let mut text = slice.trim();
         while text.starts_with("/*") {
             if let Some((_, rest)) = text.split_once("*/") {
                 text = rest.trim();
@@ -282,16 +407,26 @@ fn get_transaction_stmt_kind(
     sql: Option<&str>,
 ) -> Option<pg_sys::TransactionStmtKind::Type> {
     if let Some(ps) = pstmt
-        && !ps.utilityStmt.is_null()
-        && unsafe { (ps.utilityStmt as *const pg_sys::Node).as_ref() }
-            .map(|n| n.type_ == pg_sys::NodeTag::T_TransactionStmt)
-            .unwrap_or(false)
+        && let Some(node) = unsafe { ps.utilityStmt.as_ref() }
     {
-        let xact = unsafe { &*(ps.utilityStmt as *const pg_sys::TransactionStmt) };
-        return Some(xact.kind);
+        return node
+            .try_as::<pg_sys::TransactionStmt>()
+            .map(|xact| xact.kind);
     }
     if let Some(s) = sql {
-        let mut text = s.trim();
+        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let slice = if stmt_begin >= 0 {
+            let start = stmt_begin as usize;
+            if stmt_len > 0 {
+                s.get(start..start + stmt_len as usize)
+                    .unwrap_or(&s[start..])
+            } else {
+                s.get(start..).unwrap_or(s)
+            }
+        } else {
+            s
+        };
+        let mut text = slice.trim();
         while text.starts_with("/*") {
             if let Some((_, rest)) = text.split_once("*/") {
                 text = rest.trim();
@@ -432,133 +567,197 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
     let now = time::SystemTime::now();
     let Some(qd) = query else { return };
 
-    let is_parallel_worker = unsafe { pg_sys::ParallelWorkerNumber >= 0 };
-    if is_parallel_worker {
-        if let Some(ctx) = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take()) {
-            let sql = if !qd.sourceText.is_null() {
-                unsafe { ffi::CStr::from_ptr(qd.sourceText).to_str().ok() }
-            } else {
-                None
-            };
-            let pstmt = if !qd.plannedstmt.is_null() {
-                unsafe { qd.plannedstmt.as_ref() }
-            } else {
-                None
-            };
-            let op_name = get_operation_name(pstmt, sql);
-            let span = Span::build()
-                .name(op_name.clone())
-                .kind(SpanKind::Server as i32)
-                .trace_id(ctx.trace.id.to_bytes().to_vec())
-                .span_id(random_bytes::<8>().to_vec())
-                .parent_span_id(ctx.id.to_bytes().to_vec())
-                .start_time_unix_nano(to_unix_nano(now))
-                .attributes(vec![
-                    KeyValue::new_string("db.operation.name", op_name),
-                    KeyValue::new_string("db.system.name", "postgresql"),
-                ])
-                .finish();
-            ACTIVE_STATEMENT_SPAN.with(|s| *s.borrow_mut() = Some(span));
-            EXECUTION_DEPTH.set(1);
-        }
+    if unsafe { pg_sys::ParallelWorkerNumber >= 0 }
+        && let Some(ctx) = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take())
+    {
+        let sql = if !qd.sourceText.is_null() {
+            unsafe { ffi::CStr::from_ptr(qd.sourceText).to_str().ok() }
+        } else {
+            None
+        };
+        let pstmt = unsafe { qd.plannedstmt.as_ref() };
+        let op_name = get_operation_name(pstmt, sql);
+        let span = Span::build()
+            .name(op_name.clone())
+            .kind(SpanKind::Server as i32)
+            .trace_id(ctx.trace.id.to_bytes().to_vec())
+            .span_id(random_bytes::<8>().to_vec())
+            .parent_span_id(ctx.id.to_bytes().to_vec())
+            .start_time_unix_nano(to_unix_nano(now))
+            .attributes(vec![
+                KeyValue::new_string("db.operation.name", op_name),
+                KeyValue::new_string("db.system.name", "postgresql"),
+            ])
+            .finish();
+        SPAN_STACK.with(|s| {
+            s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
+                span,
+                depth: 1,
+                scope_budget: Cell::new(0),
+            }));
+        });
+        EXECUTION_DEPTH.set(1);
         return;
     }
 
-    let is_commit_or_rollback = ACTIVE_STATEMENT_SPAN.with(|s| {
-        s.borrow().as_ref().map_or(false, |span| {
-            span.name == "COMMIT" || span.name == "ROLLBACK"
+    let is_commit_or_rollback = SPAN_STACK.with(|s| {
+        s.borrow().last().map_or(false, |entry| {
+            entry.span().name == "COMMIT" || entry.span().name == "ROLLBACK"
         })
     });
-    let depth = EXECUTION_DEPTH.get();
-    if depth > 0 || is_commit_or_rollback {
-        EXECUTION_DEPTH.set(depth + 1);
+    let depth = EXECUTION_DEPTH.get() + 1;
+    EXECUTION_DEPTH.set(depth);
+    if is_commit_or_rollback {
         return;
     }
-    EXECUTION_DEPTH.set(1);
 
     let sql = if !qd.sourceText.is_null() {
         unsafe { ffi::CStr::from_ptr(qd.sourceText).to_str().ok() }
     } else {
         None
     };
-    let pstmt = if !qd.plannedstmt.is_null() {
-        unsafe { qd.plannedstmt.as_ref() }
-    } else {
-        None
-    };
+    let pstmt = unsafe { qd.plannedstmt.as_ref() };
 
-    let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-    let comment_ctx = sql
-        .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
-        .and_then(|h| SpanContext::try_from(h).ok());
-    let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
+    if depth == 1 {
+        let initial_budget = GUC_TRACE_NESTED_STATEMENTS
+            .get()
+            .min(GUC_MAX_NESTED_STATEMENTS.get())
+            .max(0);
+        REMAINING_BUDGET.set(initial_budget);
+        DROPPED_NESTED_STATEMENTS.set(0);
 
-    let own_ctx = comment_ctx.or(guc_ctx);
-    clear_guc_traceparent();
+        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let comment_ctx = sql
+            .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
+            .and_then(|h| SpanContext::try_from(h).ok());
+        let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
 
-    let mut links = Vec::new();
-    let (trace_id, parent_span_id) = TRANSACTION_SPAN.with(|ts| {
-        if let Some(xact) = ts.borrow().as_ref() {
-            if let Some(ctx) = own_ctx {
-                links.push(
-                    Link::build()
-                        .trace_id(xact.span.trace_id.clone())
-                        .span_id(xact.span.span_id.clone())
-                        .finish(),
+        let own_ctx = comment_ctx.or(guc_ctx);
+        clear_guc_traceparent();
+
+        let parent_ctx = SPAN_STACK.with(|s| {
+            s.borrow()
+                .last()
+                .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
+        });
+        let (trace_id, parent_span_id, links) = resolve_parent_and_links(
+            own_ctx.as_ref(),
+            parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
+        );
+
+        let op_name = get_operation_name(pstmt, sql);
+        let span_id = random_bytes::<8>().to_vec();
+
+        if pstmt.map_or(false, |p| p.parallelModeNeeded) {
+            let tp = format_traceparent(&trace_id, &span_id);
+            IN_GUC_UPDATE.set(true);
+            unsafe {
+                let val = ffi::CString::new(tp).unwrap();
+                pg_sys::SetConfigOption(
+                    c"otel.traceparent".as_ptr(),
+                    val.as_ptr(),
+                    pg_sys::GucContext::PGC_USERSET,
+                    pg_sys::GucSource::PGC_S_SESSION,
                 );
-                (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
-            } else {
-                (xact.span.trace_id.clone(), xact.span.span_id.clone())
             }
-        } else if let Some(ctx) = own_ctx {
-            (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
-        } else {
-            (random_bytes::<16>().to_vec(), vec![])
+            IN_GUC_UPDATE.set(false);
         }
-    });
 
-    let op_name = get_operation_name(pstmt, sql);
-    let span_id = random_bytes::<8>().to_vec();
+        let span = Span::build()
+            .name(op_name.clone())
+            .kind(SpanKind::Server as i32)
+            .trace_id(trace_id)
+            .span_id(span_id)
+            .parent_span_id(parent_span_id)
+            .start_time_unix_nano(to_unix_nano(now))
+            .links(links)
+            .attributes(vec![
+                KeyValue::new_string("db.operation.name", op_name),
+                KeyValue::new_string("db.system.name", "postgresql"),
+            ])
+            .finish();
 
-    if pstmt.map_or(false, |p| p.parallelModeNeeded) {
-        let tp = format_traceparent(&trace_id, &span_id);
-        IN_GUC_UPDATE.set(true);
-        unsafe {
-            let val = ffi::CString::new(tp).unwrap();
-            pg_sys::SetConfigOption(
-                c"otel.traceparent".as_ptr(),
-                val.as_ptr(),
-                pg_sys::GucContext::PGC_USERSET,
-                pg_sys::GucSource::PGC_S_SESSION,
-            );
+        SPAN_STACK.with(|s| {
+            s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
+                span,
+                depth,
+                scope_budget: Cell::new(initial_budget),
+            }));
+        });
+    } else {
+        let can_emit = SPAN_STACK.with(|stack| {
+            if let Some(StackSpan::Statement(parent)) = stack.borrow().last() {
+                parent.scope_budget.get() > 0
+                    && REMAINING_BUDGET.get() > 0
+                    && GUC_TRACE_NESTED_STATEMENTS.get() > 0
+                    && GUC_MAX_NESTED_STATEMENTS.get() > 0
+            } else {
+                false
+            }
+        });
+
+        if !can_emit {
+            DROPPED_NESTED_STATEMENTS.set(DROPPED_NESTED_STATEMENTS.get() + 1);
+            return;
         }
-        IN_GUC_UPDATE.set(false);
+
+        SPAN_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(StackSpan::Statement(parent)) = stack.last() {
+                parent.scope_budget.set(parent.scope_budget.get() - 1);
+                REMAINING_BUDGET.set(REMAINING_BUDGET.get() - 1);
+
+                let delegate = parent
+                    .scope_budget
+                    .get()
+                    .min(REMAINING_BUDGET.get())
+                    .min(GUC_TRACE_NESTED_STATEMENTS.get())
+                    .max(0);
+
+                parent
+                    .scope_budget
+                    .set(parent.scope_budget.get() - delegate);
+
+                let trace_id = parent.span.trace_id.clone();
+                let parent_span_id = parent.span.span_id.clone();
+                let span_id = random_bytes::<8>().to_vec();
+                let op_name = get_operation_name(pstmt, sql);
+
+                let mut attributes = vec![
+                    KeyValue::new_string("db.operation.name", op_name.clone()),
+                    KeyValue::new_string("db.system.name", "postgresql"),
+                ];
+                if unsafe { pg_sys::pg_trigger_depth(std::ptr::null_mut()).value() } > 0 {
+                    attributes.push(KeyValue::new_bool("db.postgresql.trigger", true));
+                }
+
+                let span = Span::build()
+                    .name(op_name)
+                    .kind(SpanKind::Internal as i32)
+                    .trace_id(trace_id)
+                    .span_id(span_id)
+                    .parent_span_id(parent_span_id)
+                    .start_time_unix_nano(to_unix_nano(now))
+                    .attributes(attributes)
+                    .finish();
+
+                stack.push(StackSpan::Statement(ActiveStatement {
+                    span,
+                    depth,
+                    scope_budget: Cell::new(delegate),
+                }));
+            }
+        });
     }
-
-    let span = Span::build()
-        .name(op_name.clone())
-        .kind(SpanKind::Server as i32)
-        .trace_id(trace_id)
-        .span_id(span_id)
-        .parent_span_id(parent_span_id)
-        .start_time_unix_nano(to_unix_nano(now))
-        .links(links)
-        .attributes(vec![
-            KeyValue::new_string("db.operation.name", op_name),
-            KeyValue::new_string("db.system.name", "postgresql"),
-        ])
-        .finish();
-
-    ACTIVE_STATEMENT_SPAN.with(|s| *s.borrow_mut() = Some(span));
 }
 
 fn executor_end(query: Option<&pg_sys::QueryDesc>) {
     let is_parallel_worker = unsafe { pg_sys::ParallelWorkerNumber >= 0 };
     if is_parallel_worker {
         EXECUTION_DEPTH.set(0);
-        if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-            span.end_time_unix_nano = to_unix_nano(time::SystemTime::now());
-            export_span(&span);
+        if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
+            entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+            export_span(entry.span());
         }
         return;
     }
@@ -566,22 +765,53 @@ fn executor_end(query: Option<&pg_sys::QueryDesc>) {
     let depth = EXECUTION_DEPTH.get();
     if depth > 0 {
         EXECUTION_DEPTH.set(depth - 1);
-        let is_commit_or_rollback = ACTIVE_STATEMENT_SPAN.with(|s| {
-            s.borrow().as_ref().map_or(false, |span| {
-                span.name == "COMMIT" || span.name == "ROLLBACK"
+        let is_commit_or_rollback = SPAN_STACK.with(|s| {
+            s.borrow().last().map_or(false, |entry| {
+                entry.span().name == "COMMIT" || entry.span().name == "ROLLBACK"
             })
         });
-        if depth - 1 == 0 && !is_commit_or_rollback {
-            if let Some(qd) = query
-                && let Some(ps) = unsafe { qd.plannedstmt.as_ref() }
-                && ps.parallelModeNeeded
-            {
-                clear_guc_traceparent();
+        if !is_commit_or_rollback {
+            if depth == 1 {
+                if let Some(qd) = query
+                    && let Some(ps) = unsafe { qd.plannedstmt.as_ref() }
+                    && ps.parallelModeNeeded
+                {
+                    clear_guc_traceparent();
+                }
             }
 
-            if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-                span.end_time_unix_nano = to_unix_nano(time::SystemTime::now());
-                export_span(&span);
+            let matches_depth = SPAN_STACK.with(|s| {
+                s.borrow()
+                    .last()
+                    .map_or(false, |entry| entry.depth() == depth)
+            });
+
+            if matches_depth {
+                let popped = SPAN_STACK.with(|s| s.borrow_mut().pop());
+                if let Some(mut entry) = popped {
+                    if depth > 1 {
+                        if let StackSpan::Statement(ref stmt) = entry {
+                            SPAN_STACK.with(|s| {
+                                if let Some(StackSpan::Statement(parent)) = s.borrow().last() {
+                                    parent
+                                        .scope_budget
+                                        .set(parent.scope_budget.get() + stmt.scope_budget.get());
+                                }
+                            });
+                        }
+                    } else {
+                        let dropped = DROPPED_NESTED_STATEMENTS.get();
+                        if dropped > 0 {
+                            entry.span_mut().attributes.push(KeyValue::new_int(
+                                "otel.dropped_child_spans",
+                                dropped as i64,
+                            ));
+                        }
+                    }
+
+                    entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                    export_span(entry.span());
+                }
             }
         }
     }
@@ -609,24 +839,19 @@ where
                 .and_then(|h| SpanContext::try_from(h).ok())
                 .map(|c| c.into_owned());
             let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
-
-            let (trace_id, parent_span_id, has_ctx) = if let Some(ctx) = comment_ctx {
-                (
-                    ctx.trace.id.to_bytes().to_vec(),
-                    ctx.id.to_bytes().to_vec(),
-                    true,
-                )
-            } else if let Some(ctx) = guc_ctx {
-                (
-                    ctx.trace.id.to_bytes().to_vec(),
-                    ctx.id.to_bytes().to_vec(),
-                    true,
-                )
-            } else {
-                (random_bytes::<16>().to_vec(), vec![], false)
-            };
-
+            let own_ctx = comment_ctx.or(guc_ctx);
             clear_guc_traceparent();
+
+            let has_ctx = own_ctx.is_some();
+            let parent_ctx = SPAN_STACK.with(|s| {
+                s.borrow()
+                    .last()
+                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
+            });
+            let (trace_id, parent_span_id, links) = resolve_parent_and_links(
+                own_ctx.as_ref(),
+                parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
+            );
 
             let span_id = random_bytes::<8>().to_vec();
             let span = Span::build()
@@ -636,31 +861,33 @@ where
                 .span_id(span_id)
                 .parent_span_id(parent_span_id)
                 .start_time_unix_nano(to_unix_nano(now))
+                .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "TRANSACTION"),
                     KeyValue::new_string("db.system.name", "postgresql"),
                 ])
                 .finish();
 
-            TRANSACTION_SPAN.with(|ts| {
-                *ts.borrow_mut() = Some(TransactionSpanState {
-                    span,
-                    has_received_context: has_ctx,
-                    error_code: None,
-                });
+            SPAN_STACK.with(|s| {
+                s.borrow_mut()
+                    .push(StackSpan::Transaction(TransactionSpanState {
+                        span,
+                        has_received_context: has_ctx,
+                        error_code: None,
+                    }));
             });
 
             hooks();
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT) => {
-            let (trace_id, parent_span_id) = TRANSACTION_SPAN.with(|ts| {
-                if let Some(xact) = ts.borrow().as_ref() {
-                    (xact.span.trace_id.clone(), xact.span.span_id.clone())
-                } else {
-                    (random_bytes::<16>().to_vec(), vec![])
-                }
+            let parent_ctx = SPAN_STACK.with(|s| {
+                s.borrow()
+                    .last()
+                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
             });
+            let (trace_id, parent_span_id, links) =
+                resolve_parent_and_links(None, parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])));
             let span_id = random_bytes::<8>().to_vec();
             let span = Span::build()
                 .name("COMMIT")
@@ -669,23 +896,30 @@ where
                 .span_id(span_id)
                 .parent_span_id(parent_span_id)
                 .start_time_unix_nano(to_unix_nano(now))
+                .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "COMMIT"),
                     KeyValue::new_string("db.system.name", "postgresql"),
                 ])
                 .finish();
-            ACTIVE_STATEMENT_SPAN.with(|s| *s.borrow_mut() = Some(span));
+            SPAN_STACK.with(|s| {
+                s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
+                    span,
+                    depth: EXECUTION_DEPTH.get() + 1,
+                    scope_budget: Cell::new(0),
+                }));
+            });
             hooks();
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK) => {
-            let (trace_id, parent_span_id) = TRANSACTION_SPAN.with(|ts| {
-                if let Some(xact) = ts.borrow().as_ref() {
-                    (xact.span.trace_id.clone(), xact.span.span_id.clone())
-                } else {
-                    (random_bytes::<16>().to_vec(), vec![])
-                }
+            let parent_ctx = SPAN_STACK.with(|s| {
+                s.borrow()
+                    .last()
+                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
             });
+            let (trace_id, parent_span_id, links) =
+                resolve_parent_and_links(None, parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])));
             let span_id = random_bytes::<8>().to_vec();
             let span = Span::build()
                 .name("ROLLBACK")
@@ -694,122 +928,254 @@ where
                 .span_id(span_id)
                 .parent_span_id(parent_span_id)
                 .start_time_unix_nano(to_unix_nano(now))
+                .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "ROLLBACK"),
                     KeyValue::new_string("db.system.name", "postgresql"),
                 ])
                 .finish();
-            ACTIVE_STATEMENT_SPAN.with(|s| *s.borrow_mut() = Some(span));
+            SPAN_STACK.with(|s| {
+                s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
+                    span,
+                    depth: EXECUTION_DEPTH.get() + 1,
+                    scope_budget: Cell::new(0),
+                }));
+            });
             hooks();
 
-            if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-                span.end_time_unix_nano = to_unix_nano(time::SystemTime::now());
-                export_span(&span);
+            if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
+                entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                export_span(entry.span());
             }
-            if let Some(mut xact) = TRANSACTION_SPAN.with(|ts| ts.borrow_mut().take()) {
-                if let Some(code) = &xact.error_code {
-                    xact.span.status = Some(SpanStatus::error(""));
-                    xact.span
-                        .attributes
-                        .push(KeyValue::new_string("db.response.status_code", code));
+            let xact = SPAN_STACK.with(|s| {
+                if s.borrow().last().map_or(false, |e| e.is_transaction()) {
+                    s.borrow_mut().pop()
+                } else {
+                    None
                 }
-                xact.span.end_time_unix_nano = to_unix_nano(time::SystemTime::now());
-                export_span(&xact.span);
+            });
+            if let Some(mut entry) = xact {
+                if let StackSpan::Transaction(ref mut xact) = entry {
+                    if let Some(code) = xact.error_code.take() {
+                        xact.span.status = Some(SpanStatus::error(""));
+                        xact.span
+                            .attributes
+                            .push(KeyValue::new_string("db.response.status_code", code));
+                    }
+                }
+                entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                export_span(entry.span());
             }
             return;
         }
         _ => (),
     }
 
-    let depth = EXECUTION_DEPTH.get();
-    if depth > 0 {
-        EXECUTION_DEPTH.set(depth + 1);
-        hooks();
-        EXECUTION_DEPTH.set(depth);
-        return;
-    }
-    EXECUTION_DEPTH.set(1);
+    let depth = EXECUTION_DEPTH.get() + 1;
+    EXECUTION_DEPTH.set(depth);
 
-    let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-    let comment_ctx = sql_str
-        .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
-        .and_then(|h| SpanContext::try_from(h).ok())
-        .map(|c| c.into_owned());
-    let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
+    if depth == 1 {
+        let initial_budget = GUC_TRACE_NESTED_STATEMENTS
+            .get()
+            .min(GUC_MAX_NESTED_STATEMENTS.get())
+            .max(0);
+        REMAINING_BUDGET.set(initial_budget);
+        DROPPED_NESTED_STATEMENTS.set(0);
 
-    let own_ctx = comment_ctx.or(guc_ctx);
-    clear_guc_traceparent();
+        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let comment_ctx = sql_str
+            .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
+            .and_then(|h| SpanContext::try_from(h).ok())
+            .map(|c| c.into_owned());
+        let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
 
-    let mut links = Vec::new();
-    let (trace_id, parent_span_id) = TRANSACTION_SPAN.with(|ts| {
-        if let Some(xact) = ts.borrow().as_ref() {
-            if let Some(ctx) = own_ctx {
-                links.push(
-                    Link::build()
-                        .trace_id(xact.span.trace_id.clone())
-                        .span_id(xact.span.span_id.clone())
-                        .finish(),
-                );
-                (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
+        let own_ctx = comment_ctx.or(guc_ctx);
+        clear_guc_traceparent();
+
+        let parent_ctx = SPAN_STACK.with(|s| {
+            s.borrow()
+                .last()
+                .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
+        });
+        let (trace_id, parent_span_id, links) = resolve_parent_and_links(
+            own_ctx.as_ref(),
+            parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
+        );
+
+        let op_name = get_operation_name(pstmt, sql_str);
+        let span_id = random_bytes::<8>().to_vec();
+        let span = Span::build()
+            .name(op_name.clone())
+            .kind(SpanKind::Server as i32)
+            .trace_id(trace_id)
+            .span_id(span_id)
+            .parent_span_id(parent_span_id)
+            .start_time_unix_nano(to_unix_nano(now))
+            .links(links)
+            .attributes(vec![
+                KeyValue::new_string("db.operation.name", op_name),
+                KeyValue::new_string("db.system.name", "postgresql"),
+            ])
+            .finish();
+
+        SPAN_STACK.with(|s| {
+            s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
+                span,
+                depth,
+                scope_budget: Cell::new(initial_budget),
+            }));
+        });
+    } else {
+        let can_emit = SPAN_STACK.with(|stack| {
+            if let Some(StackSpan::Statement(parent)) = stack.borrow().last() {
+                parent.scope_budget.get() > 0
+                    && REMAINING_BUDGET.get() > 0
+                    && GUC_TRACE_NESTED_STATEMENTS.get() > 0
+                    && GUC_MAX_NESTED_STATEMENTS.get() > 0
             } else {
-                (xact.span.trace_id.clone(), xact.span.span_id.clone())
+                false
             }
-        } else if let Some(ctx) = own_ctx {
-            (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
+        });
+
+        if !can_emit {
+            DROPPED_NESTED_STATEMENTS.set(DROPPED_NESTED_STATEMENTS.get() + 1);
         } else {
-            (random_bytes::<16>().to_vec(), vec![])
+            SPAN_STACK.with(|stack| {
+                let mut stack = stack.borrow_mut();
+                if let Some(StackSpan::Statement(parent)) = stack.last() {
+                    parent.scope_budget.set(parent.scope_budget.get() - 1);
+                    REMAINING_BUDGET.set(REMAINING_BUDGET.get() - 1);
+
+                    let delegate = parent
+                        .scope_budget
+                        .get()
+                        .min(REMAINING_BUDGET.get())
+                        .min(GUC_TRACE_NESTED_STATEMENTS.get())
+                        .max(0);
+
+                    parent
+                        .scope_budget
+                        .set(parent.scope_budget.get() - delegate);
+
+                    let trace_id = parent.span.trace_id.clone();
+                    let parent_span_id = parent.span.span_id.clone();
+                    let span_id = random_bytes::<8>().to_vec();
+                    let op_name = get_operation_name(pstmt, sql_str);
+
+                    let mut attributes = vec![
+                        KeyValue::new_string("db.operation.name", op_name.clone()),
+                        KeyValue::new_string("db.system.name", "postgresql"),
+                    ];
+                    if unsafe { pg_sys::pg_trigger_depth(std::ptr::null_mut()).value() } > 0 {
+                        attributes.push(KeyValue::new_bool("db.postgresql.trigger", true));
+                    }
+
+                    let span = Span::build()
+                        .name(op_name)
+                        .kind(SpanKind::Internal as i32)
+                        .trace_id(trace_id)
+                        .span_id(span_id)
+                        .parent_span_id(parent_span_id)
+                        .start_time_unix_nano(to_unix_nano(now))
+                        .attributes(attributes)
+                        .finish();
+
+                    stack.push(StackSpan::Statement(ActiveStatement {
+                        span,
+                        depth,
+                        scope_budget: Cell::new(delegate),
+                    }));
+                }
+            });
         }
-    });
-
-    let op_name = get_operation_name(pstmt, sql_str);
-    let span_id = random_bytes::<8>().to_vec();
-    let span = Span::build()
-        .name(op_name.clone())
-        .kind(SpanKind::Server as i32)
-        .trace_id(trace_id)
-        .span_id(span_id)
-        .parent_span_id(parent_span_id)
-        .start_time_unix_nano(to_unix_nano(now))
-        .links(links)
-        .attributes(vec![
-            KeyValue::new_string("db.operation.name", op_name),
-            KeyValue::new_string("db.system.name", "postgresql"),
-        ])
-        .finish();
-
-    ACTIVE_STATEMENT_SPAN.with(|s| *s.borrow_mut() = Some(span));
+    }
 
     hooks();
 
-    EXECUTION_DEPTH.set(0);
-    if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-        span.end_time_unix_nano = to_unix_nano(time::SystemTime::now());
-        export_span(&span);
+    let cur_depth = EXECUTION_DEPTH.get();
+    if cur_depth > 0 {
+        EXECUTION_DEPTH.set(cur_depth - 1);
+    }
+    let matches_depth = SPAN_STACK.with(|s| {
+        s.borrow()
+            .last()
+            .map_or(false, |entry| entry.depth() == depth)
+    });
+
+    if matches_depth {
+        let popped = SPAN_STACK.with(|s| s.borrow_mut().pop());
+        if let Some(mut entry) = popped {
+            if depth > 1 {
+                if let StackSpan::Statement(ref stmt) = entry {
+                    SPAN_STACK.with(|s| {
+                        if let Some(StackSpan::Statement(parent)) = s.borrow().last() {
+                            parent
+                                .scope_budget
+                                .set(parent.scope_budget.get() + stmt.scope_budget.get());
+                        }
+                    });
+                }
+            } else {
+                let dropped = DROPPED_NESTED_STATEMENTS.get();
+                if dropped > 0 {
+                    entry.span_mut().attributes.push(KeyValue::new_int(
+                        "otel.dropped_child_spans",
+                        dropped as i64,
+                    ));
+                }
+            }
+
+            entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+            export_span(entry.span());
+        }
     }
 }
 
 fn transaction_abort() {
     EXECUTION_DEPTH.set(0);
+    REMAINING_BUDGET.set(0);
+    let dropped = DROPPED_NESTED_STATEMENTS.take();
     let now = time::SystemTime::now();
     let last_error = LAST_ERROR.with(|err| err.borrow_mut().take());
     let in_xact_block = unsafe { pg_sys::IsTransactionBlock() };
 
-    let is_commit_or_rollback = ACTIVE_STATEMENT_SPAN.with(|s| {
-        s.borrow().as_ref().map_or(false, |span| {
-            span.name == "COMMIT" || span.name == "ROLLBACK"
+    let is_commit_or_rollback = SPAN_STACK.with(|s| {
+        s.borrow().last().map_or(false, |entry| {
+            entry.span().name == "COMMIT" || entry.span().name == "ROLLBACK"
         })
     });
     let is_ending_xact = is_commit_or_rollback || !in_xact_block;
 
+    let mut statement_entries = Vec::new();
+    SPAN_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        while let Some(last) = stack.last() {
+            if last.is_statement() {
+                statement_entries.push(stack.pop().unwrap());
+            } else {
+                break;
+            }
+        }
+    });
+
     if let Some(err_record) = last_error {
         let code = err_record.sqlstate;
-        let active_span = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take());
-        if let Some(mut span) = active_span {
-            span.status = Some(SpanStatus::error(""));
-            span.attributes
-                .push(KeyValue::new_string("db.response.status_code", &code));
-            span.end_time_unix_nano = to_unix_nano(now);
-            export_span(&span);
+        if !statement_entries.is_empty() {
+            for mut entry in statement_entries {
+                entry.span_mut().status = Some(SpanStatus::error(""));
+                entry
+                    .span_mut()
+                    .attributes
+                    .push(KeyValue::new_string("db.response.status_code", &code));
+                if entry.depth() == 1 && dropped > 0 {
+                    entry.span_mut().attributes.push(KeyValue::new_int(
+                        "otel.dropped_child_spans",
+                        dropped as i64,
+                    ));
+                }
+                entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+                export_span(entry.span());
+            }
         } else {
             let query_str = err_record.query.as_deref().or_else(|| unsafe {
                 if !pg_sys::debug_query_string.is_null() {
@@ -827,10 +1193,10 @@ fn transaction_abort() {
                     let mut parent_span_id = vec![];
                     let span_id = random_bytes::<8>().to_vec();
 
-                    TRANSACTION_SPAN.with(|ts| {
-                        if let Some(xact) = ts.borrow().as_ref() {
-                            trace_id = xact.span.trace_id.clone();
-                            parent_span_id = xact.span.span_id.clone();
+                    SPAN_STACK.with(|s| {
+                        if let Some(entry) = s.borrow().last() {
+                            trace_id = entry.span().trace_id.clone();
+                            parent_span_id = entry.span().span_id.clone();
                         }
                     });
 
@@ -855,30 +1221,45 @@ fn transaction_abort() {
         }
 
         if in_xact_block || is_commit_or_rollback {
-            TRANSACTION_SPAN.with(|ts| {
-                if let Some(xact) = ts.borrow_mut().as_mut() {
+            SPAN_STACK.with(|s| {
+                if let Some(StackSpan::Transaction(xact)) = s.borrow_mut().last_mut() {
                     xact.span.status = Some(SpanStatus::error(""));
                     xact.error_code = Some(code);
                 }
             });
         }
     } else {
-        if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-            span.end_time_unix_nano = to_unix_nano(now);
-            export_span(&span);
+        for mut entry in statement_entries {
+            if entry.depth() == 1 && dropped > 0 {
+                entry.span_mut().attributes.push(KeyValue::new_int(
+                    "otel.dropped_child_spans",
+                    dropped as i64,
+                ));
+            }
+            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            export_span(entry.span());
         }
     }
 
     if is_ending_xact {
-        if let Some(mut xact) = TRANSACTION_SPAN.with(|ts| ts.borrow_mut().take()) {
-            if let Some(code) = &xact.error_code {
-                xact.span.status = Some(SpanStatus::error(""));
-                xact.span
-                    .attributes
-                    .push(KeyValue::new_string("db.response.status_code", code));
+        let xact = SPAN_STACK.with(|s| {
+            if s.borrow().last().map_or(false, |e| e.is_transaction()) {
+                s.borrow_mut().pop()
+            } else {
+                None
             }
-            xact.span.end_time_unix_nano = to_unix_nano(now);
-            export_span(&xact.span);
+        });
+        if let Some(mut entry) = xact {
+            if let StackSpan::Transaction(ref mut xact) = entry {
+                if let Some(code) = xact.error_code.take() {
+                    xact.span.status = Some(SpanStatus::error(""));
+                    xact.span
+                        .attributes
+                        .push(KeyValue::new_string("db.response.status_code", code));
+                }
+            }
+            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            export_span(entry.span());
         }
     }
 }
@@ -888,13 +1269,27 @@ fn subxact_abort() {}
 fn transaction_commit() {
     EXECUTION_DEPTH.set(0);
     let now = time::SystemTime::now();
-    if let Some(mut span) = ACTIVE_STATEMENT_SPAN.with(|s| s.borrow_mut().take()) {
-        span.end_time_unix_nano = to_unix_nano(now);
-        export_span(&span);
+    let is_commit = SPAN_STACK.with(|s| {
+        s.borrow()
+            .last()
+            .map_or(false, |entry| entry.span().name == "COMMIT")
+    });
+    if is_commit {
+        if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
+            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            export_span(entry.span());
+        }
     }
-    if let Some(mut xact) = TRANSACTION_SPAN.with(|ts| ts.borrow_mut().take()) {
-        xact.span.end_time_unix_nano = to_unix_nano(now);
-        export_span(&xact.span);
+    let is_xact = SPAN_STACK.with(|s| {
+        s.borrow()
+            .last()
+            .map_or(false, |entry| entry.is_transaction())
+    });
+    if is_xact {
+        if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
+            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            export_span(entry.span());
+        }
     }
 }
 

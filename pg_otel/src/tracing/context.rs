@@ -122,10 +122,10 @@ impl<'a> Headers<'a> {
             } else {
                 sql.get(stmt_begin as usize..)
             };
-            if let Some(slice) = stmt_slice {
-                if let Some(parsed) = Self::from_sql(slice) {
-                    return Some(parsed);
-                }
+            if let Some(slice) = stmt_slice
+                && let Some(parsed) = Self::from_sql(slice)
+            {
+                return Some(parsed);
             }
         }
 
@@ -153,10 +153,10 @@ impl<'a> Headers<'a> {
             if let Some(h) = Self::from_sql(sql) {
                 return Some(h);
             }
-            if let Some((first, _)) = sql.split_once(';') {
-                if let Some(h) = Self::from_sql(first) {
-                    return Some(h);
-                }
+            if let Some((first, _)) = sql.split_once(';')
+                && let Some(h) = Self::from_sql(first)
+            {
+                return Some(h);
             }
         }
 
