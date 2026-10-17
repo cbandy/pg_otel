@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-mod context;
-
-use self::context::{Headers, SpanContext};
+use crate::context::{
+    Headers, SpanContext, SpanId, TraceFlags, TraceId, new_span_id, new_trace_id,
+};
 use crate::otlp::*;
 use crate::{GucInt32, GucString};
-use pgrx::pg_sys;
-use pgrx::pg_sys::PgNode;
+use pgrx::pg_sys::{self, PgNode};
 use std::cell::{Cell, RefCell};
 use std::{ffi, time};
 
@@ -16,6 +15,7 @@ static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
 #[derive(Debug)]
 struct ActiveStatement {
     span: Span,
+    context: SpanContext,
     depth: usize,
     scope_budget: Cell<i32>,
 }
@@ -23,6 +23,7 @@ struct ActiveStatement {
 #[derive(Debug)]
 struct TransactionSpanState {
     span: Span,
+    context: SpanContext,
     has_received_context: bool,
     error_code: Option<String>,
 }
@@ -48,6 +49,13 @@ impl StackSpan {
         }
     }
 
+    fn context(&self) -> SpanContext {
+        match self {
+            StackSpan::Transaction(t) => t.context,
+            StackSpan::Statement(s) => s.context,
+        }
+    }
+
     fn depth(&self) -> usize {
         match self {
             StackSpan::Transaction(_) => 0,
@@ -65,26 +73,27 @@ impl StackSpan {
 }
 
 fn resolve_parent_and_links(
-    own_ctx: Option<&SpanContext>,
-    parent_entry: Option<(&[u8], &[u8])>,
-) -> (Vec<u8>, Vec<u8>, Vec<Link>) {
+    own_ctx: Option<SpanContext>,
+    parent_ctx: Option<SpanContext>,
+) -> (TraceId, Option<SpanId>, TraceFlags, Vec<Link>) {
     let mut links = Vec::new();
-    let (trace_id, parent_span_id) = if let Some(ctx) = own_ctx {
-        if let Some((p_trace_id, p_span_id)) = parent_entry {
+    let (trace_id, parent_span_id, trace_flags) = if let Some(ctx) = own_ctx {
+        if let Some(p) = parent_ctx {
             links.push(
                 Link::build()
-                    .trace_id(p_trace_id.to_vec())
-                    .span_id(p_span_id.to_vec())
+                    .trace_id(p.trace_id.to_bytes())
+                    .span_id(p.span_id.to_bytes())
+                    .flags(p.trace_flags.to_u8())
                     .finish(),
             );
         }
-        (ctx.trace.id.to_bytes().to_vec(), ctx.id.to_bytes().to_vec())
-    } else if let Some((p_trace_id, p_span_id)) = parent_entry {
-        (p_trace_id.to_vec(), p_span_id.to_vec())
+        (ctx.trace_id, Some(ctx.span_id), ctx.trace_flags)
+    } else if let Some(p) = parent_ctx {
+        (p.trace_id, Some(p.span_id), p.trace_flags)
     } else {
-        (random_bytes::<16>().to_vec(), vec![])
+        (new_trace_id(), None, TraceFlags::SAMPLED)
     };
-    (trace_id, parent_span_id, links)
+    (trace_id, parent_span_id, trace_flags, links)
 }
 
 struct ErrorRecord {
@@ -94,7 +103,7 @@ struct ErrorRecord {
 
 thread_local! {
     static EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static GUC_TRACE_CONTEXT: RefCell<Option<SpanContext<'static>>> = const { RefCell::new(None) };
+    static GUC_TRACE_CONTEXT: RefCell<Option<SpanContext>> = const { RefCell::new(None) };
     static IN_GUC_UPDATE: Cell<bool> = const { Cell::new(false) };
     static SPAN_STACK: RefCell<Vec<StackSpan>> = const { RefCell::new(Vec::new()) };
     static REMAINING_BUDGET: Cell<i32> = const { Cell::new(0) };
@@ -102,13 +111,8 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<ErrorRecord>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current_span_context() -> Option<(Vec<u8>, Vec<u8>)> {
-    SPAN_STACK.with(|stack| {
-        stack
-            .borrow()
-            .last()
-            .map(|entry| (entry.span().trace_id.clone(), entry.span().span_id.clone()))
-    })
+pub(crate) fn current_span_context() -> Option<SpanContext> {
+    SPAN_STACK.with(|stack| stack.borrow().last().map(|entry| entry.context()))
 }
 
 pub(crate) fn record_error(sqlstate: &str, query: Option<&str>) {
@@ -208,15 +212,17 @@ fn assign_traceparent(value: Option<ffi::CString>) {
     let Ok(ctx) = SpanContext::try_from(headers) else {
         return;
     };
-    let ctx_owned = ctx.into_owned();
 
     let mut applied_to_xact = false;
     SPAN_STACK.with(|stack| {
         if let Some(StackSpan::Transaction(xact)) = stack.borrow_mut().first_mut()
             && !xact.has_received_context
         {
-            xact.span.trace_id = ctx_owned.trace.id.to_bytes().to_vec();
-            xact.span.parent_span_id = ctx_owned.id.to_bytes().to_vec();
+            xact.span.trace_id = ctx.trace_id.to_bytes().into();
+            xact.span.parent_span_id = ctx.span_id.to_bytes().into();
+            xact.span.flags = ctx.trace_flags.to_u8() as u32;
+            xact.context.trace_id = ctx.trace_id;
+            xact.context.trace_flags = ctx.trace_flags;
             xact.has_received_context = true;
             applied_to_xact = true;
         }
@@ -226,7 +232,7 @@ fn assign_traceparent(value: Option<ffi::CString>) {
         GUC_TRACE_CONTEXT.with(|c| *c.borrow_mut() = None);
         clear_guc_traceparent();
     } else {
-        GUC_TRACE_CONTEXT.with(|c| *c.borrow_mut() = Some(ctx_owned));
+        GUC_TRACE_CONTEXT.with(|c| *c.borrow_mut() = Some(ctx));
     }
 }
 
@@ -251,20 +257,6 @@ fn clear_guc_traceparent() {
     IN_GUC_UPDATE.set(false);
 }
 
-fn to_unix_nano(time: time::SystemTime) -> u64 {
-    time.duration_since(time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    unsafe {
-        pg_sys::pg_strong_random(buf.as_mut_ptr() as *mut ffi::c_void, N);
-    }
-    buf
-}
-
 fn export_span(span: &Span) {
     let mut buffer = crate::BytesMut::new();
     if let Err(e) = prost::Message::encode(span, &mut buffer) {
@@ -272,21 +264,6 @@ fn export_span(span: &Span) {
         return;
     }
     crate::exporter::send_one(&buffer);
-}
-
-fn format_traceparent(trace_id: &[u8], span_id: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(55);
-    s.push_str("00-");
-    for b in trace_id {
-        write!(s, "{:02x}", b).unwrap();
-    }
-    s.push('-');
-    for b in span_id {
-        write!(s, "{:02x}", b).unwrap();
-    }
-    s.push_str("-01");
-    s
 }
 
 fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) -> String {
@@ -577,13 +554,18 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         };
         let pstmt = unsafe { qd.plannedstmt.as_ref() };
         let op_name = get_operation_name(pstmt, sql);
+        let trace_id = ctx.trace_id;
+        let trace_flags = ctx.trace_flags;
+        let span_id = new_span_id();
+        let context = SpanContext::new(trace_id, span_id, trace_flags);
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(ctx.trace.id.to_bytes().to_vec())
-            .span_id(random_bytes::<8>().to_vec())
-            .parent_span_id(ctx.id.to_bytes().to_vec())
-            .start_time_unix_nano(to_unix_nano(now))
+            .trace_id(trace_id.to_bytes())
+            .span_id(span_id.to_bytes())
+            .parent_span_id(ctx.span_id.to_bytes())
+            .flags(trace_flags.to_u8())
+            .start_time(now)
             .attributes(vec![
                 KeyValue::new_string("db.operation.name", op_name),
                 KeyValue::new_string("db.system.name", "postgresql"),
@@ -592,6 +574,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         SPAN_STACK.with(|s| {
             s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
                 span,
+                context,
                 depth: 1,
                 scope_budget: Cell::new(0),
             }));
@@ -635,21 +618,16 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         let own_ctx = comment_ctx.or(guc_ctx);
         clear_guc_traceparent();
 
-        let parent_ctx = SPAN_STACK.with(|s| {
-            s.borrow()
-                .last()
-                .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
-        });
-        let (trace_id, parent_span_id, links) = resolve_parent_and_links(
-            own_ctx.as_ref(),
-            parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
-        );
+        let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
+        let (trace_id, parent_span_id, trace_flags, links) =
+            resolve_parent_and_links(own_ctx, parent_ctx);
 
         let op_name = get_operation_name(pstmt, sql);
-        let span_id = random_bytes::<8>().to_vec();
+        let span_id = new_span_id();
+        let context = SpanContext::new(trace_id, span_id, trace_flags);
 
         if pstmt.map_or(false, |p| p.parallelModeNeeded) {
-            let tp = format_traceparent(&trace_id, &span_id);
+            let tp = context.w3c_traceparent();
             IN_GUC_UPDATE.set(true);
             unsafe {
                 let val = ffi::CString::new(tp).unwrap();
@@ -666,10 +644,11 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(trace_id)
-            .span_id(span_id)
-            .parent_span_id(parent_span_id)
-            .start_time_unix_nano(to_unix_nano(now))
+            .trace_id(trace_id.to_bytes())
+            .span_id(span_id.to_bytes())
+            .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
+            .flags(trace_flags.to_u8())
+            .start_time(now)
             .links(links)
             .attributes(vec![
                 KeyValue::new_string("db.operation.name", op_name),
@@ -680,6 +659,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         SPAN_STACK.with(|s| {
             s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
                 span,
+                context,
                 depth,
                 scope_budget: Cell::new(initial_budget),
             }));
@@ -718,9 +698,11 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
                     .scope_budget
                     .set(parent.scope_budget.get() - delegate);
 
-                let trace_id = parent.span.trace_id.clone();
-                let parent_span_id = parent.span.span_id.clone();
-                let span_id = random_bytes::<8>().to_vec();
+                let trace_id = parent.context.trace_id;
+                let trace_flags = parent.context.trace_flags;
+                let parent_span_id = parent.context.span_id;
+                let span_id = new_span_id();
+                let context = SpanContext::new(trace_id, span_id, trace_flags);
                 let op_name = get_operation_name(pstmt, sql);
 
                 let mut attributes = vec![
@@ -734,15 +716,17 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
                 let span = Span::build()
                     .name(op_name)
                     .kind(SpanKind::Internal as i32)
-                    .trace_id(trace_id)
-                    .span_id(span_id)
-                    .parent_span_id(parent_span_id)
-                    .start_time_unix_nano(to_unix_nano(now))
+                    .trace_id(trace_id.to_bytes())
+                    .span_id(span_id.to_bytes())
+                    .parent_span_id(parent_span_id.to_bytes())
+                    .flags(trace_flags.to_u8())
+                    .start_time(now)
                     .attributes(attributes)
                     .finish();
 
                 stack.push(StackSpan::Statement(ActiveStatement {
                     span,
+                    context,
                     depth,
                     scope_budget: Cell::new(delegate),
                 }));
@@ -756,7 +740,7 @@ fn executor_end(query: Option<&pg_sys::QueryDesc>) {
     if is_parallel_worker {
         EXECUTION_DEPTH.set(0);
         if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
-            entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+            entry.span_mut().end(time::SystemTime::now());
             export_span(entry.span());
         }
         return;
@@ -809,7 +793,7 @@ fn executor_end(query: Option<&pg_sys::QueryDesc>) {
                         }
                     }
 
-                    entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                    entry.span_mut().end(time::SystemTime::now());
                     export_span(entry.span());
                 }
             }
@@ -836,31 +820,26 @@ where
             let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
             let comment_ctx = sql_str
                 .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
-                .and_then(|h| SpanContext::try_from(h).ok())
-                .map(|c| c.into_owned());
+                .and_then(|h| SpanContext::try_from(h).ok());
             let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
             let own_ctx = comment_ctx.or(guc_ctx);
             clear_guc_traceparent();
 
             let has_ctx = own_ctx.is_some();
-            let parent_ctx = SPAN_STACK.with(|s| {
-                s.borrow()
-                    .last()
-                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
-            });
-            let (trace_id, parent_span_id, links) = resolve_parent_and_links(
-                own_ctx.as_ref(),
-                parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
-            );
+            let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
+            let (trace_id, parent_span_id, trace_flags, links) =
+                resolve_parent_and_links(own_ctx, parent_ctx);
 
-            let span_id = random_bytes::<8>().to_vec();
+            let span_id = new_span_id();
+            let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("TRANSACTION")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id)
-                .span_id(span_id)
-                .parent_span_id(parent_span_id)
-                .start_time_unix_nano(to_unix_nano(now))
+                .trace_id(trace_id.to_bytes())
+                .span_id(span_id.to_bytes())
+                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
+                .flags(trace_flags.to_u8())
+                .start_time(now)
                 .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "TRANSACTION"),
@@ -872,6 +851,7 @@ where
                 s.borrow_mut()
                     .push(StackSpan::Transaction(TransactionSpanState {
                         span,
+                        context,
                         has_received_context: has_ctx,
                         error_code: None,
                     }));
@@ -881,21 +861,19 @@ where
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT) => {
-            let parent_ctx = SPAN_STACK.with(|s| {
-                s.borrow()
-                    .last()
-                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
-            });
-            let (trace_id, parent_span_id, links) =
-                resolve_parent_and_links(None, parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])));
-            let span_id = random_bytes::<8>().to_vec();
+            let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
+            let (trace_id, parent_span_id, trace_flags, links) =
+                resolve_parent_and_links(None, parent_ctx);
+            let span_id = new_span_id();
+            let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("COMMIT")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id)
-                .span_id(span_id)
-                .parent_span_id(parent_span_id)
-                .start_time_unix_nano(to_unix_nano(now))
+                .trace_id(trace_id.to_bytes())
+                .span_id(span_id.to_bytes())
+                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
+                .flags(trace_flags.to_u8())
+                .start_time(now)
                 .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "COMMIT"),
@@ -905,6 +883,7 @@ where
             SPAN_STACK.with(|s| {
                 s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
                     span,
+                    context,
                     depth: EXECUTION_DEPTH.get() + 1,
                     scope_budget: Cell::new(0),
                 }));
@@ -913,21 +892,19 @@ where
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK) => {
-            let parent_ctx = SPAN_STACK.with(|s| {
-                s.borrow()
-                    .last()
-                    .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
-            });
-            let (trace_id, parent_span_id, links) =
-                resolve_parent_and_links(None, parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])));
-            let span_id = random_bytes::<8>().to_vec();
+            let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
+            let (trace_id, parent_span_id, trace_flags, links) =
+                resolve_parent_and_links(None, parent_ctx);
+            let span_id = new_span_id();
+            let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("ROLLBACK")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id)
-                .span_id(span_id)
-                .parent_span_id(parent_span_id)
-                .start_time_unix_nano(to_unix_nano(now))
+                .trace_id(trace_id.to_bytes())
+                .span_id(span_id.to_bytes())
+                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
+                .flags(trace_flags.to_u8())
+                .start_time(now)
                 .links(links)
                 .attributes(vec![
                     KeyValue::new_string("db.operation.name", "ROLLBACK"),
@@ -937,6 +914,7 @@ where
             SPAN_STACK.with(|s| {
                 s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
                     span,
+                    context,
                     depth: EXECUTION_DEPTH.get() + 1,
                     scope_budget: Cell::new(0),
                 }));
@@ -944,7 +922,7 @@ where
             hooks();
 
             if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
-                entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                entry.span_mut().end(time::SystemTime::now());
                 export_span(entry.span());
             }
             let xact = SPAN_STACK.with(|s| {
@@ -963,7 +941,7 @@ where
                             .push(KeyValue::new_string("db.response.status_code", code));
                     }
                 }
-                entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+                entry.span_mut().end(time::SystemTime::now());
                 export_span(entry.span());
             }
             return;
@@ -985,32 +963,27 @@ where
         let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
         let comment_ctx = sql_str
             .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
-            .and_then(|h| SpanContext::try_from(h).ok())
-            .map(|c| c.into_owned());
+            .and_then(|h| SpanContext::try_from(h).ok());
         let guc_ctx = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take());
 
         let own_ctx = comment_ctx.or(guc_ctx);
         clear_guc_traceparent();
 
-        let parent_ctx = SPAN_STACK.with(|s| {
-            s.borrow()
-                .last()
-                .map(|e| (e.span().trace_id.clone(), e.span().span_id.clone()))
-        });
-        let (trace_id, parent_span_id, links) = resolve_parent_and_links(
-            own_ctx.as_ref(),
-            parent_ctx.as_ref().map(|(t, s)| (&t[..], &s[..])),
-        );
+        let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
+        let (trace_id, parent_span_id, trace_flags, links) =
+            resolve_parent_and_links(own_ctx, parent_ctx);
 
         let op_name = get_operation_name(pstmt, sql_str);
-        let span_id = random_bytes::<8>().to_vec();
+        let span_id = new_span_id();
+        let context = SpanContext::new(trace_id, span_id, trace_flags);
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(trace_id)
-            .span_id(span_id)
-            .parent_span_id(parent_span_id)
-            .start_time_unix_nano(to_unix_nano(now))
+            .trace_id(trace_id.to_bytes())
+            .span_id(span_id.to_bytes())
+            .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
+            .flags(trace_flags.to_u8())
+            .start_time(now)
             .links(links)
             .attributes(vec![
                 KeyValue::new_string("db.operation.name", op_name),
@@ -1021,6 +994,7 @@ where
         SPAN_STACK.with(|s| {
             s.borrow_mut().push(StackSpan::Statement(ActiveStatement {
                 span,
+                context,
                 depth,
                 scope_budget: Cell::new(initial_budget),
             }));
@@ -1057,9 +1031,11 @@ where
                         .scope_budget
                         .set(parent.scope_budget.get() - delegate);
 
-                    let trace_id = parent.span.trace_id.clone();
-                    let parent_span_id = parent.span.span_id.clone();
-                    let span_id = random_bytes::<8>().to_vec();
+                    let trace_id = parent.context.trace_id;
+                    let trace_flags = parent.context.trace_flags;
+                    let parent_span_id = parent.context.span_id;
+                    let span_id = new_span_id();
+                    let context = SpanContext::new(trace_id, span_id, trace_flags);
                     let op_name = get_operation_name(pstmt, sql_str);
 
                     let mut attributes = vec![
@@ -1073,15 +1049,17 @@ where
                     let span = Span::build()
                         .name(op_name)
                         .kind(SpanKind::Internal as i32)
-                        .trace_id(trace_id)
-                        .span_id(span_id)
-                        .parent_span_id(parent_span_id)
-                        .start_time_unix_nano(to_unix_nano(now))
+                        .trace_id(trace_id.to_bytes())
+                        .span_id(span_id.to_bytes())
+                        .parent_span_id(parent_span_id.to_bytes())
+                        .flags(trace_flags.to_u8())
+                        .start_time(now)
                         .attributes(attributes)
                         .finish();
 
                     stack.push(StackSpan::Statement(ActiveStatement {
                         span,
+                        context,
                         depth,
                         scope_budget: Cell::new(delegate),
                     }));
@@ -1125,7 +1103,7 @@ where
                 }
             }
 
-            entry.span_mut().end_time_unix_nano = to_unix_nano(time::SystemTime::now());
+            entry.span_mut().end(time::SystemTime::now());
             export_span(entry.span());
         }
     }
@@ -1173,7 +1151,7 @@ fn transaction_abort() {
                         dropped as i64,
                     ));
                 }
-                entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+                entry.span_mut().end(now);
                 export_span(entry.span());
             }
         } else {
@@ -1189,26 +1167,31 @@ fn transaction_abort() {
             if let Some(qs) = query_str {
                 let op_name = get_operation_name(None, Some(qs));
                 if !op_name.is_empty() && op_name != "UNKNOWN" {
-                    let mut trace_id = random_bytes::<16>().to_vec();
-                    let mut parent_span_id = vec![];
-                    let span_id = random_bytes::<8>().to_vec();
-
-                    SPAN_STACK.with(|s| {
+                    let (trace_id, parent_span_id, trace_flags) = SPAN_STACK.with(|s| {
                         if let Some(entry) = s.borrow().last() {
-                            trace_id = entry.span().trace_id.clone();
-                            parent_span_id = entry.span().span_id.clone();
+                            (
+                                entry.context().trace_id,
+                                Some(entry.context().span_id),
+                                entry.context().trace_flags,
+                            )
+                        } else {
+                            (new_trace_id(), None, TraceFlags::SAMPLED)
                         }
                     });
+                    let span_id = new_span_id();
 
                     let span = Span::build()
                         .name(op_name.clone())
                         .kind(SpanKind::Server as i32)
-                        .trace_id(trace_id)
-                        .span_id(span_id)
-                        .parent_span_id(parent_span_id)
+                        .trace_id(trace_id.to_bytes())
+                        .span_id(span_id.to_bytes())
+                        .parent_span_id(
+                            parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()),
+                        )
+                        .flags(trace_flags.to_u8())
                         .status(SpanStatus::error(""))
-                        .start_time_unix_nano(to_unix_nano(now))
-                        .end_time_unix_nano(to_unix_nano(now))
+                        .start_time(now)
+                        .end_time(now)
                         .attributes(vec![
                             KeyValue::new_string("db.operation.name", op_name),
                             KeyValue::new_string("db.system.name", "postgresql"),
@@ -1236,7 +1219,7 @@ fn transaction_abort() {
                     dropped as i64,
                 ));
             }
-            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            entry.span_mut().end(now);
             export_span(entry.span());
         }
     }
@@ -1258,7 +1241,7 @@ fn transaction_abort() {
                         .push(KeyValue::new_string("db.response.status_code", code));
                 }
             }
-            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            entry.span_mut().end(now);
             export_span(entry.span());
         }
     }
@@ -1276,7 +1259,7 @@ fn transaction_commit() {
     });
     if is_commit {
         if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
-            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            entry.span_mut().end(now);
             export_span(entry.span());
         }
     }
@@ -1287,7 +1270,7 @@ fn transaction_commit() {
     });
     if is_xact {
         if let Some(mut entry) = SPAN_STACK.with(|s| s.borrow_mut().pop()) {
-            entry.span_mut().end_time_unix_nano = to_unix_nano(now);
+            entry.span_mut().end(now);
             export_span(entry.span());
         }
     }

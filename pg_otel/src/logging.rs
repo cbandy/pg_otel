@@ -245,8 +245,11 @@ fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) ->
         record = record.severity_number(n).severity_text(t);
     }
 
-    if let Some((trace_id, span_id)) = crate::tracing::current_span_context() {
-        record = record.trace_id(trace_id).span_id(span_id);
+    if let Some(ctx) = crate::tracing::current_span_context() {
+        record = record
+            .trace_id(ctx.trace_id.to_bytes())
+            .span_id(ctx.span_id.to_bytes())
+            .flags(ctx.trace_flags.to_u8());
     }
 
     let mut buffer = crate::BytesMut::new();

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+mod context;
 mod exporter;
 mod logging;
 mod otlp;

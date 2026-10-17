@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 pub use self::ext::*;
-use std::ffi;
+use std::{ffi, time};
 
 pub use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
@@ -429,10 +429,27 @@ pub mod ext {
         }
     }
 
-    impl SpanExt for Span {}
     pub trait SpanExt {
         fn build() -> SpanBuilder {
             SpanBuilder::default()
+        }
+
+        fn start(&mut self, at: time::SystemTime);
+        fn end(&mut self, at: time::SystemTime);
+    }
+    impl SpanExt for Span {
+        fn start(&mut self, at: time::SystemTime) {
+            self.start_time_unix_nano = at
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+        }
+
+        fn end(&mut self, at: time::SystemTime) {
+            self.end_time_unix_nano = at
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
         }
     }
 
@@ -465,8 +482,18 @@ pub mod ext {
             self
         }
 
+        pub fn start_time(mut self, v: time::SystemTime) -> Self {
+            self.0.start(v);
+            self
+        }
+
         pub fn start_time_unix_nano(mut self, v: u64) -> Self {
             self.0.start_time_unix_nano = v;
+            self
+        }
+
+        pub fn end_time(mut self, v: time::SystemTime) -> Self {
+            self.0.end(v);
             self
         }
 
@@ -669,5 +696,21 @@ mod tests {
         let err_empty = SpanStatus::error("");
         assert_eq!(err_empty.code, SpanStatusCode::Error as i32);
         assert_eq!(err_empty.message, "");
+    }
+
+    #[test]
+    fn test_span_builder_times() {
+        let t1 = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_890);
+        let t2 = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(2_345_678_901);
+
+        let span = Span::build().start_time(t1).end_time(t2).finish();
+        assert_eq!(span.start_time_unix_nano, 1_234_567_890);
+        assert_eq!(span.end_time_unix_nano, 2_345_678_901);
+
+        let mut span2 = Span::build().finish();
+        span2.start(t1);
+        span2.end(t2);
+        assert_eq!(span2.start_time_unix_nano, 1_234_567_890);
+        assert_eq!(span2.end_time_unix_nano, 2_345_678_901);
     }
 }
