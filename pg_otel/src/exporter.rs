@@ -132,9 +132,10 @@ pub fn install_hooks() {
         .set_extra("E")
         .load();
 
-    // https://github.com/pgcentralfoundation/pgrx/issues/2370
-    use pgrx::pg_guard;
-    pgrx::pg_shmem_init!(QUEUE);
+    #[allow(unexpected_cfgs)]
+    {
+        pgrx::pg_shmem_init!(QUEUE);
+    }
 }
 
 pub fn send(data: &crate::BytesMut, notify: bool) {
