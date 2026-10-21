@@ -467,8 +467,8 @@ pub mod ext {
             self
         }
 
-        pub fn parent_span_id(mut self, v: impl Into<Vec<u8>>) -> Self {
-            self.0.parent_span_id = v.into();
+        pub fn parent_span_id(mut self, v: Option<impl Into<Vec<u8>>>) -> Self {
+            self.0.parent_span_id = v.map(Into::into).unwrap_or_default();
             self
         }
 
@@ -712,5 +712,16 @@ mod tests {
         span2.end(t2);
         assert_eq!(span2.start_time_unix_nano, 1_234_567_890);
         assert_eq!(span2.end_time_unix_nano, 2_345_678_901);
+    }
+
+    #[test]
+    fn test_span_builder_parent_span_id() {
+        let span_some = Span::build()
+            .parent_span_id(Some(vec![1, 2, 3, 4, 5, 6, 7, 8]))
+            .finish();
+        assert_eq!(span_some.parent_span_id, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let span_none = Span::build().parent_span_id(None::<Vec<u8>>).finish();
+        assert_eq!(span_none.parent_span_id, Vec::<u8>::new());
     }
 }

@@ -16,11 +16,7 @@ prost.workspace = true
 reqwest.workspace = true
 url.workspace = true
 
-opentelemetry = { workspace = true }
-opentelemetry-proto = {
-  workspace = true,
-  features = ["gen-tonic-messages", "logs", "metrics", "trace"]
-}
+opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
 
 # [pg_test] dependencies
 googletest = { workspace = true, optional = true }

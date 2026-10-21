@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-pub use opentelemetry::{SpanId, TraceFlags, TraceId};
 use pgrx::{pg_sys, void_mut_ptr};
 use std::cell::Cell;
+
+thread_local! {
+    static PRNG: Cell<PseudoRandom> = Cell::default();
+}
 
 /// Random number generator that uses Postgres [`pg_sys::pg_prng_seed`].
 #[derive(Clone, Copy, Default)]
@@ -12,10 +15,10 @@ struct PseudoRandom {
 }
 
 impl PseudoRandom {
-    fn next_u64(&mut self) -> u64 {
+    // Seed the pseudorandom state after fork(2) or when uninitialized.
+    fn ensure_seeded(&mut self) {
         let pid = unsafe { pg_sys::MyProcPid };
 
-        // Seed the pseudorandom state after fork(2) or when uninitialized.
         if self.pid != pid || self.pid == 0 {
             let mut seed = [0u8; 8];
             unsafe {
@@ -24,43 +27,172 @@ impl PseudoRandom {
             }
             self.pid = pid;
         }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.ensure_seeded();
 
         unsafe { pg_sys::pg_prng_uint64(&mut self.state) }
     }
+
+    fn next_u128(&mut self) -> u128 {
+        self.ensure_seeded();
+
+        let hi = unsafe { pg_sys::pg_prng_uint64(&mut self.state) } as u128;
+        let lo = unsafe { pg_sys::pg_prng_uint64(&mut self.state) } as u128;
+
+        (hi << 64) | lo
+    }
 }
 
-thread_local! {
-    static PRNG: Cell<PseudoRandom> = Cell::default();
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SpanId(u64);
 
-// Generate a new (pseudorandom) span identifier.
-pub fn new_span_id() -> SpanId {
-    PRNG.with(|cell| {
-        let mut prng = cell.get();
-        loop {
-            let id = SpanId::from(prng.next_u64());
-            if id != SpanId::INVALID {
-                cell.set(prng);
-                return id;
+impl SpanId {
+    // Generate a new (uniformly pseudorandom) span identifier.
+    pub fn new() -> Self {
+        PRNG.with(|cell| {
+            let mut prng = cell.get();
+
+            // Repeat until the value is nonzero; W3C Trace Context § 3.2.2.4
+            loop {
+                let id = prng.next_u64();
+                if id != 0 {
+                    cell.set(prng);
+                    return Self(id);
+                }
             }
+        })
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self, ()> {
+        match hex.len() {
+            16 => u64::from_str_radix(hex, 16).map(Self).map_err(|_| ()),
+            _ => Err(()),
         }
-    })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 != 0
+    }
 }
 
-// Generate a new (pseudorandom) trace identifier.
-pub fn new_trace_id() -> TraceId {
-    PRNG.with(|cell| {
-        let mut prng = cell.get();
-        loop {
-            let hi = prng.next_u64() as u128;
-            let lo = prng.next_u64() as u128;
-            let id = TraceId::from((hi << 64) | lo);
-            if id != TraceId::INVALID {
-                cell.set(prng);
-                return id;
+impl From<SpanId> for Vec<u8> {
+    fn from(id: SpanId) -> Self {
+        id.0.to_be_bytes().to_vec()
+    }
+}
+
+impl std::fmt::LowerHex for SpanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl std::fmt::Debug for SpanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpanId({:016x})", self.0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TraceId(u128);
+
+impl TraceId {
+    // Generate a new (uniformly pseudorandom) trace identifier.
+    pub fn new() -> Self {
+        PRNG.with(|cell| {
+            let mut prng = cell.get();
+
+            // Repeat until the value is nonzero; W3C Trace Context § 3.2.2.3
+            loop {
+                let id = prng.next_u128();
+                if id != 0 {
+                    cell.set(prng);
+                    return Self(id);
+                }
             }
+        })
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self, ()> {
+        match hex.len() {
+            32 => u128::from_str_radix(hex, 16).map(Self).map_err(|_| ()),
+            _ => Err(()),
         }
-    })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl core::convert::From<TraceId> for Vec<u8> {
+    fn from(id: TraceId) -> Self {
+        id.0.to_be_bytes().to_vec()
+    }
+}
+
+impl core::fmt::LowerHex for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl core::fmt::Debug for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TraceId({:032x})", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceFlags(u8);
+
+impl TraceFlags {
+    pub fn from_hex(hex: &str) -> Result<Self, ()> {
+        match hex.len() {
+            2 => u8::from_str_radix(hex, 16).map(Self).map_err(|_| ()),
+            _ => Err(()),
+        }
+    }
+
+    pub const W3C_RANDOM: Self = Self(0x02); // Indicates the right-most bytes are uniformly random; W3C Trace Context § 3.2.2.5
+    pub const W3C_SAMPLED: Self = Self(0x01); // Indicates the caller may have recorded trace data; W3C Trace Context § 3.2.2.5
+
+    pub fn is_random(self) -> bool {
+        self.0 & 0x02 != 0
+    }
+
+    pub fn is_sampled(self) -> bool {
+        self.0 & 0x01 != 0
+    }
+}
+
+impl core::ops::BitOr for TraceFlags {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::convert::From<TraceFlags> for u32 {
+    fn from(f: TraceFlags) -> Self {
+        f.0 as u32
+    }
+}
+
+impl core::fmt::LowerHex for TraceFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02x}", self.0)
+    }
+}
+
+impl core::fmt::Debug for TraceFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TraceFlags({:02x})", self.0)
+    }
 }
 
 pub type Str<'a> = std::borrow::Cow<'a, str>;
@@ -84,12 +216,11 @@ impl SpanContext {
         }
     }
 
+    // Representation defined by W3C Trace Context, Traceparent § 3.2
     pub fn w3c_traceparent(&self) -> String {
         format!(
             "00-{:032x}-{:016x}-{:02x}",
-            self.trace_id,
-            self.span_id,
-            self.trace_flags.to_u8()
+            self.trace_id, self.span_id, self.trace_flags
         )
     }
 }
@@ -105,14 +236,10 @@ impl<'a> std::convert::TryFrom<Headers<'a>> for SpanContext {
                 let (trace, rest) = rest.split_once('-').ok_or(())?;
                 let (span, flags) = rest.split_once('-').ok_or(())?;
 
-                if trace.len() != 32 || span.len() != 16 || flags.len() != 2 {
-                    return Err(());
-                }
-
                 Ok(SpanContext {
-                    span_id: SpanId::from_hex(span).map_err(|_| ())?,
-                    trace_id: TraceId::from_hex(trace).map_err(|_| ())?,
-                    trace_flags: TraceFlags::new(u8::from_str_radix(flags, 16).map_err(|_| ())?),
+                    span_id: SpanId::from_hex(span)?,
+                    trace_id: TraceId::from_hex(trace)?,
+                    trace_flags: TraceFlags::from_hex(flags)?,
                 })
             }
             _ => Err(()),
@@ -397,14 +524,14 @@ fn rfind_quote(s: &str, quote: char) -> Option<usize> {
     None
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
-    use super::{CommenterIterator, Headers, SpanContext, Str};
+    use super::{CommenterIterator, Headers, SpanContext, SpanId, Str, TraceFlags, TraceId};
     use googletest::prelude::*;
-    use opentelemetry::{SpanId, TraceFlags, TraceId};
 
     #[test]
-    fn test_decode() {
+    fn test_commenter_iterator_decode() {
         // String without encoding is borrowed (zero allocation)
         match CommenterIterator::decode("plain_text") {
             Str::Borrowed(s) => assert_that!(s, eq("plain_text")),
@@ -496,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_sql() {
+    fn test_headers_from_sql() {
         assert_that!(
             Headers::from_sql(
                 "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',tracestate='congo=t61rcWkgMzE' */;",
@@ -551,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_statement() {
+    fn test_headers_from_statement() {
         struct Case<'a> {
             name: &'a str,
             sql: &'a str,
@@ -738,33 +865,24 @@ mod tests {
                 name: "sampled",
                 traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
                 tracestate: None,
-                expected_trace: TraceId::from_bytes([
-                    0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e,
-                    0x0e, 0x47, 0x36,
-                ]),
-                expected_span: SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]),
-                expected_flags: TraceFlags::SAMPLED,
+                expected_trace: TraceId(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736),
+                expected_span: SpanId(0x00f0_67aa_0ba9_02b7),
+                expected_flags: TraceFlags::W3C_SAMPLED,
             },
             Case {
                 name: "unsampled",
                 traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
                 tracestate: None,
-                expected_trace: TraceId::from_bytes([
-                    0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e,
-                    0x0e, 0x47, 0x36,
-                ]),
-                expected_span: SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]),
+                expected_trace: TraceId(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736),
+                expected_span: SpanId(0x00f0_67aa_0ba9_02b7),
                 expected_flags: TraceFlags::default(),
             },
             Case {
                 name: "unsampled with state",
                 traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
                 tracestate: Some("congo=t61rcWkgMzE"),
-                expected_trace: TraceId::from_bytes([
-                    0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e,
-                    0x0e, 0x47, 0x36,
-                ]),
-                expected_span: SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]),
+                expected_trace: TraceId(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736),
+                expected_span: SpanId(0x00f0_67aa_0ba9_02b7),
                 expected_flags: TraceFlags::default(),
             },
         ];
@@ -815,17 +933,14 @@ mod tests {
     }
 
     #[test]
-    fn test_w3c_traceparent_format_and_roundtrip() {
-        let trace_id = TraceId::from_bytes([
-            0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
-            0x47, 0x36,
-        ]);
-        let span_id = SpanId::from_bytes([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+    fn test_context_w3c_traceparent_roundtrip() {
+        let trace_id = TraceId(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
+        let span_id = SpanId(0x00f0_67aa_0ba9_02b7);
 
         let sampled = SpanContext {
             trace_id,
             span_id,
-            trace_flags: TraceFlags::SAMPLED,
+            trace_flags: TraceFlags::W3C_SAMPLED,
         };
         assert_that!(
             sampled.w3c_traceparent(),
@@ -849,5 +964,101 @@ mod tests {
             SpanContext::try_from(Headers::new(&unsampled.w3c_traceparent(), None)),
             ok(eq(unsampled))
         );
+    }
+
+    #[pgrx::pg_test]
+    fn test_span_id_new() {
+        let span1 = SpanId::new();
+        assert_that!(span1, eq(span1));
+        assert!(span1.is_valid());
+
+        let span2 = SpanId::new();
+        assert_that!(span2, eq(span2));
+        assert!(span2.is_valid());
+
+        assert_that!(span1, not(eq(span2)), "generated");
+        assert_that!(span2, not(eq(span1)), "generated");
+    }
+
+    #[test]
+    fn test_span_id_conversions() {
+        let span = SpanId(0x0123_4567_89ab_cdef);
+        let v: Vec<u8> = span.into();
+        assert_that!(v, eq(&vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]));
+    }
+
+    #[test]
+    fn test_span_id_formatting() {
+        let span = SpanId(0x00f0_67aa_0ba9_02b7);
+        assert_that!(format!("{:016x}", span), eq("00f067aa0ba902b7"));
+        assert_that!(format!("{:x}", span), eq("00f067aa0ba902b7"));
+        assert_that!(format!("{:?}", span), eq("SpanId(00f067aa0ba902b7)"));
+    }
+
+    #[pgrx::pg_test]
+    fn test_trace_id_new() {
+        let trace1 = TraceId::new();
+        assert_that!(trace1, eq(trace1));
+        assert!(trace1.is_valid());
+
+        let trace2 = TraceId::new();
+        assert_that!(trace2, eq(trace2));
+        assert!(trace2.is_valid());
+
+        assert_that!(trace1, not(eq(trace2)), "generated");
+        assert_that!(trace2, not(eq(trace1)), "generated");
+    }
+
+    #[test]
+    fn test_trace_id_conversions() {
+        let trace = TraceId(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let v: Vec<u8> = trace.into();
+        assert_that!(
+            v,
+            eq(&vec![
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef,
+            ])
+        );
+    }
+
+    #[test]
+    fn test_trace_id_formatting() {
+        let trace = TraceId(0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736);
+        assert_that!(
+            format!("{:032x}", trace),
+            eq("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_that!(
+            format!("{:x}", trace),
+            eq("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_that!(
+            format!("{:?}", trace),
+            eq("TraceId(4bf92f3577b34da6a3ce929d0e0e4736)")
+        );
+    }
+
+    #[test]
+    fn test_trace_flags_conversions() {
+        let flags = TraceFlags::W3C_SAMPLED;
+        let flags_u32: u32 = flags.into();
+        assert_that!(flags_u32, eq(1u32));
+    }
+
+    #[test]
+    fn test_trace_flags_formatting() {
+        let flags = TraceFlags::W3C_SAMPLED;
+        assert_that!(format!("{:02x}", flags), eq("01"));
+        assert_that!(format!("{:x}", flags), eq("01"));
+        assert_that!(format!("{:?}", flags), eq("TraceFlags(01)"));
+    }
+
+    #[test]
+    fn test_trace_flags_bitor() {
+        let flags = TraceFlags::W3C_RANDOM | TraceFlags::W3C_SAMPLED;
+        assert_that!(flags.is_random(), eq(true));
+        assert_that!(flags.is_sampled(), eq(true));
+        assert_that!(format!("{:x}", flags), eq("03"));
     }
 }
