@@ -2,6 +2,11 @@ This is a pgrx extension for emitting telemetry about PostgreSQL at runtime.
 
 - **Target Personas**: `docs/personas.md` defines the primary users and their operational priorities.
 
+## Development
+
+- **Testing**: Use `cargo pgrx test` (NOT `cargo test`) to run tests.
+- **Workflow**: Test with `cargo pgrx test pg15` for fast iteration; verify against multiple versions before completing changes that touch hooks, shared memory, or Postgres internals.
+
 ## Architectural Decision Records (ADRs)
 
 ADRs are located in `docs/decisions/` and follow the [MADR](https://adr.github.io/madr) format.
