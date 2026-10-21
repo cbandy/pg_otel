@@ -204,7 +204,7 @@ mod tests {
 
         // Verify worker span
         verify_that!(worker_span.name, eq("SELECT"))?;
-        verify_that!(worker_span.kind, eq(SpanKind::Server as i32))?;
+        verify_that!(worker_span.kind, eq(SpanKind::Internal as i32))?;
         verify_that!(worker_span.status, is_empty())?;
         verify_that!(worker_span.trace_id, eq(&leader_span.trace_id))?;
         verify_that!(worker_span.parent_span_id, eq(&leader_span.span_id))?;

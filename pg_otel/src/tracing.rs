@@ -546,7 +546,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
     let now = time::SystemTime::now();
     let Some(qd) = query else { return };
 
-    if unsafe { pg_sys::ParallelWorkerNumber >= 0 }
+    if unsafe { pg_sys::ParallelWorkerNumber } >= 0
         && let Some(ctx) = GUC_TRACE_CONTEXT.with(|c| c.borrow_mut().take())
     {
         let sql = if !qd.sourceText.is_null() {
@@ -562,7 +562,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         let context = SpanContext::new(trace_id, span_id, trace_flags);
         let span = Span::build()
             .name(op_name.clone())
-            .kind(SpanKind::Server as i32)
+            .kind(SpanKind::Internal as i32)
             .trace_id(trace_id)
             .span_id(span_id)
             .parent_span_id(Some(ctx.span_id))

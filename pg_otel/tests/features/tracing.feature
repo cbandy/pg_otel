@@ -107,7 +107,7 @@ Feature: Tracing and Spans
       | parent_id | *none*         |
       | db.operation.name | SELECT |
     And I should see a span with:
-      | kind      | server         |
+      | kind      | internal       |
       | status    | unset          |
       | span_id   | *generated*    |
       | trace_id  | *query*        |
