@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use crate::context::{
-    Headers, SpanContext, SpanId, TraceFlags, TraceId, new_span_id, new_trace_id,
-};
+use crate::context::{Headers, SpanContext, SpanId, TraceFlags, TraceId};
 use crate::otlp::*;
 use crate::{GucInt32, GucString};
 use pgrx::pg_sys::{self, PgNode};
@@ -76,24 +74,28 @@ fn resolve_parent_and_links(
     own_ctx: Option<SpanContext>,
     parent_ctx: Option<SpanContext>,
 ) -> (TraceId, Option<SpanId>, TraceFlags, Vec<Link>) {
-    let mut links = Vec::new();
-    let (trace_id, parent_span_id, trace_flags) = if let Some(ctx) = own_ctx {
-        if let Some(p) = parent_ctx {
-            links.push(
+    match (own_ctx, parent_ctx) {
+        (None, None) => (
+            TraceId::new(),
+            None,
+            TraceFlags::W3C_RANDOM | TraceFlags::W3C_SAMPLED,
+            vec![],
+        ),
+        (Some(o), Some(p)) => (
+            o.trace_id,
+            Some(o.span_id),
+            o.trace_flags,
+            vec![
                 Link::build()
-                    .trace_id(p.trace_id.to_bytes())
-                    .span_id(p.span_id.to_bytes())
-                    .flags(p.trace_flags.to_u8())
+                    .trace_id(p.trace_id)
+                    .span_id(p.span_id)
+                    .flags(p.trace_flags)
                     .finish(),
-            );
-        }
-        (ctx.trace_id, Some(ctx.span_id), ctx.trace_flags)
-    } else if let Some(p) = parent_ctx {
-        (p.trace_id, Some(p.span_id), p.trace_flags)
-    } else {
-        (new_trace_id(), None, TraceFlags::SAMPLED)
-    };
-    (trace_id, parent_span_id, trace_flags, links)
+            ],
+        ),
+        (Some(o), _) => (o.trace_id, Some(o.span_id), o.trace_flags, vec![]),
+        (_, Some(p)) => (p.trace_id, Some(p.span_id), p.trace_flags, vec![]),
+    }
 }
 
 struct ErrorRecord {
@@ -218,9 +220,9 @@ fn assign_traceparent(value: Option<ffi::CString>) {
         if let Some(StackSpan::Transaction(xact)) = stack.borrow_mut().first_mut()
             && !xact.has_received_context
         {
-            xact.span.trace_id = ctx.trace_id.to_bytes().into();
-            xact.span.parent_span_id = ctx.span_id.to_bytes().into();
-            xact.span.flags = ctx.trace_flags.to_u8() as u32;
+            xact.span.trace_id = ctx.trace_id.into();
+            xact.span.parent_span_id = ctx.span_id.into();
+            xact.span.flags = ctx.trace_flags.into();
             xact.context.trace_id = ctx.trace_id;
             xact.context.trace_flags = ctx.trace_flags;
             xact.has_received_context = true;
@@ -556,15 +558,15 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         let op_name = get_operation_name(pstmt, sql);
         let trace_id = ctx.trace_id;
         let trace_flags = ctx.trace_flags;
-        let span_id = new_span_id();
+        let span_id = SpanId::new();
         let context = SpanContext::new(trace_id, span_id, trace_flags);
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(trace_id.to_bytes())
-            .span_id(span_id.to_bytes())
-            .parent_span_id(ctx.span_id.to_bytes())
-            .flags(trace_flags.to_u8())
+            .trace_id(trace_id)
+            .span_id(span_id)
+            .parent_span_id(Some(ctx.span_id))
+            .flags(trace_flags)
             .start_time(now)
             .attributes(vec![
                 KeyValue::new_string("db.operation.name", op_name),
@@ -623,7 +625,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
             resolve_parent_and_links(own_ctx, parent_ctx);
 
         let op_name = get_operation_name(pstmt, sql);
-        let span_id = new_span_id();
+        let span_id = SpanId::new();
         let context = SpanContext::new(trace_id, span_id, trace_flags);
 
         if pstmt.map_or(false, |p| p.parallelModeNeeded) {
@@ -644,10 +646,10 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(trace_id.to_bytes())
-            .span_id(span_id.to_bytes())
-            .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
-            .flags(trace_flags.to_u8())
+            .trace_id(trace_id)
+            .span_id(span_id)
+            .parent_span_id(parent_span_id)
+            .flags(trace_flags)
             .start_time(now)
             .links(links)
             .attributes(vec![
@@ -701,7 +703,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
                 let trace_id = parent.context.trace_id;
                 let trace_flags = parent.context.trace_flags;
                 let parent_span_id = parent.context.span_id;
-                let span_id = new_span_id();
+                let span_id = SpanId::new();
                 let context = SpanContext::new(trace_id, span_id, trace_flags);
                 let op_name = get_operation_name(pstmt, sql);
 
@@ -716,10 +718,10 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
                 let span = Span::build()
                     .name(op_name)
                     .kind(SpanKind::Internal as i32)
-                    .trace_id(trace_id.to_bytes())
-                    .span_id(span_id.to_bytes())
-                    .parent_span_id(parent_span_id.to_bytes())
-                    .flags(trace_flags.to_u8())
+                    .trace_id(trace_id)
+                    .span_id(span_id)
+                    .parent_span_id(Some(parent_span_id))
+                    .flags(trace_flags)
                     .start_time(now)
                     .attributes(attributes)
                     .finish();
@@ -830,15 +832,15 @@ where
             let (trace_id, parent_span_id, trace_flags, links) =
                 resolve_parent_and_links(own_ctx, parent_ctx);
 
-            let span_id = new_span_id();
+            let span_id = SpanId::new();
             let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("TRANSACTION")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id.to_bytes())
-                .span_id(span_id.to_bytes())
-                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
-                .flags(trace_flags.to_u8())
+                .trace_id(trace_id)
+                .span_id(span_id)
+                .parent_span_id(parent_span_id)
+                .flags(trace_flags)
                 .start_time(now)
                 .links(links)
                 .attributes(vec![
@@ -864,15 +866,15 @@ where
             let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
             let (trace_id, parent_span_id, trace_flags, links) =
                 resolve_parent_and_links(None, parent_ctx);
-            let span_id = new_span_id();
+            let span_id = SpanId::new();
             let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("COMMIT")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id.to_bytes())
-                .span_id(span_id.to_bytes())
-                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
-                .flags(trace_flags.to_u8())
+                .trace_id(trace_id)
+                .span_id(span_id)
+                .parent_span_id(parent_span_id)
+                .flags(trace_flags)
                 .start_time(now)
                 .links(links)
                 .attributes(vec![
@@ -895,15 +897,15 @@ where
             let parent_ctx = SPAN_STACK.with(|s| s.borrow().last().map(|e| e.context()));
             let (trace_id, parent_span_id, trace_flags, links) =
                 resolve_parent_and_links(None, parent_ctx);
-            let span_id = new_span_id();
+            let span_id = SpanId::new();
             let context = SpanContext::new(trace_id, span_id, trace_flags);
             let span = Span::build()
                 .name("ROLLBACK")
                 .kind(SpanKind::Server as i32)
-                .trace_id(trace_id.to_bytes())
-                .span_id(span_id.to_bytes())
-                .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
-                .flags(trace_flags.to_u8())
+                .trace_id(trace_id)
+                .span_id(span_id)
+                .parent_span_id(parent_span_id)
+                .flags(trace_flags)
                 .start_time(now)
                 .links(links)
                 .attributes(vec![
@@ -974,15 +976,15 @@ where
             resolve_parent_and_links(own_ctx, parent_ctx);
 
         let op_name = get_operation_name(pstmt, sql_str);
-        let span_id = new_span_id();
+        let span_id = SpanId::new();
         let context = SpanContext::new(trace_id, span_id, trace_flags);
         let span = Span::build()
             .name(op_name.clone())
             .kind(SpanKind::Server as i32)
-            .trace_id(trace_id.to_bytes())
-            .span_id(span_id.to_bytes())
-            .parent_span_id(parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()))
-            .flags(trace_flags.to_u8())
+            .trace_id(trace_id)
+            .span_id(span_id)
+            .parent_span_id(parent_span_id)
+            .flags(trace_flags)
             .start_time(now)
             .links(links)
             .attributes(vec![
@@ -1034,7 +1036,7 @@ where
                     let trace_id = parent.context.trace_id;
                     let trace_flags = parent.context.trace_flags;
                     let parent_span_id = parent.context.span_id;
-                    let span_id = new_span_id();
+                    let span_id = SpanId::new();
                     let context = SpanContext::new(trace_id, span_id, trace_flags);
                     let op_name = get_operation_name(pstmt, sql_str);
 
@@ -1049,10 +1051,10 @@ where
                     let span = Span::build()
                         .name(op_name)
                         .kind(SpanKind::Internal as i32)
-                        .trace_id(trace_id.to_bytes())
-                        .span_id(span_id.to_bytes())
-                        .parent_span_id(parent_span_id.to_bytes())
-                        .flags(trace_flags.to_u8())
+                        .trace_id(trace_id)
+                        .span_id(span_id)
+                        .parent_span_id(Some(parent_span_id))
+                        .flags(trace_flags)
                         .start_time(now)
                         .attributes(attributes)
                         .finish();
@@ -1175,20 +1177,18 @@ fn transaction_abort() {
                                 entry.context().trace_flags,
                             )
                         } else {
-                            (new_trace_id(), None, TraceFlags::SAMPLED)
+                            (TraceId::new(), None, TraceFlags::W3C_SAMPLED)
                         }
                     });
-                    let span_id = new_span_id();
+                    let span_id = SpanId::new();
 
                     let span = Span::build()
                         .name(op_name.clone())
                         .kind(SpanKind::Server as i32)
-                        .trace_id(trace_id.to_bytes())
-                        .span_id(span_id.to_bytes())
-                        .parent_span_id(
-                            parent_span_id.map_or_else(Vec::new, |id| id.to_bytes().into()),
-                        )
-                        .flags(trace_flags.to_u8())
+                        .trace_id(trace_id)
+                        .span_id(span_id)
+                        .parent_span_id(parent_span_id)
+                        .flags(trace_flags)
                         .status(SpanStatus::error(""))
                         .start_time(now)
                         .end_time(now)
