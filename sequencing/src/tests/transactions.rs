@@ -393,4 +393,33 @@ mod tests {
             ]
         )
     }
+
+    #[pgrx::pg_test]
+    fn savepoint_outside_transaction_errors() -> Result<()> {
+        let filename = "savepoint_outside_transaction_errors";
+        let mut client = super::setup_test(filename);
+        super::clear_trace(filename);
+
+        assert_that!(
+            client.simple_query("SAVEPOINT s1"),
+            err(predicate(|e: &postgres::Error| {
+                e.code() == Some(&postgres::error::SqlState::NO_ACTIVE_SQL_TRANSACTION)
+            }))
+        );
+
+        // wait for backend error handling
+        client.check_connection()?;
+
+        verify_that!(
+            super::read_trace(filename),
+            elements_are![
+                eq(&("emit_log_hook", "entry")), // LOG: statement: SAVEPOINT s1
+                eq(&("post_parse_analyze_hook", "start")),
+                eq(&("post_parse_analyze_hook", "end")),
+                eq(&("ProcessUtility_hook", "start")),
+                eq(&("emit_log_hook", "entry")), // ERROR: SAVEPOINT can only be used in transaction blocks
+                eq(&("xact_callback", "ABORT")),
+            ]
+        )
+    }
 }

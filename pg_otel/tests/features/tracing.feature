@@ -487,3 +487,102 @@ Feature: Tracing and Spans
       | parent_id         | *transaction*    |
       | db.operation.name | COMMIT           |
 
+  Scenario: Savepoint and Release in Transaction
+    Savepoint statements appear as server spans under the transaction.
+
+    Given I am authenticated
+    When I execute: BEGIN
+    When I execute: SAVEPOINT s1
+    When I execute: SELECT 1
+    When I execute: RELEASE SAVEPOINT s1
+    When I execute: COMMIT
+    Then I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SAVEPOINT     |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | RELEASE       |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | COMMIT        |
+
+  Scenario: Savepoint Error Recovery
+    An error after a savepoint produces an error span.
+    The savepoint and rollback to it should not have an error when the rollback succeeds.
+
+    Given I am authenticated
+    When I execute: BEGIN
+    When I execute: SAVEPOINT s1
+    When I execute: SELECT 1/0
+    When I execute: ROLLBACK TO s1
+    When I execute: SELECT 2
+    When I execute: COMMIT
+    Then I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SAVEPOINT     |
+    And I should see a span with:
+      | kind                    | server        |
+      | status                  | error         |
+      | span_id                 | *generated*   |
+      | trace_id                | *transaction* |
+      | parent_id               | *transaction* |
+      | db.operation.name       | SELECT        |
+      | db.response.status_code | 22012         |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | ROLLBACK      |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | COMMIT        |

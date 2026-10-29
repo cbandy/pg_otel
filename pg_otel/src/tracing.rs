@@ -1111,21 +1111,11 @@ where
     }
 }
 
-fn transaction_abort() {
-    EXECUTION_DEPTH.set(0);
-    REMAINING_BUDGET.set(0);
-    let dropped = DROPPED_NESTED_STATEMENTS.take();
-    let now = time::SystemTime::now();
-    let last_error = LAST_ERROR.with(|err| err.borrow_mut().take());
-    let in_xact_block = unsafe { pg_sys::IsTransactionBlock() };
-
-    let is_commit_or_rollback = SPAN_STACK.with(|s| {
-        s.borrow().last().map_or(false, |entry| {
-            entry.span().name == "COMMIT" || entry.span().name == "ROLLBACK"
-        })
-    });
-    let is_ending_xact = is_commit_or_rollback || !in_xact_block;
-
+fn abort_statements(
+    now: time::SystemTime,
+    last_error: Option<ErrorRecord>,
+    dropped: usize,
+) -> Option<String> {
     let mut statement_entries = Vec::new();
     SPAN_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1202,15 +1192,7 @@ fn transaction_abort() {
                 }
             }
         }
-
-        if in_xact_block || is_commit_or_rollback {
-            SPAN_STACK.with(|s| {
-                if let Some(StackSpan::Transaction(xact)) = s.borrow_mut().last_mut() {
-                    xact.span.status = Some(SpanStatus::error(""));
-                    xact.error_code = Some(code);
-                }
-            });
-        }
+        Some(code)
     } else {
         for mut entry in statement_entries {
             if entry.depth() == 1 && dropped > 0 {
@@ -1221,6 +1203,36 @@ fn transaction_abort() {
             }
             entry.span_mut().end(now);
             export_span(entry.span());
+        }
+        None
+    }
+}
+
+fn transaction_abort() {
+    let now = time::SystemTime::now();
+    EXECUTION_DEPTH.set(0);
+    REMAINING_BUDGET.set(0);
+    let dropped = DROPPED_NESTED_STATEMENTS.take();
+    let last_error = LAST_ERROR.with(|err| err.borrow_mut().take());
+    let in_xact_block = unsafe { pg_sys::IsTransactionBlock() };
+
+    let is_commit_or_rollback = SPAN_STACK.with(|s| {
+        s.borrow().last().map_or(false, |entry| {
+            entry.span().name == "COMMIT" || entry.span().name == "ROLLBACK"
+        })
+    });
+    let is_ending_xact = is_commit_or_rollback || !in_xact_block;
+
+    let error_code = abort_statements(now, last_error, dropped);
+
+    if let Some(code) = error_code {
+        if in_xact_block || is_commit_or_rollback {
+            SPAN_STACK.with(|s| {
+                if let Some(StackSpan::Transaction(xact)) = s.borrow_mut().last_mut() {
+                    xact.span.status = Some(SpanStatus::error(""));
+                    xact.error_code = Some(code);
+                }
+            });
         }
     }
 
@@ -1247,11 +1259,19 @@ fn transaction_abort() {
     }
 }
 
-fn subxact_abort() {}
+fn subxact_abort() {
+    let now = time::SystemTime::now();
+    EXECUTION_DEPTH.set(0);
+    REMAINING_BUDGET.set(0);
+    let dropped = DROPPED_NESTED_STATEMENTS.take();
+    let last_error = LAST_ERROR.with(|err| err.borrow_mut().take());
+
+    let _ = abort_statements(now, last_error, dropped);
+}
 
 fn transaction_commit() {
-    EXECUTION_DEPTH.set(0);
     let now = time::SystemTime::now();
+    EXECUTION_DEPTH.set(0);
     let is_commit = SPAN_STACK.with(|s| {
         s.borrow()
             .last()

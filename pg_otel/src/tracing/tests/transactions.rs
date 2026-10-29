@@ -452,4 +452,192 @@ mod tests {
             ]
         )
     }
+
+    #[pgrx::pg_test]
+    fn savepoint_and_release_in_transaction() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        for sqls in [
+            // Five Query ('Q') messages
+            &[
+                "BEGIN",
+                "SAVEPOINT s1",
+                "SELECT 1",
+                "RELEASE SAVEPOINT s1",
+                "COMMIT",
+            ][..],
+            // Some statements combined in Query ('Q') messages
+            &[
+                "BEGIN; SAVEPOINT s1",
+                "SELECT 1",
+                "RELEASE SAVEPOINT s1; COMMIT",
+            ][..],
+            // One Query ('Q') message with all statements
+            &["BEGIN; SAVEPOINT s1; SELECT 1; RELEASE SAVEPOINT s1; COMMIT"][..],
+        ] {
+            scoped_trace!("{sqls:?}");
+
+            harness.enable_tracing()?;
+            for sql in sqls {
+                harness.client.batch_execute(sql)?;
+            }
+
+            let all_spans = harness.collect_transaction_spans(time::Duration::from_secs(2));
+
+            let xact_span = all_spans.last().or_fail()?;
+            verify_that!(
+                all_spans,
+                elements_are![
+                    matches_pattern!(Span {
+                        name: eq("SAVEPOINT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("SELECT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("RELEASE"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("COMMIT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("TRANSACTION"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        parent_span_id: is_empty(),
+                        ..
+                    }),
+                ]
+            )?;
+        }
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn savepoint_error_recovery() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        for error_sql in [
+            // This fails while planning, when Postgres folds constants.
+            "SELECT 1/0",
+            // This fails while running, when Postgres produces rows.
+            "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+        ] {
+            for (sqls, error_idx) in [
+                // Six Query ('Q') messages
+                (
+                    &[
+                        "BEGIN",
+                        "SAVEPOINT s1",
+                        error_sql,
+                        "ROLLBACK TO s1",
+                        "SELECT 2",
+                        "COMMIT",
+                    ][..],
+                    2,
+                ),
+                // Some statements combined before and after the error
+                (
+                    &[
+                        "BEGIN; SAVEPOINT s1",
+                        error_sql,
+                        "ROLLBACK TO s1; SELECT 2; COMMIT",
+                    ][..],
+                    1,
+                ),
+            ] {
+                scoped_trace!("{sqls:?}");
+
+                harness.enable_tracing()?;
+                for (idx, sql) in sqls.iter().enumerate() {
+                    if idx == error_idx {
+                        verify_that!(harness.client.batch_execute(sql), err(anything()))?;
+                    } else {
+                        harness.client.batch_execute(sql)?;
+                    }
+                }
+
+                let all_spans = harness.collect_transaction_spans(time::Duration::from_secs(2));
+
+                let xact_span = all_spans.last().or_fail()?;
+                verify_that!(
+                    all_spans,
+                    elements_are![
+                        matches_pattern!(Span {
+                            name: eq("SAVEPOINT"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: is_empty(),
+                            trace_id: eq(&xact_span.trace_id),
+                            parent_span_id: eq(&xact_span.span_id),
+                            ..
+                        }),
+                        matches_pattern!(Span {
+                            name: eq("SELECT"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: some(eq(&SpanStatus::error(""))),
+                            trace_id: eq(&xact_span.trace_id),
+                            parent_span_id: eq(&xact_span.span_id),
+                            attributes: contains(eq(&KeyValue::new_string(
+                                "db.response.status_code",
+                                "22012"
+                            ))),
+                            ..
+                        }),
+                        matches_pattern!(Span {
+                            name: eq("ROLLBACK"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: is_empty(),
+                            trace_id: eq(&xact_span.trace_id),
+                            parent_span_id: eq(&xact_span.span_id),
+                            ..
+                        }),
+                        matches_pattern!(Span {
+                            name: eq("SELECT"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: is_empty(),
+                            trace_id: eq(&xact_span.trace_id),
+                            parent_span_id: eq(&xact_span.span_id),
+                            ..
+                        }),
+                        matches_pattern!(Span {
+                            name: eq("COMMIT"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: is_empty(),
+                            trace_id: eq(&xact_span.trace_id),
+                            parent_span_id: eq(&xact_span.span_id),
+                            ..
+                        }),
+                        matches_pattern!(Span {
+                            name: eq("TRANSACTION"),
+                            kind: eq(&(SpanKind::Server as i32)),
+                            status: is_empty(),
+                            parent_span_id: is_empty(),
+                            ..
+                        }),
+                    ]
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
