@@ -151,6 +151,11 @@ pub mod ext {
             self
         }
 
+        pub fn attribute(mut self, kv: KeyValue) -> Self {
+            self.0.attributes.push(kv);
+            self
+        }
+
         pub fn dropped_attributes_count(mut self, v: u32) -> Self {
             self.0.dropped_attributes_count = v;
             self
@@ -243,6 +248,11 @@ pub mod ext {
             self
         }
 
+        pub fn attribute(mut self, kv: KeyValue) -> Self {
+            self.0.attributes.push(kv);
+            self
+        }
+
         pub fn dropped_attributes_count(mut self, v: u32) -> Self {
             self.0.dropped_attributes_count = v;
             self
@@ -299,6 +309,11 @@ pub mod ext {
             self
         }
 
+        pub fn attribute(mut self, kv: KeyValue) -> Self {
+            self.0.attributes.push(kv);
+            self
+        }
+
         pub fn dropped_attributes_count(mut self, v: u32) -> Self {
             self.0.dropped_attributes_count = v;
             self
@@ -352,6 +367,11 @@ pub mod ext {
     impl ResourceBuilder {
         pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
             self.0.attributes = v.into_iter().collect();
+            self
+        }
+
+        pub fn attribute(mut self, kv: KeyValue) -> Self {
+            self.0.attributes.push(kv);
             self
         }
 
@@ -436,6 +456,7 @@ pub mod ext {
 
         fn start(&mut self, at: time::SystemTime);
         fn end(&mut self, at: time::SystemTime);
+        fn attribute(&mut self, kv: KeyValue);
     }
     impl SpanExt for Span {
         fn start(&mut self, at: time::SystemTime) {
@@ -450,6 +471,10 @@ pub mod ext {
                 .duration_since(time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
+        }
+
+        fn attribute(&mut self, kv: KeyValue) {
+            self.attributes.push(kv);
         }
     }
 
@@ -504,6 +529,11 @@ pub mod ext {
 
         pub fn attributes(mut self, v: impl IntoIterator<Item = KeyValue>) -> Self {
             self.0.attributes = v.into_iter().collect();
+            self
+        }
+
+        pub fn attribute(mut self, kv: KeyValue) -> Self {
+            self.0.attributes.push(kv);
             self
         }
 

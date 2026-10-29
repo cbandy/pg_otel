@@ -163,4 +163,71 @@ mod tests {
             ]
         )
     }
+
+    #[pgrx::pg_test]
+    fn multiple_errors_in_aborted_transaction() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        harness.enable_tracing()?;
+        harness.client.batch_execute("BEGIN")?;
+        // This fails the transaction
+        verify_that!(
+            harness.client.batch_execute("SELECT 1/0"),
+            err(predicate(|e: &postgres::Error| {
+                e.code() == Some(&postgres::error::SqlState::DIVISION_BY_ZERO)
+            }))
+        )?;
+        // This is rejected
+        verify_that!(
+            harness.client.batch_execute("SELECT 1"),
+            err(predicate(|e: &postgres::Error| {
+                e.code() == Some(&postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION)
+            }))
+        )?;
+        harness.client.batch_execute("ROLLBACK")?;
+
+        let all_spans = harness.collect_transaction_spans(time::Duration::from_secs(2));
+
+        let xact_span = all_spans.last().or_fail()?;
+        verify_that!(
+            all_spans,
+            elements_are![
+                // Failing statement has a span
+                matches_pattern!(Span {
+                    name: eq("SELECT"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: some(eq(&SpanStatus::error(""))),
+                    trace_id: eq(&xact_span.trace_id),
+                    parent_span_id: eq(&xact_span.span_id),
+                    attributes: contains(eq(&KeyValue::new_string(
+                        "db.response.status_code",
+                        "22012",
+                    ))),
+                    ..
+                }),
+                matches_pattern!(Span {
+                    name: eq("ROLLBACK"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&xact_span.trace_id),
+                    parent_span_id: eq(&xact_span.span_id),
+                    ..
+                }),
+                // Failing statement determines the transaction state
+                matches_pattern!(Span {
+                    name: eq("TRANSACTION"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: some(eq(&SpanStatus::error(""))),
+                    trace_id: not(is_empty()),
+                    parent_span_id: is_empty(),
+                    attributes: container_eq([
+                        KeyValue::new_string("db.operation.name", "TRANSACTION"),
+                        KeyValue::new_string("db.system.name", "postgresql"),
+                        KeyValue::new_string("db.response.status_code", "22012"),
+                    ]),
+                    ..
+                }),
+            ]
+        )
+    }
 }

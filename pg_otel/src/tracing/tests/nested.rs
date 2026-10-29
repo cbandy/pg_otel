@@ -309,4 +309,237 @@ mod tests {
 
         Ok(())
     }
+
+    #[pgrx::pg_test]
+    fn nested_parallel_query_child_spans() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        harness.client.batch_execute(cfg_select! {
+            any(feature = "pg15") => {
+                "SET force_parallel_mode = regress; SET max_parallel_workers_per_gather = 1"
+            }
+            _ => {
+                "SET debug_parallel_query = regress; SET max_parallel_workers_per_gather = 1"
+            }
+        })?;
+
+        harness.client.batch_execute(
+            "CREATE TABLE t_par_nested AS SELECT generate_series(1, 1000) AS id;
+            CREATE OR REPLACE PROCEDURE proc_parallel() LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM count(*) FROM t_par_nested;
+            END;
+            $$;",
+        )?;
+
+        harness.enable_tracing()?;
+
+        // Case 1: With nested statement budget enabled (CALL -> nested SELECT -> parallel worker SELECT)
+        harness.client.batch_execute(
+            "SET LOCAL otel.trace_nested_statements = 10;
+            CALL proc_parallel() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */;",
+        )?;
+
+        let all_spans = harness.collect_spans_count(3, time::Duration::from_secs(2));
+        verify_that!(all_spans, len(eq(3)))?;
+
+        let call_span = all_spans.iter().find(|s| s.name == "CALL").or_fail()?;
+        let nested_select_span = all_spans
+            .iter()
+            .find(|s| s.name == "SELECT" && s.parent_span_id == call_span.span_id)
+            .or_fail()?;
+
+        verify_that!(
+            all_spans,
+            unordered_elements_are![
+                matches_pattern!(Span {
+                    name: eq("CALL"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x11u8; 16]),
+                    parent_span_id: eq(&vec![0x22u8; 8]),
+                    trace_state: eq("rojo=1"),
+                    ..
+                }),
+                matches_pattern!(Span {
+                    name: eq("SELECT"),
+                    kind: eq(&(SpanKind::Internal as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x11u8; 16]),
+                    span_id: eq(&nested_select_span.span_id),
+                    parent_span_id: eq(&call_span.span_id),
+                    trace_state: eq("rojo=1"),
+                    ..
+                }),
+                matches_pattern!(Span {
+                    name: eq("SELECT"),
+                    kind: eq(&(SpanKind::Internal as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x11u8; 16]),
+                    span_id: not(eq(&nested_select_span.span_id)),
+                    parent_span_id: eq(&nested_select_span.span_id),
+                    trace_state: eq("rojo=1"),
+                    ..
+                }),
+            ]
+        )?;
+
+        // Case 2: With nested statement budget = 0 (CALL -> parallel worker SELECT)
+        harness.client.batch_execute(
+            "CALL proc_parallel() /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */;",
+        )?;
+
+        let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
+        verify_that!(all_spans, len(eq(2)))?;
+
+        let call_span = all_spans.iter().find(|s| s.name == "CALL").or_fail()?;
+
+        verify_that!(
+            all_spans,
+            unordered_elements_are![
+                matches_pattern!(Span {
+                    name: eq("CALL"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x33u8; 16]),
+                    parent_span_id: eq(&vec![0x44u8; 8]),
+                    trace_state: eq("congo=2"),
+                    ..
+                }),
+                matches_pattern!(Span {
+                    name: eq("SELECT"),
+                    kind: eq(&(SpanKind::Internal as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x33u8; 16]),
+                    span_id: not(eq(&call_span.span_id)),
+                    parent_span_id: eq(&call_span.span_id),
+                    trace_state: eq("congo=2"),
+                    ..
+                }),
+            ]
+        )?;
+
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn nested_context_is_immutable() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        harness.client.batch_execute(
+            "CREATE OR REPLACE PROCEDURE proc_set_traceparent() LANGUAGE plpgsql AS $$
+            BEGIN
+                SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01';
+            END;
+            $$;
+            CREATE OR REPLACE PROCEDURE proc_set_tracestate() LANGUAGE plpgsql AS $$
+            BEGIN
+                SET otel.tracestate = 'congo=2';
+            END;
+            $$;
+            CREATE OR REPLACE PROCEDURE proc_comment_override() LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM 1 /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */;
+            END;
+            $$;",
+        )?;
+
+        harness.enable_tracing()?;
+
+        // Persisting otel.traceparent or otel.tracestate via ALTER PROCEDURE must error
+        for alter_sql in [
+            "ALTER PROCEDURE proc_comment_override() SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
+            "ALTER PROCEDURE proc_comment_override() SET otel.tracestate = 'congo=2'",
+        ] {
+            verify_that!(harness.client.batch_execute(alter_sql), err(anything()))?;
+            let spans = harness.collect_spans_count(1, time::Duration::from_secs(1));
+            verify_that!(
+                spans,
+                elements_are![matches_pattern!(Span {
+                    name: eq("ALTER"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: some(eq(&SpanStatus::error(""))),
+                    attributes: contains(eq(&KeyValue::new_string(
+                        "db.response.status_code",
+                        "22023"
+                    ))),
+                    ..
+                })]
+            )?;
+        }
+
+        // Mutating otel.traceparent or otel.tracestate inside a procedure must error
+        // without leaking context to subsequent top-level queries
+        for call_sql in [
+            "CALL proc_set_traceparent() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
+            "CALL proc_set_tracestate() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
+        ] {
+            verify_that!(harness.client.batch_execute(call_sql), err(anything()))?;
+            harness.client.batch_execute("SELECT 1")?;
+
+            let spans = harness.collect_spans_count(2, time::Duration::from_secs(1));
+            verify_that!(
+                spans,
+                elements_are![
+                    matches_pattern!(Span {
+                        name: eq("CALL"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: some(eq(&SpanStatus::error(""))),
+                        trace_id: eq(&vec![0x11u8; 16]),
+                        parent_span_id: eq(&vec![0x22u8; 8]),
+                        trace_state: eq("rojo=1"),
+                        attributes: contains(eq(&KeyValue::new_string(
+                            "db.response.status_code",
+                            "22023"
+                        ))),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("SELECT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: not(eq(&vec![0x33u8; 16])),
+                        parent_span_id: is_empty(),
+                        trace_state: eq(""),
+                        ..
+                    }),
+                ]
+            )?;
+        }
+
+        // SQLCommenter headers on nested statements are ignored and keep the caller's context
+        harness.client.batch_execute(
+            "SET LOCAL otel.trace_nested_statements = 10;
+            CALL proc_comment_override() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */;",
+        )?;
+
+        let spans = harness.collect_spans_count(2, time::Duration::from_secs(1));
+        let call_span = spans.iter().find(|s| s.name == "CALL").or_fail()?;
+        verify_that!(
+            spans,
+            unordered_elements_are![
+                matches_pattern!(Span {
+                    name: eq("CALL"),
+                    kind: eq(&(SpanKind::Server as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x11u8; 16]),
+                    parent_span_id: eq(&vec![0x22u8; 8]),
+                    trace_state: eq("rojo=1"),
+                    ..
+                }),
+                matches_pattern!(Span {
+                    name: eq("SELECT"),
+                    kind: eq(&(SpanKind::Internal as i32)),
+                    status: is_empty(),
+                    trace_id: eq(&vec![0x11u8; 16]),
+                    parent_span_id: eq(&call_span.span_id),
+                    trace_state: eq("rojo=1"),
+                    links: is_empty(),
+                    ..
+                }),
+            ]
+        )?;
+
+        Ok(())
+    }
 }

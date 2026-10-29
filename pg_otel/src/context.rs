@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
+use core::cell::Cell;
 use pgrx::{pg_sys, void_mut_ptr};
-use std::cell::Cell;
+use std::rc::Rc;
 
 thread_local! {
     static PRNG: Cell<PseudoRandom> = Cell::default();
 }
 
-/// Random number generator that uses Postgres [`pg_sys::pg_prng_seed`].
+/// Random number generator that uses Postgres [`pg_sys::pg_prng_uint64`].
 #[derive(Clone, Copy, Default)]
 struct PseudoRandom {
     state: pg_sys::pg_prng_state,
@@ -50,7 +51,7 @@ pub struct SpanId(u64);
 
 impl SpanId {
     // Generate a new (uniformly pseudorandom) span identifier.
-    pub fn new() -> Self {
+    pub fn random() -> Self {
         PRNG.with(|cell| {
             let mut prng = cell.get();
 
@@ -100,7 +101,7 @@ pub struct TraceId(u128);
 
 impl TraceId {
     // Generate a new (uniformly pseudorandom) trace identifier.
-    pub fn new() -> Self {
+    pub fn random() -> Self {
         PRNG.with(|cell| {
             let mut prng = cell.get();
 
@@ -178,6 +179,7 @@ impl core::ops::BitOr for TraceFlags {
 }
 
 impl core::convert::From<TraceFlags> for u32 {
+    #[inline]
     fn from(f: TraceFlags) -> Self {
         f.0 as u32
     }
@@ -197,25 +199,28 @@ impl core::fmt::Debug for TraceFlags {
 
 pub type Str<'a> = std::borrow::Cow<'a, str>;
 
+/// W3C Trace Context headers extracted from a statement or session.
 #[derive(Debug, PartialEq)]
-pub struct Headers<'a>(pub Str<'a>, pub Option<Str<'a>>);
+pub struct Headers<'a> {
+    /// Required [W3C `traceparent` header](https://www.w3.org/TR/trace-context#traceparent-header)
+    pub traceparent: Str<'a>,
+    /// Optional [W3C `tracestate` header](https://www.w3.org/TR/trace-context#tracestate-header)
+    pub tracestate: Option<Str<'a>>,
+}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Context identifying a span within an OpenTelemetry trace.
+///
+/// # Performance
+/// Cloning a `SpanContext` is $O(1)$ with zero allocations.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanContext {
     pub span_id: SpanId,
     pub trace_id: TraceId,
     pub trace_flags: TraceFlags,
+    pub trace_state: Rc<str>,
 }
 
 impl SpanContext {
-    pub fn new(trace_id: TraceId, span_id: SpanId, trace_flags: TraceFlags) -> Self {
-        Self {
-            trace_id,
-            span_id,
-            trace_flags,
-        }
-    }
-
     // Representation defined by W3C Trace Context, Traceparent § 3.2
     pub fn w3c_traceparent(&self) -> String {
         format!(
@@ -225,12 +230,20 @@ impl SpanContext {
     }
 }
 
+/// Parses a [`SpanContext`] from W3C [`Headers`].
+///
+/// # W3C Trace Context Specification
+///
+/// Implements parsing of the `traceparent` and `tracestate` headers according to [W3C Trace Context](https://www.w3.org/TR/trace-context):
+///
+/// - **`traceparent` format**: Expects version `00` followed by 32-hex of `trace-id`, 16-hex of `parent-id`, and 2-hex of `trace-flags` separated by hyphens.
+/// - **`tracestate` dependency**: If `traceparent` fails to parse, this method returns `Err(())`; W3C Trace Context § 3.3
 impl<'a> core::convert::TryFrom<Headers<'a>> for SpanContext {
     type Error = ();
 
     fn try_from(value: Headers<'a>) -> Result<Self, Self::Error> {
-        let Headers(traceparent, _) = value;
-        let (version, rest) = traceparent.split_once('-').ok_or(())?;
+        let (version, rest) = value.traceparent.split_once('-').ok_or(())?;
+
         match version {
             "00" => {
                 let (trace, rest) = rest.split_once('-').ok_or(())?;
@@ -240,6 +253,11 @@ impl<'a> core::convert::TryFrom<Headers<'a>> for SpanContext {
                     span_id: SpanId::from_hex(span)?,
                     trace_id: TraceId::from_hex(trace)?,
                     trace_flags: TraceFlags::from_hex(flags)?,
+                    trace_state: value
+                        .tracestate
+                        .as_deref()
+                        .map(Rc::from)
+                        .unwrap_or_default(),
                 })
             }
             _ => Err(()),
@@ -249,24 +267,33 @@ impl<'a> core::convert::TryFrom<Headers<'a>> for SpanContext {
 
 impl<'a> Headers<'a> {
     pub fn new(traceparent: &'a str, tracestate: Option<&'a str>) -> Self {
-        Headers(Str::Borrowed(traceparent), tracestate.map(Str::Borrowed))
+        Headers {
+            traceparent: Str::Borrowed(traceparent),
+            tracestate: tracestate.map(Str::Borrowed),
+        }
     }
 
     /// Extracts W3C `traceparent` and `tracestate` headers from comma-separated key-value pairs
     /// emitted by [SQLCommenter](https://google.github.io/sqlcommenter).
+    ///
+    /// Per [W3C Trace Context](https://www.w3.org/TR/trace-context), `traceparent` is required;
+    /// if it is missing, any accompanying `tracestate` is ignored and this returns `None`.
     fn from_comment(comment: &'a str) -> Option<Headers<'a>> {
         let mut traceparent = None;
         let mut tracestate = None;
 
         for (k, v) in CommenterIterator::new(comment) {
-            if k == "tracestate" {
-                tracestate = Some(v);
-            } else if k == "traceparent" {
+            if k == "traceparent" {
                 traceparent = Some(v);
+            } else if k == "tracestate" {
+                tracestate = Some(v);
             }
         }
 
-        Some(Headers(traceparent?, tracestate))
+        Some(Headers {
+            traceparent: traceparent?,
+            tracestate,
+        })
     }
 
     /// Finds W3C `traceparent` and `tracestate` headers inside a leading or trailing SQL comment.
@@ -345,7 +372,7 @@ impl<'a> Headers<'a> {
     }
 }
 
-/// A zero-copy iterator over comma-separated key-value pairs in an [SQLCommenter](https://google.github.io/sqlcommenter/spec) comment body.
+/// An iterator over comma-separated key-value pairs in an [SQLCommenter](https://google.github.io/sqlcommenter/spec) comment body.
 ///
 /// - Key-value pairs are separated by commas `,`.
 /// - Keys and values are separated by `=`.
@@ -358,6 +385,9 @@ impl<'a> Headers<'a> {
 /// Yields:
 /// - `("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")`
 /// - `("tracestate", "congo=t61rcWkgMzE")`
+///
+/// # Performance
+/// This avoids copying unencoded pairs and allocates only when unescaping or percent-decoding.
 struct CommenterIterator<'a>(&'a str);
 
 impl<'a> CommenterIterator<'a> {
@@ -527,7 +557,9 @@ fn rfind_quote(s: &str, quote: char) -> Option<usize> {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use super::{CommenterIterator, Headers, SpanContext, SpanId, Str, TraceFlags, TraceId};
+    #[cfg(test)]
+    use super::{CommenterIterator, Headers, SpanContext, Str, TraceFlags};
+    use super::{SpanId, TraceId};
     use googletest::prelude::*;
 
     #[test]
@@ -841,8 +873,8 @@ mod tests {
         for case in cases {
             let headers = Headers::from_statement(case.sql, case.begin, case.length);
             let headers = headers.as_ref();
-            let actual_tp = headers.map(|h| h.0.as_ref());
-            let actual_ts = headers.and_then(|h| h.1.as_ref().map(|s| s.as_ref()));
+            let actual_tp = headers.map(|h| h.traceparent.as_ref());
+            let actual_ts = headers.and_then(|h| h.tracestate.as_deref());
 
             scoped_trace!("{}", case.name);
             assert_that!((actual_tp, actual_ts), eq(case.expected),);
@@ -893,10 +925,11 @@ mod tests {
             scoped_trace!("{}", case.name);
             assert_that!(
                 SpanContext::try_from(headers),
-                ok(eq(SpanContext {
+                ok(eq(&SpanContext {
                     span_id: case.expected_span,
                     trace_id: case.expected_trace,
                     trace_flags: case.expected_flags,
+                    trace_state: case.tracestate.map(std::rc::Rc::from).unwrap_or_default(),
                 })),
             );
         }
@@ -941,6 +974,7 @@ mod tests {
             trace_id,
             span_id,
             trace_flags: TraceFlags::W3C_SAMPLED,
+            trace_state: std::rc::Rc::default(),
         };
         assert_that!(
             sampled.w3c_traceparent(),
@@ -948,13 +982,14 @@ mod tests {
         );
         assert_that!(
             SpanContext::try_from(Headers::new(&sampled.w3c_traceparent(), None)),
-            ok(eq(sampled))
+            ok(eq(&sampled))
         );
 
         let unsampled = SpanContext {
             trace_id,
             span_id,
             trace_flags: TraceFlags::default(),
+            trace_state: std::rc::Rc::default(),
         };
         assert_that!(
             unsampled.w3c_traceparent(),
@@ -962,17 +997,17 @@ mod tests {
         );
         assert_that!(
             SpanContext::try_from(Headers::new(&unsampled.w3c_traceparent(), None)),
-            ok(eq(unsampled))
+            ok(eq(&unsampled))
         );
     }
 
     #[pgrx::pg_test]
-    fn test_span_id_new() {
-        let span1 = SpanId::new();
+    fn test_span_id_construction() {
+        let span1 = SpanId::random();
         assert_that!(span1, eq(span1));
         assert!(span1.is_valid());
 
-        let span2 = SpanId::new();
+        let span2 = SpanId::random();
         assert_that!(span2, eq(span2));
         assert!(span2.is_valid());
 
@@ -996,12 +1031,12 @@ mod tests {
     }
 
     #[pgrx::pg_test]
-    fn test_trace_id_new() {
-        let trace1 = TraceId::new();
+    fn test_trace_id_construction() {
+        let trace1 = TraceId::random();
         assert_that!(trace1, eq(trace1));
         assert!(trace1.is_valid());
 
-        let trace2 = TraceId::new();
+        let trace2 = TraceId::random();
         assert_that!(trace2, eq(trace2));
         assert!(trace2.is_valid());
 

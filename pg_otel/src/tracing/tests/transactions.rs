@@ -122,13 +122,13 @@ mod tests {
         for sqls in [
             // Three Query ('Q') messages
             &[
-                "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */",
+                "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
                 "SELECT 1",
                 "COMMIT",
             ][..],
             // One Query ('Q') message with three statements
             &[
-                "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */; SELECT 1; COMMIT",
+                "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */; SELECT 1; COMMIT",
             ][..],
         ] {
             scoped_trace!("{sqls:?}");
@@ -150,6 +150,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&vec![0x11; 16]),
                         parent_span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
                         ..
                     }),
                     matches_pattern!(Span {
@@ -158,6 +159,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&vec![0x11; 16]),
                         parent_span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
                         ..
                     }),
                     matches_pattern!(Span {
@@ -166,6 +168,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&vec![0x11; 16]),
                         parent_span_id: eq(&vec![0x22; 8]),
+                        trace_state: eq("rojo=1"),
                         ..
                     }),
                 ]
@@ -228,10 +231,10 @@ mod tests {
         let mut harness = TracingHarness::new()?;
         harness.enable_tracing()?;
         harness.client.batch_execute(
-            "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */",
+            "BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
         )?;
         harness.client.batch_execute(
-            "SELECT 1 /* traceparent='00-33333333333333333333333333333333-4444444444444444-01' */",
+            "SELECT 1 /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */",
         )?;
         harness.client.batch_execute("SELECT 2")?;
         harness.client.batch_execute("COMMIT")?;
@@ -248,9 +251,11 @@ mod tests {
                     status: is_empty(),
                     trace_id: eq(&vec![0x33; 16]),
                     parent_span_id: eq(&vec![0x44; 8]),
+                    trace_state: eq("congo=2"),
                     links: elements_are![matches_pattern!(Link {
                         trace_id: eq(&xact_span.trace_id),
                         span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
                         ..
                     })],
                     ..
@@ -261,6 +266,7 @@ mod tests {
                     status: is_empty(),
                     trace_id: eq(&xact_span.trace_id),
                     parent_span_id: eq(&xact_span.span_id),
+                    trace_state: eq("rojo=1"),
                     ..
                 }),
                 matches_pattern!(Span {
@@ -269,6 +275,7 @@ mod tests {
                     status: is_empty(),
                     trace_id: eq(&xact_span.trace_id),
                     parent_span_id: eq(&xact_span.span_id),
+                    trace_state: eq("rojo=1"),
                     ..
                 }),
                 matches_pattern!(Span {
@@ -277,6 +284,7 @@ mod tests {
                     status: is_empty(),
                     trace_id: eq(&vec![0x11; 16]),
                     parent_span_id: eq(&vec![0x22; 8]),
+                    trace_state: eq("rojo=1"),
                     ..
                 }),
             ]
@@ -291,13 +299,28 @@ mod tests {
             // A connection pooler might use GUC *before* the transaction
             &[
                 "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET otel.tracestate = 'rojo=1'",
                 "BEGIN",
                 "SELECT 1",
                 "COMMIT",
                 "SELECT 2",
             ][..],
             &[
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SET otel.tracestate = 'rojo=1'",
+                "BEGIN; SELECT 1; COMMIT",
+                "SELECT 2",
+            ][..],
+            // Reversed SET order before transaction
+            &[
+                "SET otel.tracestate = 'rojo=1'",
                 "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "BEGIN",
+                "SELECT 1",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "SET otel.tracestate = 'rojo=1'; SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "BEGIN; SELECT 1; COMMIT",
                 "SELECT 2",
             ][..],
@@ -305,12 +328,26 @@ mod tests {
             &[
                 "BEGIN",
                 "SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET LOCAL otel.tracestate = 'rojo=1'",
                 "SELECT 1",
                 "COMMIT",
                 "SELECT 2",
             ][..],
             &[
-                "BEGIN; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; COMMIT",
+                "BEGIN; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SET LOCAL otel.tracestate = 'rojo=1'; SELECT 1; COMMIT",
+                "SELECT 2",
+            ][..],
+            // Reversed SET LOCAL order
+            &[
+                "BEGIN",
+                "SET LOCAL otel.tracestate = 'rojo=1'",
+                "SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SELECT 1",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "BEGIN; SET LOCAL otel.tracestate = 'rojo=1'; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; COMMIT",
                 "SELECT 2",
             ][..],
         ] {
@@ -337,6 +374,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&xact_span.trace_id),
                         parent_span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
                         attributes: contains(eq(&KeyValue::new_string(
                             "db.operation.name",
                             "SELECT"
@@ -349,6 +387,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&xact_span.trace_id),
                         parent_span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
                         attributes: contains(eq(&KeyValue::new_string(
                             "db.operation.name",
                             "COMMIT"
@@ -361,6 +400,7 @@ mod tests {
                         status: is_empty(),
                         trace_id: eq(&vec![0x11u8; 16]),
                         parent_span_id: eq(&vec![0x22u8; 8]),
+                        trace_state: eq("rojo=1"),
                         attributes: contains(eq(&KeyValue::new_string(
                             "db.operation.name",
                             "TRANSACTION"
@@ -373,6 +413,124 @@ mod tests {
                         status: is_empty(),
                         trace_id: not(eq(&xact_span.trace_id)),
                         parent_span_id: is_empty(),
+                        trace_state: eq(""),
+                        attributes: contains(eq(&KeyValue::new_string(
+                            "db.operation.name",
+                            "SELECT"
+                        ))),
+                        ..
+                    }),
+                ]
+            )?;
+        }
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn transaction_with_context_no_queries() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        for sqls in [
+            // A connection pooler might use GUC *before* the transaction
+            &[
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET otel.tracestate = 'rojo=1'",
+                "BEGIN",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SET otel.tracestate = 'rojo=1'",
+                "BEGIN; COMMIT",
+                "SELECT 2",
+            ][..],
+            // Reversed SET order before transaction
+            &[
+                "SET otel.tracestate = 'rojo=1'",
+                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "BEGIN",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "SET otel.tracestate = 'rojo=1'; SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "BEGIN; COMMIT",
+                "SELECT 2",
+            ][..],
+            // A client that allows properties on a transaction might use GUC *in* the transaction
+            &[
+                "BEGIN",
+                "SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "SET LOCAL otel.tracestate = 'rojo=1'",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "BEGIN; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SET LOCAL otel.tracestate = 'rojo=1'; COMMIT",
+                "SELECT 2",
+            ][..],
+            // Reversed SET LOCAL order
+            &[
+                "BEGIN",
+                "SET LOCAL otel.tracestate = 'rojo=1'",
+                "SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
+                "COMMIT",
+                "SELECT 2",
+            ][..],
+            &[
+                "BEGIN; SET LOCAL otel.tracestate = 'rojo=1'; SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; COMMIT",
+                "SELECT 2",
+            ][..],
+        ] {
+            scoped_trace!("{sqls:?}");
+
+            harness.enable_tracing()?;
+            for sql in sqls {
+                harness.client.batch_execute(sql)?;
+            }
+
+            let all_spans = harness.collect_spans_count(3, time::Duration::from_secs(2));
+            let xact_span = all_spans
+                .iter()
+                .find(|s| s.name == "TRANSACTION")
+                .or_fail()?;
+
+            verify_that!(
+                all_spans,
+                elements_are![
+                    matches_pattern!(Span {
+                        name: eq("COMMIT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        trace_state: eq("rojo=1"),
+                        attributes: contains(eq(&KeyValue::new_string(
+                            "db.operation.name",
+                            "COMMIT"
+                        ))),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("TRANSACTION"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&vec![0x11u8; 16]),
+                        parent_span_id: eq(&vec![0x22u8; 8]),
+                        trace_state: eq("rojo=1"),
+                        attributes: contains(eq(&KeyValue::new_string(
+                            "db.operation.name",
+                            "TRANSACTION"
+                        ))),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("SELECT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: not(eq(&xact_span.trace_id)),
+                        parent_span_id: is_empty(),
+                        trace_state: eq(""),
                         attributes: contains(eq(&KeyValue::new_string(
                             "db.operation.name",
                             "SELECT"
@@ -638,6 +796,114 @@ mod tests {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn commit_and_rollback_can_have_their_own_context() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        for (cmd, sqls) in [
+            (
+                "COMMIT",
+                &[
+                    "BEGIN",
+                    "SELECT 1",
+                    "COMMIT /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */",
+                ][..],
+            ),
+            (
+                "COMMIT",
+                &[
+                    "BEGIN",
+                    "SELECT 1",
+                    "SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
+                    "SET otel.tracestate = 'congo=2'",
+                    "COMMIT",
+                ][..],
+            ),
+            (
+                "ROLLBACK",
+                &[
+                    "BEGIN",
+                    "SELECT 1",
+                    "ROLLBACK /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */",
+                ][..],
+            ),
+            (
+                "ROLLBACK",
+                &[
+                    "BEGIN",
+                    "SELECT 1",
+                    "SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
+                    "SET otel.tracestate = 'congo=2'",
+                    "ROLLBACK",
+                ][..],
+            ),
+        ] {
+            scoped_trace!("{sqls:?}");
+
+            harness.enable_tracing()?;
+            for sql in sqls {
+                harness.client.batch_execute(sql)?;
+            }
+
+            let all_spans = harness.collect_transaction_spans(time::Duration::from_secs(2));
+
+            let xact_span = all_spans.last().or_fail()?;
+            verify_that!(
+                all_spans,
+                elements_are![
+                    matches_pattern!(Span {
+                        name: eq("SELECT"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&xact_span.trace_id),
+                        parent_span_id: eq(&xact_span.span_id),
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq(cmd),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: eq(&vec![0x33; 16]),
+                        parent_span_id: eq(&vec![0x44; 8]),
+                        trace_state: eq("congo=2"),
+                        links: elements_are![matches_pattern!(Link {
+                            trace_id: eq(&xact_span.trace_id),
+                            span_id: eq(&xact_span.span_id),
+                            ..
+                        })],
+                        ..
+                    }),
+                    matches_pattern!(Span {
+                        name: eq("TRANSACTION"),
+                        kind: eq(&(SpanKind::Server as i32)),
+                        status: is_empty(),
+                        trace_id: not(eq(&vec![0x33; 16])),
+                        parent_span_id: is_empty(),
+                        ..
+                    }),
+                ]
+            )?;
+        }
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn tracestate_cleared_without_traceparent() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+        harness.enable_tracing()?;
+        harness
+            .client
+            .batch_execute("SET otel.tracestate = 'rojo=1'")?;
+        harness.client.batch_execute("SELECT 1")?;
+        harness.client.batch_execute("SELECT 2")?;
+
+        let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
+        verify_that!(all_spans, len(eq(2)))?;
+        verify_that!(all_spans[0].trace_state, eq(""))?;
+        verify_that!(all_spans[1].trace_state, eq(""))?;
         Ok(())
     }
 }

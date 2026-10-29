@@ -62,26 +62,42 @@ Chosen options: **Option A1 (4-Hook Minimal Foundation)** and **Option B2 (Dual-
 These do not behave entirely like regular parameters, so we must take care to make them intuitive. These will consistently follow a few principles:
 
 #### Single-Use
-Whenever `pg_otel` initializes a span, it **clears** `otel.traceparent` to ensure it is used exactly once.
-This prevents the `traceparent` context from "leaking" to a subsequent statement, transaction, or connection pool.
+Whenever `pg_otel` initializes a top-level statement or transaction span, it **clears** `otel.traceparent` and `otel.tracestate` to ensure they are used exactly once.
+This prevents context from "leaking" to a subsequent statement, transaction, or connection pool.
 
 #### Set Context (on or) Before
-A user may assign a `traceparent` context to a statement in 2 ways:
-* **SQLCommenter**: `SELECT … /* traceparent='00-1111…-2222…-01' */;` — this is how auto-instrumentation or an ORM might behave
-* **`SET` or `SET LOCAL` before**: `SET otel.traceparent = '00-1111…-2222…-01''; SELECT …` — this is how a connection pooler might behave
+A user may assign W3C `traceparent` and `tracestate` context to a top-level statement in 2 ways:
+- **SQLCommenter**: `SELECT … /* traceparent='00-1111…-2222…-01',tracestate='rojo=1' */;` — this is how auto-instrumentation or an ORM might behave
+- **`SET` or `SET LOCAL` before**: `SET otel.traceparent = '00-1111…-2222…-01'; SET otel.tracestate = 'rojo=1'; SELECT …` — this is how a connection pooler might behave
 
-Doing this sets the `trace_id` and `parent_id` of the statement's span and attaches a **Span Link** back to the original parent span, if any.
+Doing this sets the `trace_id`, `parent_id`, `flags`, and `trace_state` of the statement's span and attaches a **Span Link** back to the original parent span, if any.
 
 #### First Context Affects the Transaction
-The **first** `traceparent` context received for a transaction block sets the `TRANSACTION` span's identity. This first context can arrive in any of 3 ways:
-* **SQLCommenter on `BEGIN`**: `BEGIN /* traceparent='00-3333…-4444…-01' */;`
-* **`SET` before `BEGIN`**: `SET otel.traceparent = '00-3333…-4444…-01'; BEGIN`
-* **`SET LOCAL` after `BEGIN`**: `BEGIN; SET LOCAL otel.traceparent = '00-3333…-4444…-01';`
+The **first** context received for a transaction block sets the `TRANSACTION` span's identity and state. This first context can arrive in any of 3 ways:
+- **SQLCommenter on `BEGIN`**: `BEGIN /* traceparent='00-3333…-4444…-01',tracestate='rojo=1' */;`
+- **`SET` before `BEGIN`**: `SET otel.traceparent = '00-3333…-4444…-01'; SET otel.tracestate = 'rojo=1'; BEGIN`
+- **`SET LOCAL` after `BEGIN`**: `BEGIN; SET LOCAL otel.traceparent = '00-3333…-4444…-01'; SET LOCAL otel.tracestate = 'rojo=1';`
   — this looks like an exception to the prior principle, but it's the natural way to affect a transaction in SQL
+
+#### Immutable During Nested Execution (Caller Governance)
+Spans produced by triggers, procedures, and function calls cannot (directly) affect the current context.
+- Attempting to set `otel.traceparent` or `otel.tracestate` inside a routine body (including `ALTER FUNCTION/PROCEDURE … SET`) is rejected with an `ERROR`.
+- Any SQLCommenter comments on nested statements are ignored.
+
+This ensures internal spans correctly inherit `trace_id`, `trace_flags`, and `trace_state` from their enclosing span, and prevents procedural code from leaking GUC state.
+This is stricter than described in [W3C Trace Context §3.4](https://www.w3.org/TR/trace-context#mutating-the-traceparent-field) and [§3.5](https://www.w3.org/TR/trace-context#mutating-the-tracestate-field).
+We can relax this later without breaking existing PL routines.
+
+#### Deferred: Outbound Context
+It might be possible to return the current context using GUC hooks for `SHOW` and `current_setting()`, but for now `otel.traceparent` and `otel.tracestate` are single-use *input* parameters that clear when consumed.
+- Returning a random span ID on every `SHOW` or `pg_settings` query might confuse existing tools that diff or examine GUCs.
+- The `current_setting()` function is subtly inconsistent in PL/pgSQL: simple variable assignments `v := current_setting()` bypass executor hooks whereas `SELECT current_setting()` executes via nested SPI.
+
+Exposing the current context so that outbound calls (FDWs, extensions) can propagate it is deferred for now.
 
 ### 4. Parallel Worker Propagation Architecture
 
-1. **GUC Setup**: When `qd.plannedstmt.parallelModeNeeded == true`, the leader backend sets `otel.traceparent = <statement_span_context>` in `ExecutorStart_hook`.
-2. **Automatic Inheritance**: PostgreSQL's native `SerializeGUCState()` / `RestoreGUCState()` carries `otel.traceparent` into spawned parallel worker processes.
-3. **Worker Execution**: Workers inspect `IsParallelWorker() == true` in `ExecutorStart_hook`, read `otel.traceparent` via `.take()`, emit worker child spans under the leader's trace, and clean up automatically upon completion.
+1. **GUC Setup**: Whenever `qd.plannedstmt.parallelModeNeeded == true`, the leader backend sets `otel.traceparent` and `otel.tracestate` in `ExecutorStart_hook`.
+2. **Automatic Inheritance**: PostgreSQL's native `SerializeGUCState()` / `RestoreGUCState()` carries these GUC into spawned parallel worker processes.
+3. **Worker Execution**: Workers inspect `IsParallelWorker() == true` in `ExecutorStart_hook`, read those GUC, and emit worker child spans under the leader's active span.
 

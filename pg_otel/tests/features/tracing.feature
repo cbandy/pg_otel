@@ -59,14 +59,15 @@ Feature: Tracing and Spans
     Context attached to one query appears on the produced span.
 
     Given I am authenticated
-    When I execute: SELECT 1 /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */
+    When I execute: SELECT 1 /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */
     Then I should see a span with:
-      | kind      | server           |
-      | status    | unset            |
-      | span_id   | *generated*      |
-      | trace_id  | 11111111111111111111111111111111 |
-      | parent_id | 2222222222222222 |
-      | db.operation.name | SELECT   |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
+      | trace_id          | 11111111111111111111111111111111 |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
 
   Scenario: Multiple Queries
     Two queries without parallelization should produce two spans.
@@ -119,22 +120,25 @@ Feature: Tracing and Spans
 
     Given I am authenticated
     When I execute: SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET otel.tracestate = 'rojo=1'
     When I execute: SELECT 1
     When I execute: SELECT 2
     Then I should see a span with:
-      | kind      | server           |
-      | status    | unset            |
-      | span_id   | *generated*      |
-      | trace_id  | 11111111111111111111111111111111 |
-      | parent_id | 2222222222222222 |
-      | db.operation.name | SELECT   |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
+      | trace_id          | 11111111111111111111111111111111 |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind      | server           |
-      | status    | unset            |
-      | span_id   | *generated*      |
-      | trace_id  | *generated*      |
-      | parent_id | *none*           |
-      | db.operation.name | SELECT   |
+      | kind              | server      |
+      | status            | unset       |
+      | span_id           | *generated* |
+      | trace_id          | *generated* |
+      | parent_id         | *none*      |
+      | trace_state       | *none*      |
+      | db.operation.name | SELECT      |
 
   Scenario: Single Query in Transaction
     An explicit transaction statement produces a transaction span with child query and commit spans.
@@ -206,30 +210,33 @@ Feature: Tracing and Spans
     Context attached to an explicit transaction appears on the transaction span.
 
     Given I am authenticated
-    When I execute: BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */
+    When I execute: BEGIN /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */
     When I execute: SELECT 1
     When I execute: COMMIT
     Then I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | 2222222222222222 |
-      | db.operation.name | TRANSACTION      |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | TRANSACTION                      |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | SELECT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | COMMIT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | COMMIT                           |
 
   Scenario: Single Query with Context in Transaction
     Without SET or SET LOCAL, the transaction has its own trace.
@@ -268,40 +275,45 @@ Feature: Tracing and Spans
     The Trace of its former/otherwise parent is associated as a Link.
 
     Given I am authenticated
-    When I execute: BEGIN    /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */
-    When I execute: SELECT 1 /* traceparent='00-33333333333333333333333333333333-4444444444444444-01' */
+    When I execute: BEGIN    /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */
+    When I execute: SELECT 1 /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */
     When I execute: SELECT 2
     When I execute: COMMIT
     Then I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | 2222222222222222 |
-      | db.operation.name | TRANSACTION      |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | TRANSACTION                      |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 33333333333333333333333333333333 |
-      | parent_id         | 4444444444444444 |
-      | link_span_id      | *transaction*    |
+      | parent_id         | 4444444444444444                 |
+      | trace_state       | congo=2                          |
+      | link_span_id      | *transaction*                    |
       | link_trace_id     | 11111111111111111111111111111111 |
-      | db.operation.name | SELECT           |
+      | link_trace_state  | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | SELECT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | COMMIT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | COMMIT                           |
 
   Scenario: Query Error in Transaction
     An aborted transaction should have an error status on its span.
@@ -375,38 +387,43 @@ Feature: Tracing and Spans
 
     Given I am authenticated
     When I execute: SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET otel.tracestate = 'rojo=1'
     When I execute: BEGIN
     When I execute: SELECT 1
     When I execute: COMMIT
     When I execute: SELECT 2
     Then I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | 2222222222222222 |
-      | db.operation.name | TRANSACTION      |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | TRANSACTION                      |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | SELECT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | COMMIT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | COMMIT                           |
     And I should see a span with:
-      | kind      | server         |
-      | status    | unset          |
-      | span_id   | *generated*    |
-      | trace_id  | *generated*    |
-      | parent_id | *none*         |
-      | db.operation.name | SELECT |
+      | kind              | server      |
+      | status            | unset       |
+      | span_id           | *generated* |
+      | trace_id          | *generated* |
+      | parent_id         | *none*      |
+      | trace_state       | *none*      |
+      | db.operation.name | SELECT      |
 
   Scenario: Transaction with SET LOCAL Context
     Context can be applied to a transaction when its first statement is a SET LOCAL.
@@ -414,37 +431,42 @@ Feature: Tracing and Spans
     Given I am authenticated
     When I execute: BEGIN
     When I execute: SET LOCAL otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'
+    When I execute: SET LOCAL otel.tracestate = 'rojo=1'
     When I execute: SELECT 1
     When I execute: COMMIT
     When I execute: SELECT 2
     Then I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | 2222222222222222 |
-      | db.operation.name | TRANSACTION      |
+      | parent_id         | 2222222222222222                 |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | TRANSACTION                      |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | SELECT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | SELECT                           |
     And I should see a span with:
-      | kind              | server           |
-      | status            | unset            |
-      | span_id           | *generated*      |
+      | kind              | server                           |
+      | status            | unset                            |
+      | span_id           | *generated*                      |
       | trace_id          | 11111111111111111111111111111111 |
-      | parent_id         | *transaction*    |
-      | db.operation.name | COMMIT           |
+      | parent_id         | *transaction*                    |
+      | trace_state       | rojo=1                           |
+      | db.operation.name | COMMIT                           |
     And I should see a span with:
-      | kind      | server         |
-      | status    | unset          |
-      | span_id   | *generated*    |
-      | trace_id  | *generated*    |
-      | parent_id | *none*         |
-      | db.operation.name | SELECT |
+      | kind              | server      |
+      | status            | unset       |
+      | span_id           | *generated* |
+      | trace_id          | *generated* |
+      | parent_id         | *none*      |
+      | trace_state       | *none*      |
+      | db.operation.name | SELECT      |
 
   Scenario: Parent Override in Transaction with SET LOCAL Context
     Context cannot be applied to a transaction twice.
