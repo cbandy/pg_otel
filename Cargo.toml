@@ -7,6 +7,7 @@ members = ["pg_otel", "sequencing"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.96"
 
 [workspace.dependencies]
 atoi = "3.1"
