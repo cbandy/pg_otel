@@ -28,7 +28,12 @@ mod tests {
         }
 
         // Every PG calls ExplainOneQuery_hook here, but PG17 makes it much easier to implement.
-        if cfg!(any(feature = "pg17", feature = "pg18", feature = "pg19")) {
+        if !cfg!(any(
+            feature = "pg13",
+            feature = "pg14",
+            feature = "pg15",
+            feature = "pg16",
+        )) {
             expected.push(("ExplainOneQuery_hook", "start"));
         }
 
@@ -45,7 +50,12 @@ mod tests {
         ]);
 
         // Every PG has ExplainOneQuery_hook here, but PG17 makes it much easier to implement.
-        if cfg!(any(feature = "pg17", feature = "pg18", feature = "pg19")) {
+        if !cfg!(any(
+            feature = "pg13",
+            feature = "pg14",
+            feature = "pg15",
+            feature = "pg16",
+        )) {
             expected.push(("ExplainOneQuery_hook", "end"));
         }
 
@@ -80,7 +90,12 @@ mod tests {
         }
 
         // Every PG calls ExplainOneQuery_hook here, but PG17 makes it much easier to implement.
-        if cfg!(any(feature = "pg17", feature = "pg18", feature = "pg19")) {
+        if !cfg!(any(
+            feature = "pg13",
+            feature = "pg14",
+            feature = "pg15",
+            feature = "pg16",
+        )) {
             expected.push(("ExplainOneQuery_hook", "start"));
         }
 
@@ -100,7 +115,12 @@ mod tests {
         ]);
 
         // Every PG has ExplainOneQuery_hook here, but PG17 makes it much easier to implement.
-        if cfg!(any(feature = "pg17", feature = "pg18", feature = "pg19")) {
+        if !cfg!(any(
+            feature = "pg13",
+            feature = "pg14",
+            feature = "pg15",
+            feature = "pg16",
+        )) {
             expected.push(("ExplainOneQuery_hook", "end"));
         }
 

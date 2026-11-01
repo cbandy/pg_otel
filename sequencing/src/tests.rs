@@ -8,6 +8,7 @@ mod dml;
 mod errors;
 mod explain;
 mod prepared;
+mod statement_offsets;
 mod transactions;
 mod triggers;
 mod utility;
@@ -40,6 +41,27 @@ fn read_trace(filename: &str) -> Vec<(&'static str, &'static str)> {
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+fn read_trace_lines(filename: &str) -> Vec<&'static str> {
+    let data = unsafe { ffi::CStr::from_ptr(pg_sys::DataDir) };
+    let filepath =
+        path::Path::new(&data.to_string_lossy().into_owned()).join(format!("{filename}.tsv"));
+
+    let Ok(content) = fs::read_to_string(filepath) else {
+        return vec![];
+    };
+    let content: &'static str = Box::leak(content.into_boxed_str());
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let _pid = parts.next()?;
+            let _seq = parts.next()?;
+            parts.next()
         })
         .collect()
 }

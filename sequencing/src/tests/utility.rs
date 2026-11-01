@@ -86,7 +86,13 @@ mod tests {
         ];
 
         // PG18+ parses the view definition subquery inside ProcessUtility_hook
-        if cfg!(any(feature = "pg18", feature = "pg19")) {
+        if !cfg!(any(
+            feature = "pg13",
+            feature = "pg14",
+            feature = "pg15",
+            feature = "pg16",
+            feature = "pg17",
+        )) {
             // SELECT
             expected.push(("post_parse_analyze_hook", "start"));
             expected.push(("post_parse_analyze_hook", "end"));

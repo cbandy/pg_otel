@@ -3,6 +3,8 @@
 //! This shared library extension uses numerous Postgres hooks to document when they are called and
 //! in what situations.
 
+#![allow(clippy::missing_safety_doc)]
+
 use pgrx::pg_sys;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,10 +63,11 @@ pub extern "C-unwind" fn _PG_init() {
         #[pgrx::pg_guard]
         unsafe extern "C-unwind" fn emit_log_hook(edata: *mut pg_sys::ErrorData) {
             if let Some(err) = unsafe { edata.as_mut() } {
-                let message = (!err.message.is_null())
-                    .then(|| unsafe { ffi::CStr::from_ptr(err.message).to_string_lossy() })
-                    .unwrap_or_default();
-
+                let message = if !err.message.is_null() {
+                    unsafe { ffi::CStr::from_ptr(err.message).to_string_lossy() }
+                } else {
+                    Default::default()
+                };
                 log_event(
                     "emit_log_hook",
                     "entry",
@@ -126,7 +129,8 @@ pub extern "C-unwind" fn _PG_init() {
 
         #[pgrx::pg_guard]
         unsafe extern "C-unwind" fn executor_end_hook(query: *mut pg_sys::QueryDesc) {
-            log_event("ExecutorEnd_hook", "start", "");
+            let details = unsafe { query_desc_offsets(query) };
+            log_event("ExecutorEnd_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXECUTOR_END } {
                 unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(query)) };
             } else {
@@ -143,7 +147,8 @@ pub extern "C-unwind" fn _PG_init() {
 
         #[pgrx::pg_guard]
         unsafe extern "C-unwind" fn executor_finish_hook(query: *mut pg_sys::QueryDesc) {
-            log_event("ExecutorFinish_hook", "start", "");
+            let details = unsafe { query_desc_offsets(query) };
+            log_event("ExecutorFinish_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXECUTOR_FINISH } {
                 unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(query)) };
             } else {
@@ -167,7 +172,8 @@ pub extern "C-unwind" fn _PG_init() {
                     count: u64,
                     once: bool,
                 ) {
-                    log_event("ExecutorRun_hook", "start", "");
+                    let details = unsafe { query_desc_offsets(query) };
+                    log_event("ExecutorRun_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_EXECUTOR_RUN } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(query, dir, count, once)) };
                     } else {
@@ -183,7 +189,8 @@ pub extern "C-unwind" fn _PG_init() {
                     dir: pg_sys::ScanDirection::Type,
                     count: u64,
                 ) {
-                    log_event("ExecutorRun_hook", "start", "");
+                    let details = unsafe { query_desc_offsets(query) };
+                    log_event("ExecutorRun_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_EXECUTOR_RUN } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(query, dir, count)) };
                     } else {
@@ -205,7 +212,8 @@ pub extern "C-unwind" fn _PG_init() {
             query: *mut pg_sys::QueryDesc,
             eflags: i32,
         ) {
-            log_event("ExecutorStart_hook", "start", "");
+            let details = unsafe { query_desc_offsets(query) };
+            log_event("ExecutorStart_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXECUTOR_START } {
                 unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(query, eflags)) };
             } else {
@@ -232,7 +240,8 @@ pub extern "C-unwind" fn _PG_init() {
             pl: pg_sys::ParamListInfo,
             qe: *mut pg_sys::QueryEnvironment,
         ) {
-            log_event("ExplainOneQuery_hook", "start", "");
+            let details = unsafe { query_offsets(q, qs) };
+            log_event("ExplainOneQuery_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXPLAIN_ONE_QUERY } {
                 unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(q, co, ic, es, qs, pl, qe)) };
             } else {
@@ -262,7 +271,8 @@ pub extern "C-unwind" fn _PG_init() {
                     co: i32,
                     pl: pg_sys::ParamListInfo,
                 ) -> *mut pg_sys::PlannedStmt {
-                    log_event("planner_hook", "start", "");
+                    let details = unsafe { query_offsets(q, qs) };
+                    log_event("planner_hook", "start", &details);
                     let result = if let Some(next) = unsafe { HOOK_PLANNER } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(q, qs, co, pl)) }
                     } else {
@@ -281,7 +291,8 @@ pub extern "C-unwind" fn _PG_init() {
                     pl: pg_sys::ParamListInfo,
                     es: *mut pg_sys::ExplainState,
                 ) -> *mut pg_sys::PlannedStmt {
-                    log_event("planner_hook", "start", "");
+                    let details = unsafe { query_offsets(q, qs) };
+                    log_event("planner_hook", "start", &details);
                     let result = if let Some(next) = unsafe { HOOK_PLANNER } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(q, qs, co, pl, es)) }
                     } else {
@@ -306,7 +317,8 @@ pub extern "C-unwind" fn _PG_init() {
                     pstate: *mut pg_sys::ParseState,
                     query: *mut pg_sys::Query,
                 ) {
-                    log_event("post_parse_analyze_hook", "start", "");
+                    let details = unsafe { parse_state_query_offsets(pstate, query) };
+                    log_event("post_parse_analyze_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_POST_PARSE_ANALYZE } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(pstate, query)) };
                     }
@@ -320,7 +332,8 @@ pub extern "C-unwind" fn _PG_init() {
                     query: *mut pg_sys::Query,
                     jstate: *mut pg_sys::JumbleState,
                 ) {
-                    log_event("post_parse_analyze_hook", "start", "");
+                    let details = unsafe { parse_state_query_offsets(pstate, query) };
+                    log_event("post_parse_analyze_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_POST_PARSE_ANALYZE } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(pstate, query, jstate)) };
                     }
@@ -334,7 +347,8 @@ pub extern "C-unwind" fn _PG_init() {
                     query: *mut pg_sys::Query,
                     jstate: *const pg_sys::JumbleState,
                 ) {
-                    log_event("post_parse_analyze_hook", "start", "");
+                    let details = unsafe { parse_state_query_offsets(pstate, query) };
+                    log_event("post_parse_analyze_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_POST_PARSE_ANALYZE } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(pstate, query, jstate)) };
                     }
@@ -361,7 +375,8 @@ pub extern "C-unwind" fn _PG_init() {
                     dr: *mut pg_sys::DestReceiver,
                     qc: *mut pg_sys::QueryCompletion,
                 ) {
-                    log_event("ProcessUtility_hook", "start", "");
+                    let details = unsafe { planned_stmt_offsets(ps, qs) };
+                    log_event("ProcessUtility_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_PROCESS_UTILITY } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(ps, qs, puc, pl, qe, dr, qc)) };
                     } else {
@@ -371,6 +386,7 @@ pub extern "C-unwind" fn _PG_init() {
                 }
             }
             any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19") => {
+                #[allow(clippy::too_many_arguments)]
                 #[pgrx::pg_guard]
                 unsafe extern "C-unwind" fn process_utility_hook(
                     ps: *mut pg_sys::PlannedStmt,
@@ -382,7 +398,8 @@ pub extern "C-unwind" fn _PG_init() {
                     dr: *mut pg_sys::DestReceiver,
                     qc: *mut pg_sys::QueryCompletion,
                 ) {
-                    log_event("ProcessUtility_hook", "start", "");
+                    let details = unsafe { planned_stmt_offsets(ps, qs) };
+                    log_event("ProcessUtility_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_PROCESS_UTILITY } {
                         unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(ps, qs, ro, puc, pl, qe, dr, qc)) };
                     } else {
@@ -441,6 +458,61 @@ pub extern "C-unwind" fn _PG_init() {
             };
             log_event("xact_callback", name, "");
         }
+    }
+}
+
+unsafe fn query_desc_offsets(query: *mut pg_sys::QueryDesc) -> String {
+    let qd = unsafe { query.as_ref() };
+    format_offsets(
+        qd.and_then(|q| unsafe { q.plannedstmt.as_ref() })
+            .map(|p| (p.stmt_location, p.stmt_len)),
+        qd.and_then(|q| {
+            (!q.sourceText.is_null())
+                .then(|| unsafe { ffi::CStr::from_ptr(q.sourceText).to_str().ok() })
+        })
+        .flatten(),
+    )
+}
+
+unsafe fn planned_stmt_offsets(ps: *mut pg_sys::PlannedStmt, qs: *const ffi::c_char) -> String {
+    format_offsets(
+        unsafe { ps.as_ref() }.map(|p| (p.stmt_location, p.stmt_len)),
+        (!qs.is_null())
+            .then(|| unsafe { ffi::CStr::from_ptr(qs).to_str().ok() })
+            .flatten(),
+    )
+}
+
+unsafe fn query_offsets(q: *mut pg_sys::Query, qs: *const ffi::c_char) -> String {
+    format_offsets(
+        unsafe { q.as_ref() }.map(|query| (query.stmt_location, query.stmt_len)),
+        (!qs.is_null())
+            .then(|| unsafe { ffi::CStr::from_ptr(qs).to_str().ok() })
+            .flatten(),
+    )
+}
+
+unsafe fn parse_state_query_offsets(
+    pstate: *mut pg_sys::ParseState,
+    query: *mut pg_sys::Query,
+) -> String {
+    format_offsets(
+        unsafe { query.as_ref() }.map(|q| (q.stmt_location, q.stmt_len)),
+        unsafe { pstate.as_ref() }
+            .and_then(|p| {
+                (!p.p_sourcetext.is_null())
+                    .then(|| unsafe { ffi::CStr::from_ptr(p.p_sourcetext).to_str().ok() })
+            })
+            .flatten(),
+    )
+}
+
+fn format_offsets(loc_len: Option<(i32, i32)>, sql: Option<&str>) -> String {
+    match (loc_len, sql) {
+        (Some((loc, len)), Some(sql)) => format!("loc={loc} len={len} sql={sql:?}"),
+        (Some((loc, len)), None) => format!("loc={loc} len={len}"),
+        (None, Some(sql)) => format!("sql={sql:?}"),
+        (None, None) => String::new(),
     }
 }
 
