@@ -21,8 +21,8 @@ mod tests {
             ("ProcessUtility_hook", "start"),
         ];
 
-        // PG15+ parses the target query inside ProcessUtility_hook
-        if cfg!(not(any(feature = "pg13", feature = "pg14"))) {
+        // PG14+ parses the target query inside ProcessUtility_hook
+        if cfg!(not(feature = "pg13")) {
             expected.push(("post_parse_analyze_hook", "start"));
             expected.push(("post_parse_analyze_hook", "end"));
         }
@@ -73,8 +73,8 @@ mod tests {
             ("ProcessUtility_hook", "start"),
         ];
 
-        // PG15+ parses the target query inside ProcessUtility_hook
-        if cfg!(not(any(feature = "pg13", feature = "pg14"))) {
+        // PG14+ parses the target query inside ProcessUtility_hook
+        if cfg!(not(feature = "pg13")) {
             expected.push(("post_parse_analyze_hook", "start"));
             expected.push(("post_parse_analyze_hook", "end"));
         }

@@ -72,4 +72,50 @@ mod tests {
             ]
         )
     }
+
+    #[derive(Debug)]
+    struct InvalidInt4;
+
+    impl postgres::types::ToSql for InvalidInt4 {
+        fn accepts(_ty: &postgres::types::Type) -> bool {
+            true
+        }
+
+        fn encode_format(&self, _ty: &postgres::types::Type) -> postgres::types::Format {
+            postgres::types::Format::Text
+        }
+
+        fn to_sql(
+            &self,
+            _ty: &postgres::types::Type,
+            out: &mut postgres::types::private::BytesMut,
+        ) -> std::result::Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+        {
+            out.extend_from_slice(b"not_an_int");
+            Ok(postgres::types::IsNull::No)
+        }
+
+        postgres::types::to_sql_checked!();
+    }
+
+    #[pgrx::pg_test]
+    fn extended_query_bind_error_aborts_before_executor() -> Result<()> {
+        let filename = "extended_query_bind_error_aborts_before_executor";
+        let mut client = super::setup_test(filename);
+
+        let stmt = client.prepare("SELECT $1::int")?;
+        super::clear_trace(filename);
+
+        assert_that!(client.query(&stmt, &[&InvalidInt4]), err(anything()));
+
+        client.check_connection()?;
+
+        verify_that!(
+            super::read_trace(filename),
+            elements_are![
+                eq(&("emit_log_hook", "entry")), // ERROR: invalid input syntax for type integer: "not_an_int"
+                eq(&("xact_callback", "ABORT")),
+            ]
+        )
+    }
 }

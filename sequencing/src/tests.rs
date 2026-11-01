@@ -44,12 +44,7 @@ fn read_trace(filename: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-fn setup_test(filename: &str) -> postgres::Client {
-    const FNV: u64 = 0x811C9DC5;
-    const KEY: i64 = FNV as i64;
-    pgrx::Spi::get_one::<()>(format!("SELECT pg_advisory_xact_lock({KEY})").as_str())
-        .expect("failed to acquire pg_advisory_xact_lock");
-
+fn new_client(filename: &str) -> postgres::Client {
     // clear any leftovers
     clear_trace(filename);
 
@@ -64,4 +59,13 @@ fn setup_test(filename: &str) -> postgres::Client {
     .expect("some connection string");
 
     postgres::Client::connect(&conn_str, postgres::NoTls).unwrap()
+}
+
+fn setup_test(filename: &str) -> postgres::Client {
+    const FNV: u64 = 0x811C9DC5;
+    const KEY: i64 = FNV as i64;
+    pgrx::Spi::get_one::<()>(format!("SELECT pg_advisory_xact_lock({KEY})").as_str())
+        .expect("failed to acquire pg_advisory_xact_lock");
+
+    new_client(filename)
 }

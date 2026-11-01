@@ -91,4 +91,52 @@ mod tests {
             ]
         )
     }
+
+    #[pgrx::pg_test]
+    fn syntax_error_bypasses_all_parse_and_plan_hooks() -> Result<()> {
+        let filename = "syntax_error_bypasses_all_parse_and_plan_hooks";
+        let mut client = super::setup_test(filename);
+        super::clear_trace(filename);
+
+        assert_that!(client.simple_query("blah"), err(anything()));
+
+        // wait for backend error handling
+        client.check_connection()?;
+
+        verify_that!(
+            super::read_trace(filename),
+            elements_are![
+                eq(&("emit_log_hook", "entry")), // ERROR: syntax error at or near "blah"
+                eq(&("xact_callback", "ABORT")),
+            ]
+        )
+    }
+
+    #[pgrx::pg_test]
+    fn empty_query_skips_execution_pipeline() -> Result<()> {
+        let filename = "empty_query_skips_execution_pipeline";
+        let mut client = super::setup_test(filename);
+
+        for sql in [
+            "",
+            "; ; ;",
+            "/* traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' */",
+        ] {
+            scoped_trace!("{sql:?}");
+
+            super::clear_trace(filename);
+            let _ = client.simple_query(sql)?;
+
+            verify_that!(
+                super::read_trace(filename),
+                elements_are![
+                    eq(&("emit_log_hook", "entry")), // LOG: statement
+                    eq(&("xact_callback", "PRE_COMMIT")),
+                    eq(&("xact_callback", "COMMIT")),
+                ]
+            )?;
+        }
+
+        Ok(())
+    }
 }

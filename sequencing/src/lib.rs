@@ -83,7 +83,7 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::ExecutorCheckPerms_hook = Some(executor_check_perms_hook);
 
         cfg_select! {
-            any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17") => {
+            any(feature = "pg13", feature = "pg14", feature = "pg15") => {
                 #[pgrx::pg_guard]
                 unsafe extern "C-unwind" fn executor_check_perms_hook(
                     rtl: *mut pg_sys::List,
@@ -99,7 +99,7 @@ pub extern "C-unwind" fn _PG_init() {
                     result
                 }
             }
-            any(feature = "pg18", feature = "pg19") => {
+            any(feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19") => {
                 #[pgrx::pg_guard]
                 unsafe extern "C-unwind" fn executor_check_perms_hook(
                     _rtl: *mut pg_sys::List,
@@ -300,7 +300,7 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::post_parse_analyze_hook = Some(post_parse_analyze_hook);
 
         cfg_select! {
-            any(feature = "pg13", feature = "pg14") => {
+            feature = "pg13" => {
                 #[pgrx::pg_guard]
                 unsafe extern "C-unwind" fn post_parse_analyze_hook(
                     pstate: *mut pg_sys::ParseState,
@@ -313,7 +313,7 @@ pub extern "C-unwind" fn _PG_init() {
                     log_event("post_parse_analyze_hook", "end", "");
                 }
             }
-            any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18") => {
+            any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18") => {
                 #[pgrx::pg_guard]
                 unsafe extern "C-unwind" fn post_parse_analyze_hook(
                     pstate: *mut pg_sys::ParseState,

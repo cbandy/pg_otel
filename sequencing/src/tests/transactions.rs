@@ -422,4 +422,36 @@ mod tests {
             ]
         )
     }
+
+    #[pgrx::pg_test]
+    fn pre_execution_lock_timeout_aborts_without_executor() -> Result<()> {
+        let filename = "pre_execution_lock_timeout_aborts_without_executor";
+        let mut client = super::setup_test(filename);
+        let mut holder = super::new_client(&format!("{filename}_holder"));
+
+        client.simple_query("CREATE TABLE IF NOT EXISTS t_lock_test (id int)")?;
+
+        let mut xact = holder.transaction()?;
+        xact.simple_query("LOCK TABLE t_lock_test IN ACCESS EXCLUSIVE MODE")?;
+
+        client.simple_query("SET lock_timeout = '50ms'")?;
+        super::clear_trace(filename);
+
+        assert_that!(
+            client.simple_query("SELECT * FROM t_lock_test"),
+            err(anything())
+        );
+
+        client.check_connection()?;
+        xact.rollback()?;
+
+        verify_that!(
+            super::read_trace(filename),
+            elements_are![
+                eq(&("emit_log_hook", "entry")), // LOG: statement
+                eq(&("emit_log_hook", "entry")), // ERROR: canceling statement due to lock timeout
+                eq(&("xact_callback", "ABORT")),
+            ]
+        )
+    }
 }

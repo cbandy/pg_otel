@@ -103,8 +103,8 @@ mod tests {
             ("ExecutorRun_hook", "start"),
         ]);
 
-        // PG13/14 performs a secondary permission check during ExecutorRun
-        if cfg!(any(feature = "pg13", feature = "pg14")) {
+        // PG13 performs a secondary permission check during ExecutorRun
+        if cfg!(feature = "pg13") {
             expected.push(("ExecutorCheckPerms_hook", "start"));
             expected.push(("ExecutorCheckPerms_hook", "end"));
         }
