@@ -296,79 +296,21 @@ impl<'a> Headers<'a> {
         })
     }
 
-    /// Finds W3C `traceparent` and `tracestate` headers inside a leading or trailing SQL comment.
-    ///
-    /// Compatible with [SQLCommenter](https://google.github.io/sqlcommenter) which adds W3C trace
-    /// context as comma-separated key-value pairs inside a C-style block comment; `/* … */`
-    fn from_sql(sql: &'a str) -> Option<Headers<'a>> {
-        // Look for a trailing comment by removing any trailing whitespace and semicolons.
-        let trailing = sql.trim_end_matches(|c: char| c.is_whitespace() || c == ';');
-        if let Some(comment) = trailing.strip_suffix("*/")
-            && let Some((_, comment)) = comment.rsplit_once("/*")
-            && let Some(headers) = Self::from_comment(comment)
-        {
-            return Some(headers);
-        }
-
-        // Look for a leading comment by removing any leading whitespace.
-        let leading = sql.trim_start();
-        if let Some(comment) = leading.strip_prefix("/*")
-            && let Some((comment, _)) = comment.split_once("*/")
-            && let Some(headers) = Self::from_comment(comment)
-        {
-            return Some(headers);
-        }
-
-        None
+    /// Extracts headers from a comment at the head (front/left) of a slice.
+    #[allow(dead_code)]
+    pub fn from_head(sql: &'a str) -> Option<Headers<'a>> {
+        let comment = sql.trim_start().strip_prefix("/*")?;
+        let (comment, _) = comment.split_once("*/")?;
+        Self::from_comment(comment)
     }
 
-    /// Finds W3C `traceparent` and `tracestate` headers in SQL comments *between* SQL statements.
-    pub fn from_statement(sql: &'a str, stmt_begin: i32, stmt_length: i32) -> Option<Headers<'a>> {
-        if stmt_begin >= 0 {
-            let stmt_slice = if stmt_length > 0 {
-                sql.get(stmt_begin as usize..(stmt_begin + stmt_length) as usize)
-            } else {
-                sql.get(stmt_begin as usize..)
-            };
-            if let Some(slice) = stmt_slice
-                && let Some(parsed) = Self::from_sql(slice)
-            {
-                return Some(parsed);
-            }
-        }
-
-        if stmt_begin >= 0 && stmt_length > 0 {
-            let stmt_end = stmt_begin + stmt_length;
-
-            // Look for a comment in the area behind the statement
-            if let Some((_, behind)) = sql.split_at_checked(stmt_end as usize)
-                && let Some(parsed) =
-                    Self::from_sql(behind.split_once(';').map_or(behind, |(s, _)| s))
-            {
-                return Some(parsed);
-            }
-
-            // Look for a comment in the area ahead of the statement
-            if let Some((ahead, _)) = sql.split_at_checked(stmt_begin as usize)
-                && let Some(parsed) =
-                    Self::from_sql(ahead.rsplit_once(';').map_or(ahead, |(_, s)| s))
-            {
-                return Some(parsed);
-            }
-        }
-
-        if stmt_begin < 0 || stmt_length <= 0 {
-            if let Some(h) = Self::from_sql(sql) {
-                return Some(h);
-            }
-            if let Some((first, _)) = sql.split_once(';')
-                && let Some(h) = Self::from_sql(first)
-            {
-                return Some(h);
-            }
-        }
-
-        None
+    /// Extracts headers from a comment at the tail (back/right) of a slice.
+    ///
+    /// Compatible with [SQLCommenter](https://google.github.io/sqlcommenter).
+    pub fn from_tail(sql: &'a str) -> Option<Headers<'a>> {
+        let comment = sql.trim_end().strip_suffix("*/")?;
+        let (_, comment) = comment.rsplit_once("/*")?;
+        Self::from_comment(comment)
     }
 }
 
@@ -655,10 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn test_headers_from_sql() {
+    fn test_headers_from_head() {
+        // Comment at head of statement body (Postgres 13–17)
         assert_that!(
-            Headers::from_sql(
-                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',tracestate='congo=t61rcWkgMzE' */;",
+            Headers::from_head(
+                "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',tracestate='congo=t61rcWkgMzE' */ SELECT * FROM users"
             ),
             some(eq(&Headers::new(
                 "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
@@ -666,219 +609,183 @@ mod tests {
             ))),
         );
 
-        // no tracestate
+        // Comment at head without tracestate
         assert_that!(
-            Headers::from_sql(
-                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */;",
+            Headers::from_head(
+                "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ SELECT * FROM users"
             ),
             some(eq(&Headers::new(
                 "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                None
+                None,
             ))),
         );
 
-        // bad tracestate
+        // Comment at head with leading whitespace
         assert_that!(
-            Headers::from_sql("SELECT * FROM users /* traceparent='00-invalid-span-01' */;"),
-            some(eq(&Headers::new("00-invalid-span-01", None))),
-        );
-
-        // no flags
-        assert_that!(
-            Headers::from_sql(
-                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7' */;"
+            Headers::from_head(
+                "  \t\n /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ SELECT 1"
             ),
             some(eq(&Headers::new(
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
-                None
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                None,
             ))),
         );
 
-        // no comment
+        // Multiline comment at head
         assert_that!(
-            Headers::from_sql(
-                "SELECT * FROM users WHERE traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';"
+            Headers::from_head(
+                "/*\n traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',\ntracestate='congo=t61rcWkgMzE'\n*/ SELECT 1"
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                Some("congo=t61rcWkgMzE"),
+            ))),
+        );
+
+        // Ignore comment at tail (not at head)
+        assert_that!(
+            Headers::from_head(
+                "SELECT 1 /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */"
             ),
             none(),
         );
 
-        // no traceparent
+        // Ignore comment embedded in the middle
         assert_that!(
-            Headers::from_sql("SELECT * FROM users /* tracestate='congo=t61rcWkgMzE' */;"),
+            Headers::from_head(
+                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ WHERE id = 1"
+            ),
             none(),
+        );
+
+        // Empty comment or no-traceparent comment returns None
+        assert_that!(Headers::from_head("/**/ SELECT 1"), none());
+        assert_that!(
+            Headers::from_head("/* route='/users',action='index' */ SELECT 1"),
+            none(),
+        );
+        assert_that!(
+            Headers::from_head("/* tracestate='congo=t61rcWkgMzE' */ SELECT 1"),
+            none(),
+        );
+
+        // Multiple comments: comment at head takes precedence when inspecting head
+        assert_that!(
+            Headers::from_head(
+                "/* traceparent='00-11111111111111111111111111111111-1111111111111111-01' */ SELECT 1 /* traceparent='00-22222222222222222222222222222222-2222222222222222-01' */"
+            ),
+            some(eq(&Headers::new(
+                "00-11111111111111111111111111111111-1111111111111111-01",
+                None,
+            ))),
         );
     }
 
     #[test]
-    fn test_headers_from_statement() {
-        struct Case<'a> {
-            name: &'a str,
-            sql: &'a str,
-            begin: i32,
-            length: i32,
-            expected: (Option<&'a str>, Option<&'a str>),
-        }
+    fn test_headers_from_tail() {
+        // Comment at tail of statement body (all Postgres versions)
+        assert_that!(
+            Headers::from_tail(
+                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',tracestate='congo=t61rcWkgMzE' */"
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                Some("congo=t61rcWkgMzE"),
+            ))),
+        );
 
-        let cases = [
-            //
-            // Leading
-            //
-            Case {
-                name: "multi-statement leading: stmt 1 gets its leading comment",
-                sql: "/* traceparent='tp1' */ SELECT 1; /* traceparent='tp2' */ SELECT 2;",
-                begin: 24, //-----------------^
-                length: 8, //-------------------------^
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "multi-statement leading: stmt 2 gets its leading comment",
-                sql: "/* traceparent='tp1' */ SELECT 1; /* traceparent='tp2' */ SELECT 2;",
-                begin: 58, //---------------------------------------------------^
-                length: 8, //-----------------------------------------------------------^
-                expected: (Some("tp2"), None),
-            },
-            Case {
-                name: "multi-statement leading: stmt 2 without comment does NOT find another",
-                sql: "/* traceparent='tp1' */ SELECT 1; SELECT 2;",
-                begin: 34, //---------------------------^
-                length: 8, //-----------------------------------^
-                expected: (None, None),
-            },
-            //
-            // Trailing
-            //
-            Case {
-                name: "multi-statement trailing: stmt 1 gets its trailing comment",
-                sql: "SELECT 1 /* traceparent='tp1' */; SELECT 2 /* traceparent='tp2' */;",
-                begin: 0,  //
-                length: 8, //^
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "multi-statement trailing: stmt 2 gets its trailing comment",
-                sql: "SELECT 1 /* traceparent='tp1' */; SELECT 2 /* traceparent='tp2' */;",
-                begin: 34, //---------------------------^
-                length: 8, //-----------------------------------^
-                expected: (Some("tp2"), None),
-            },
-            Case {
-                name: "multi-statement trailing: stmt 1 without comment does NOT find another",
-                sql: "SELECT 1; SELECT 2 /* traceparent='tp2' */;",
-                begin: 0,  //
-                length: 8, //^
-                expected: (None, None),
-            },
-            //
-            // Mixed, leading and trailing
-            //
-            Case {
-                name: "multi-statement mixed: stmt 1 gets its leading, stmt 2 trailing",
-                sql: "/* traceparent='tp1' */ SELECT 1; SELECT 2 /* traceparent='tp2' */;",
-                begin: 24, //-----------------^
-                length: 8, //-------------------------^
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "multi-statement mixed: stmt 2 gets its trailing, stmt 1 leading",
-                sql: "/* traceparent='tp1' */ SELECT 1; SELECT 2 /* traceparent='tp2' */;",
-                begin: 34, //---------------------------^
-                length: 8, //-----------------------------------^
-                expected: (Some("tp2"), None),
-            },
-            Case {
-                name: "multi-statement mixed: stmt 1 gets its trailing, stmt 2 leading",
-                sql: "SELECT 1 /* traceparent='tp1' */; /* traceparent='tp2' */ SELECT 2;",
-                begin: 0,  //
-                length: 8, //^
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "multi-statement mixed: stmt 2 gets its leading, stmt 1 trailing",
-                sql: "SELECT 1 /* traceparent='tp1' */; /* traceparent='tp2' */ SELECT 2;",
-                begin: 58, //---------------------------------------------------^
-                length: 8, //-----------------------------------------------------------^
-                expected: (Some("tp2"), None),
-            },
-            //
-            // Possible false-positives
-            //
-            Case {
-                name: "internal comment",
-                sql: "SELECT 1 /* traceparent='tp1' */ WHERE 1;",
-                begin: 0,   //
-                length: 39, //--------------------------------^
-                expected: (None, None),
-            },
-            Case {
-                name: "internal comment in prior statement",
-                sql: "SELECT 1 /* traceparent='tp1' */ WHERE 1; SELECT 2;",
-                begin: 42, //-----------------------------------^
-                length: 8, //-------------------------------------------^
-                expected: (None, None),
-            },
-            Case {
-                name: "unclosed comment ignored",
-                sql: "SELECT 1 -- traceparent='tp1' */",
-                begin: 0,  //
-                length: 8, //^
-                expected: (None, None),
-            },
-            Case {
-                name: "multiple empty statements prior ignored",
-                sql: "SELECT 1 /* traceparent='tp1' */; ; ; SELECT 2;",
-                begin: 39, //-------------------------------^
-                length: 8, //---------------------------------------^
-                expected: (None, None),
-            },
-            //
-            // Possible false-negatives
-            //
-            Case {
-                name: "unpopulated offsets: trailing comment found",
-                sql: "CREATE TEMP TABLE t1 (id int) /* traceparent='tp1' */;",
-                begin: 0,
-                length: 0,
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "unpopulated offsets: trailing comment before trailing semicolons",
-                sql: "SELECT 1 /* traceparent='tp1' */; ; ;",
-                begin: 0,
-                length: 0,
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "unpopulated offsets: leading comment found",
-                sql: "/* traceparent='tp1' */ CREATE TEMP TABLE t1 (id int);",
-                begin: 0,
-                length: 0,
-                expected: (Some("tp1"), None),
-            },
-            Case {
-                name: "multiline trailing comment",
-                sql: "SELECT 1 /*\n traceparent='tp1',\ntracestate='ts1'\n*/;",
-                begin: 0,  //
-                length: 8, //^
-                expected: (Some("tp1"), Some("ts1")),
-            },
-            Case {
-                name: "multiline leading comment",
-                sql: "/*\n traceparent='tp1',\ntracestate='ts1'\n*/ SELECT 1;",
-                begin: 43, //---------------------------------------^
-                length: 8, //-----------------------------------------------^
-                expected: (Some("tp1"), Some("ts1")),
-            },
-        ];
+        // Comment at tail without tracestate
+        assert_that!(
+            Headers::from_tail(
+                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */"
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                None,
+            ))),
+        );
 
-        for case in cases {
-            let headers = Headers::from_statement(case.sql, case.begin, case.length);
-            let headers = headers.as_ref();
-            let actual_tp = headers.map(|h| h.traceparent.as_ref());
-            let actual_ts = headers.and_then(|h| h.tracestate.as_deref());
+        // Comment at tail followed by whitespace
+        assert_that!(
+            Headers::from_tail(
+                "SELECT 1 /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */  \t\n "
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                None,
+            ))),
+        );
 
-            scoped_trace!("{}", case.name);
-            assert_that!((actual_tp, actual_ts), eq(case.expected),);
-        }
+        // Multiline comment at tail
+        assert_that!(
+            Headers::from_tail(
+                "SELECT 1 /*\n traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',\ntracestate='congo=t61rcWkgMzE'\n*/"
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                Some("congo=t61rcWkgMzE"),
+            ))),
+        );
+
+        // Postgres 18+ prefix slice: comment at tail of prefix (immediately preceding statement keyword)
+        assert_that!(
+            Headers::from_tail(
+                "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ "
+            ),
+            some(eq(&Headers::new(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                None,
+            ))),
+        );
+
+        // Postgres 18+ prefix slice: empty statement barrier (ends with ';', not '*/') ignored
+        assert_that!(Headers::from_tail(" /* isolated */ ; "), none(),);
+
+        // Statement slice with terminating semicolon ignored (slices stop before ';')
+        assert_that!(
+            Headers::from_tail(
+                "SELECT 1 /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */;"
+            ),
+            none(),
+        );
+
+        // Ignore comment at head (not at tail)
+        assert_that!(
+            Headers::from_tail(
+                "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ SELECT 1"
+            ),
+            none(),
+        );
+
+        // Ignore comment embedded in the middle of slice
+        assert_that!(
+            Headers::from_tail(
+                "SELECT * FROM users /* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ WHERE id = 1"
+            ),
+            none(),
+        );
+
+        // Empty comment or no-traceparent comment returns None
+        assert_that!(Headers::from_tail("SELECT 1 /**/"), none());
+        assert_that!(
+            Headers::from_tail("SELECT 1 /* route='/users',action='index' */"),
+            none(),
+        );
+        assert_that!(
+            Headers::from_tail("SELECT * FROM users /* tracestate='congo=t61rcWkgMzE' */"),
+            none(),
+        );
+
+        // Multiple comments: comment at tail takes precedence
+        assert_that!(
+            Headers::from_tail(
+                "/* traceparent='00-11111111111111111111111111111111-1111111111111111-01' */ SELECT 1 /* traceparent='00-22222222222222222222222222222222-2222222222222222-01' */"
+            ),
+            some(eq(&Headers::new(
+                "00-22222222222222222222222222222222-2222222222222222-01",
+                None,
+            ))),
+        );
     }
 
     #[test]

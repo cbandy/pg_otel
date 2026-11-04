@@ -13,6 +13,60 @@ static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
 static GUC_TRACEPARENT: GucString = GucString::new(None);
 static GUC_TRACESTATE: GucString = GucString::new(None);
 
+thread_local! {
+    /// Tracks the starting byte offset of the unparsed remainder in a multi-statement simple query batch.
+    ///
+    /// Since PostgreSQL 18, `PlannedStmt::stmt_location` advances past leading comments to the first SQL keyword.
+    /// The value here marks where the previous statement's terminating delimiter ended so leading comments can be recovered without backward scanning.
+    /// It also anchors synthetic error spans when a batch aborts.
+    static BATCH_CURSOR: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Advances the batch SQL cursor to the position immediately after the completed statement's terminating semicolon.
+///
+/// PostgreSQL documents on `PlannedStmt` in `plannodes.h` that:
+/// - `stmt_location` is the start byte offset, or -1 if unknown.
+/// - `stmt_len` is the length in bytes; `0` means "rest of string".
+///
+/// The definitions in `gram.y` ensure that when `stmt_len > 0`,
+/// `stmt_location + stmt_len` points directly at the terminating `;` token.
+///
+/// When the statement extends to EOF or reaches the end of the query string,
+/// the cursor resets to `0` ahead of the next query.
+fn batch_advance_cursor(sql: &str, stmt_location: i32, stmt_len: i32) {
+    if stmt_location < 0 || stmt_len <= 0 {
+        BATCH_CURSOR.set(0);
+        return;
+    }
+    let stmt_end = (stmt_location + stmt_len) as usize;
+    let next_pos = if sql.as_bytes().get(stmt_end) == Some(&b';') {
+        stmt_end + 1
+    } else {
+        stmt_end
+    };
+
+    BATCH_CURSOR.set(if next_pos >= sql.len() { 0 } else { next_pos });
+}
+
+/// Slices a statement from the batch SQL text using engine byte offsets.
+///
+/// When `stmt_location` is negative (e.g. parse failures), slicing begins at `BATCH_CURSOR`.
+/// When `stmt_len` is non-positive, slicing extends to the end of `sql`.
+fn batch_statement_slice(sql: &str, stmt_location: i32, stmt_len: i32) -> Option<&str> {
+    let start = if stmt_location >= 0 {
+        stmt_location as usize
+    } else {
+        BATCH_CURSOR.get()
+    };
+    let end = if stmt_location >= 0 && stmt_len > 0 {
+        (stmt_location + stmt_len) as usize
+    } else {
+        sql.len()
+    };
+
+    sql.get(start..end)
+}
+
 #[derive(Debug)]
 struct ActiveStatement {
     span: Span,
@@ -306,6 +360,10 @@ fn guc_cstr(guc: &GucString) -> Option<&ffi::CStr> {
     }
 }
 
+/// Reads W3C trace context from `otel.traceparent` and `otel.tracestate` GUCs without clearing them.
+///
+/// Used primarily by parallel query workers, where GUC state is restored by PostgreSQL from the
+/// leader backend.
 fn read_guc_context() -> Option<SpanContext> {
     let tp_str = guc_cstr(&GUC_TRACEPARENT)?.to_str().ok()?;
     let ts_str = guc_cstr(&GUC_TRACESTATE).and_then(|s| s.to_str().ok());
@@ -313,6 +371,7 @@ fn read_guc_context() -> Option<SpanContext> {
     SpanContext::try_from(headers).ok()
 }
 
+/// Clears the `otel.traceparent` and `otel.tracestate` GUC parameters in session state.
 fn clear_guc_context() {
     IN_GUC_UPDATE.set(true);
     unsafe {
@@ -332,6 +391,10 @@ fn clear_guc_context() {
     IN_GUC_UPDATE.set(false);
 }
 
+/// Reads W3C trace context from session GUCs and resets them to empty strings.
+///
+/// GUC trace context is single-use and cleared immediately to prevent session pollution
+/// across pooled connections.
 fn take_guc_context() -> Option<SpanContext> {
     let ctx = read_guc_context();
     if ctx.is_some() || guc_cstr(&GUC_TRACEPARENT).is_some() || guc_cstr(&GUC_TRACESTATE).is_some()
@@ -341,36 +404,51 @@ fn take_guc_context() -> Option<SpanContext> {
     ctx
 }
 
+/// Extracts incoming trace context for a statement, preferring SQL comments over session GUCs.
 fn take_statement_context(
     pstmt: Option<&pg_sys::PlannedStmt>,
     sql: Option<&str>,
 ) -> Option<SpanContext> {
-    let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-    let comment_ctx = sql
-        .and_then(|s| Headers::from_statement(s, stmt_begin, stmt_len))
-        .and_then(|h| SpanContext::try_from(h).ok());
+    // Consume and clear any pending session context GUCs.
     let guc_ctx = take_guc_context();
+
+    let comment_ctx = sql
+        .and_then(|s| {
+            let (loc, len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+            let body = batch_statement_slice(s, loc, len).unwrap_or(s);
+
+            // Trailing comments (SQLCommenter) take precedence over leading comments.
+            //
+            // Since PostgreSQL 18, `PlannedStmt::stmt_location` points to the first SQL keyword.
+            // Leading comments therefore reside at the tail of the area between the previous
+            // statement's terminating delimiter (`BATCH_CURSOR`) and `loc`.
+            std::cfg_select! {
+                any(feature = "pg15", feature = "pg16", feature = "pg17") => {
+                    Headers::from_tail(body).or_else(|| Headers::from_head(body))
+                }
+                _ => {
+                    Headers::from_tail(body).or_else(|| {
+                        let cursor = BATCH_CURSOR.get();
+                        if loc >= 0 && (loc as usize) > cursor {
+                            let prefix = s.get(cursor..loc as usize)?;
+                            Headers::from_tail(prefix)
+                        } else {
+                            None
+                        }
+                    })
+                }
+            }
+        })
+        .and_then(|h| SpanContext::try_from(h).ok());
+
     comment_ctx.or(guc_ctx)
 }
 
-fn start_statement_span(
-    pstmt: Option<&pg_sys::PlannedStmt>,
-    sql: Option<&str>,
-) -> (SpanContext, SpanBuilder) {
-    let incoming = take_statement_context(pstmt, sql);
-    propagate_context(incoming, current_span_context())
-}
-
-fn start_transaction_span(
-    pstmt: Option<&pg_sys::PlannedStmt>,
-    sql: Option<&str>,
-) -> (SpanContext, SpanBuilder, bool) {
-    let incoming = take_statement_context(pstmt, sql);
-    let has_incoming = incoming.is_some();
-    let (context, builder) = propagate_context(incoming, current_span_context());
-    (context, builder, has_incoming)
-}
-
+/// Settles the active transaction span's context if it does not yet have any.
+///
+/// In SQL, `SET LOCAL otel.traceparent` can execute after `BEGIN`. This late-binding step
+/// checks if a GUC context arrived after transaction initialization and retroactively
+/// updates the transaction span's parent and trace ID.
 fn settle_transaction_context() {
     SPAN_STACK.with_borrow_mut(|stack| {
         if let Some(StackSpan::Transaction(xact)) = stack.first_mut()
@@ -385,6 +463,44 @@ fn settle_transaction_context() {
             xact.has_received_context = true;
         }
     });
+}
+
+/// Initializes trace context and builder for a statement span.
+///
+/// Automatically settles any pending transaction context before extracting statement context,
+/// ensuring proper parenting under active transactions.
+fn init_statement_span(
+    pstmt: Option<&pg_sys::PlannedStmt>,
+    sql: Option<&str>,
+) -> (SpanContext, SpanBuilder) {
+    settle_transaction_context();
+    let incoming = take_statement_context(pstmt, sql);
+    propagate_context(incoming, current_span_context())
+}
+
+/// Opens a new transaction span for `BEGIN` or `START TRANSACTION` commands.
+fn open_transaction_span(
+    pstmt: Option<&pg_sys::PlannedStmt>,
+    sql: Option<&str>,
+    start_time: time::SystemTime,
+) -> TransactionSpanState {
+    let incoming = take_statement_context(pstmt, sql);
+    let has_received_context = incoming.is_some();
+    let (context, builder) = propagate_context(incoming, current_span_context());
+    let span = builder
+        .name("TRANSACTION")
+        .start_time(start_time)
+        .attributes([
+            KeyValue::new_string("db.operation.name", "TRANSACTION"),
+            KeyValue::new_string("db.system.name", "postgresql"),
+        ])
+        .finish();
+
+    TransactionSpanState {
+        span,
+        context,
+        has_received_context,
+    }
 }
 
 fn export_span(span: &Span) {
@@ -419,19 +535,8 @@ fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) ->
     }
 
     if let Some(s) = sql {
-        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-        let slice = if stmt_begin >= 0 {
-            let start = stmt_begin as usize;
-            if stmt_len > 0 {
-                s.get(start..start + stmt_len as usize)
-                    .unwrap_or(&s[start..])
-            } else {
-                s.get(start..).unwrap_or(s)
-            }
-        } else {
-            s
-        };
-        let mut text = slice.trim();
+        let (loc, len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let mut text = batch_statement_slice(s, loc, len).unwrap_or(s).trim();
         while !text.is_empty() {
             if text.starts_with("/*")
                 && let Some((_, rest)) = text.split_once("*/")
@@ -481,19 +586,8 @@ fn is_variable_set(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) -> bo
         return node.try_as::<pg_sys::VariableSetStmt>().is_some();
     }
     if let Some(s) = sql {
-        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-        let slice = if stmt_begin >= 0 {
-            let start = stmt_begin as usize;
-            if stmt_len > 0 {
-                s.get(start..start + stmt_len as usize)
-                    .unwrap_or(&s[start..])
-            } else {
-                s.get(start..).unwrap_or(s)
-            }
-        } else {
-            s
-        };
-        let mut text = slice.trim();
+        let (loc, len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let mut text = batch_statement_slice(s, loc, len).unwrap_or(s).trim();
         while text.starts_with("/*") {
             if let Some((_, rest)) = text.split_once("*/") {
                 text = rest.trim();
@@ -521,19 +615,8 @@ fn get_transaction_stmt_kind(
             .map(|xact| xact.kind);
     }
     if let Some(s) = sql {
-        let (stmt_begin, stmt_len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
-        let slice = if stmt_begin >= 0 {
-            let start = stmt_begin as usize;
-            if stmt_len > 0 {
-                s.get(start..start + stmt_len as usize)
-                    .unwrap_or(&s[start..])
-            } else {
-                s.get(start..).unwrap_or(s)
-            }
-        } else {
-            s
-        };
-        let mut text = slice.trim();
+        let (loc, len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
+        let mut text = batch_statement_slice(s, loc, len).unwrap_or(s).trim();
         while text.starts_with("/*") {
             if let Some((_, rest)) = text.split_once("*/") {
                 text = rest.trim();
@@ -587,7 +670,7 @@ pub fn install_hooks() {
 
         if crate::ENABLED.get().spans() {
             process_utility(
-                (!ps.is_null() && ps.is_aligned()).then(|| unsafe { ps.as_ref_unchecked() }),
+                unsafe { ps.as_ref() },
                 (!qs.is_null()).then(|| unsafe { ffi::CStr::from_ptr(qs) }),
                 call_remaining_hooks,
             );
@@ -634,9 +717,7 @@ pub fn install_hooks() {
     #[pgrx::pg_guard]
     unsafe extern "C-unwind" fn executor_start_hook(qd: *mut pg_sys::QueryDesc, ef: i32) {
         if crate::ENABLED.get().spans() {
-            executor_start(
-                (!qd.is_null() && qd.is_aligned()).then(|| unsafe { qd.as_ref_unchecked() }),
-            );
+            executor_start(unsafe { qd.as_ref() });
         }
 
         // SAFETY: HOOK_EXECUTOR_START is assigned above, during startup; it is safe to read here.
@@ -663,9 +744,7 @@ pub fn install_hooks() {
         }
 
         if crate::ENABLED.get().spans() {
-            executor_end(
-                (!qd.is_null() && qd.is_aligned()).then(|| unsafe { qd.as_ref_unchecked() }),
-            );
+            executor_end(unsafe { qd.as_ref() });
         }
     }
 }
@@ -711,7 +790,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
 
     if SPAN_STACK.with_borrow(|s| {
         s.last()
-            .map_or(false, |entry| entry.is_commit() || entry.is_rollback())
+            .is_some_and(|entry| entry.is_commit() || entry.is_rollback())
     }) {
         return;
     }
@@ -724,8 +803,6 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
     };
 
     if depth == 1 {
-        settle_transaction_context();
-
         let initial_budget = GUC_TRACE_NESTED_STATEMENTS
             .get()
             .min(GUC_MAX_NESTED_STATEMENTS.get())
@@ -733,7 +810,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         REMAINING_BUDGET.set(initial_budget);
         DROPPED_NESTED_STATEMENTS.set(0);
 
-        let (context, builder) = start_statement_span(pstmt, sql);
+        let (context, builder) = init_statement_span(pstmt, sql);
         let op_name = get_operation_name(pstmt, sql);
 
         let span = builder
@@ -800,7 +877,7 @@ fn executor_start(query: Option<&pg_sys::QueryDesc>) {
         });
     }
 
-    if pstmt.map_or(false, |p| p.parallelModeNeeded)
+    if pstmt.is_some_and(|p| p.parallelModeNeeded)
         && let Some(context) = current_span_context()
     {
         let tp = context.w3c_traceparent();
@@ -848,7 +925,7 @@ fn executor_end(query: Option<&pg_sys::QueryDesc>) {
 
     if SPAN_STACK.with_borrow(|s| {
         s.last()
-            .map_or(false, |entry| entry.is_commit() || entry.is_rollback())
+            .is_some_and(|entry| entry.is_commit() || entry.is_rollback())
     }) {
         return;
     }
@@ -860,8 +937,19 @@ fn executor_end(query: Option<&pg_sys::QueryDesc>) {
         clear_guc_context();
     }
 
+    if depth == 1
+        && let Some(qd) = query
+        && let Some(ps) = unsafe { qd.plannedstmt.as_ref() }
+        && let Some(sql) = unsafe {
+            (!qd.sourceText.is_null()).then(|| ffi::CStr::from_ptr(qd.sourceText).to_str().ok())
+        }
+        .flatten()
+    {
+        batch_advance_cursor(sql, ps.stmt_location, ps.stmt_len);
+    }
+
     SPAN_STACK.with_borrow_mut(|s| {
-        if s.last().map_or(false, |entry| entry.depth() == depth)
+        if s.last().is_some_and(|entry| entry.depth() == depth)
             && let Some(mut entry) = s.pop()
         {
             if depth == 1 {
@@ -894,6 +982,12 @@ where
 
     if is_variable_set(pstmt, sql_str) {
         hooks();
+        if EXECUTION_DEPTH.get() == 0
+            && let Some(ps) = pstmt
+            && let Some(src) = sql_str
+        {
+            batch_advance_cursor(src, ps.stmt_location, ps.stmt_len);
+        }
         return;
     }
 
@@ -901,31 +995,16 @@ where
     match xact_kind {
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_BEGIN)
         | Some(pg_sys::TransactionStmtKind::TRANS_STMT_START) => {
-            let (context, builder, has_received_context) = start_transaction_span(pstmt, sql_str);
-            let span = builder
-                .name("TRANSACTION")
-                .start_time(now)
-                .attributes([
-                    KeyValue::new_string("db.operation.name", "TRANSACTION"),
-                    KeyValue::new_string("db.system.name", "postgresql"),
-                ])
-                .finish();
-
+            let xact = open_transaction_span(pstmt, sql_str, now);
             SPAN_STACK.with_borrow_mut(|s| {
-                s.push(StackSpan::Transaction(TransactionSpanState {
-                    span,
-                    context,
-                    has_received_context,
-                }));
+                s.push(StackSpan::Transaction(xact));
             });
 
             hooks();
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT) => {
-            settle_transaction_context();
-
-            let (context, builder) = start_statement_span(pstmt, sql_str);
+            let (context, builder) = init_statement_span(pstmt, sql_str);
             let span = builder
                 .name("COMMIT")
                 .start_time(now)
@@ -946,9 +1025,7 @@ where
             return;
         }
         Some(pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK) => {
-            settle_transaction_context();
-
-            let (context, builder) = start_statement_span(pstmt, sql_str);
+            let (context, builder) = init_statement_span(pstmt, sql_str);
             let span = builder
                 .name("ROLLBACK")
                 .start_time(now)
@@ -970,7 +1047,7 @@ where
             SPAN_STACK.with_borrow_mut(|s| {
                 while s
                     .last()
-                    .map_or(false, |e| e.is_rollback() || e.is_transaction())
+                    .is_some_and(|e| e.is_rollback() || e.is_transaction())
                 {
                     if let Some(entry) = s.pop() {
                         entry.finish_and_export(now);
@@ -986,8 +1063,6 @@ where
     EXECUTION_DEPTH.set(depth);
 
     if depth == 1 {
-        settle_transaction_context();
-
         let initial_budget = GUC_TRACE_NESTED_STATEMENTS
             .get()
             .min(GUC_MAX_NESTED_STATEMENTS.get())
@@ -995,7 +1070,7 @@ where
         REMAINING_BUDGET.set(initial_budget);
         DROPPED_NESTED_STATEMENTS.set(0);
 
-        let (context, builder) = start_statement_span(pstmt, sql_str);
+        let (context, builder) = init_statement_span(pstmt, sql_str);
         let op_name = get_operation_name(pstmt, sql_str);
         let span = builder
             .name(op_name.clone())
@@ -1068,8 +1143,15 @@ where
         EXECUTION_DEPTH.set(cur_depth - 1);
     }
 
+    if depth == 1
+        && let Some(ps) = pstmt
+        && let Some(sql) = sql_str
+    {
+        batch_advance_cursor(sql, ps.stmt_location, ps.stmt_len);
+    }
+
     SPAN_STACK.with_borrow_mut(|s| {
-        if s.last().map_or(false, |entry| entry.depth() == depth)
+        if s.last().is_some_and(|entry| entry.depth() == depth)
             && let Some(mut entry) = s.pop()
         {
             if depth == 1 {
@@ -1134,11 +1216,9 @@ fn abort_statements(
                 }
             });
             if let Some(qs) = query_str {
-                let op_name = get_operation_name(None, Some(qs));
+                let op_name = get_operation_name(None, batch_statement_slice(qs, -1, 0));
                 if !op_name.is_empty() && op_name != "UNKNOWN" {
-                    settle_transaction_context();
-
-                    let (context, builder) = start_statement_span(None, Some(qs));
+                    let (context, builder) = init_statement_span(None, Some(qs));
                     let span = builder
                         .name(op_name.clone())
                         .status(SpanStatus::error(""))
@@ -1183,10 +1263,13 @@ fn transaction_abort() {
     let in_xact_block = unsafe { pg_sys::IsTransactionBlock() };
     let is_commit_or_rollback = SPAN_STACK.with_borrow(|s| {
         s.last()
-            .map_or(false, |entry| entry.is_commit() || entry.is_rollback())
+            .is_some_and(|entry| entry.is_commit() || entry.is_rollback())
     });
 
     let error_code = abort_statements(now, last_error, dropped);
+
+    // Discard any partial batch position when a query fails mid-batch.
+    BATCH_CURSOR.set(0);
 
     SPAN_STACK.with_borrow_mut(|s| {
         if let Some(code) = error_code
@@ -1200,7 +1283,7 @@ fn transaction_abort() {
         }
 
         if (is_commit_or_rollback || !in_xact_block)
-            && s.last().map_or(false, |e| e.is_transaction())
+            && s.last().is_some_and(|e| e.is_transaction())
             && let Some(entry) = s.pop()
         {
             entry.finish_and_export(now);
@@ -1224,7 +1307,7 @@ fn transaction_commit() {
     SPAN_STACK.with_borrow_mut(|s| {
         while s
             .last()
-            .map_or(false, |e| e.is_commit() || e.is_transaction())
+            .is_some_and(|e| e.is_commit() || e.is_transaction())
         {
             if let Some(entry) = s.pop() {
                 entry.finish_and_export(now);
