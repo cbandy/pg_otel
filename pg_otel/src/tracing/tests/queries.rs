@@ -67,10 +67,6 @@ mod tests {
                 "SELECT 1",
                 "SELECT 2",
             ][..],
-            // One Query ('Q') message with four statements
-            &[
-                "SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SET otel.tracestate = 'rojo=1'; SELECT 1; SELECT 2",
-            ][..],
             // Reversed SET statements
             &[
                 "SET otel.tracestate = 'rojo=1'",
@@ -82,9 +78,6 @@ mod tests {
                 "SET otel.tracestate = 'rojo=1'; SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'",
                 "SELECT 1",
                 "SELECT 2",
-            ][..],
-            &[
-                "SET otel.tracestate = 'rojo=1'; SET otel.traceparent = '00-11111111111111111111111111111111-2222222222222222-01'; SELECT 1; SELECT 2",
             ][..],
         ] {
             scoped_trace!("{sqls:?}");
@@ -139,7 +132,6 @@ mod tests {
 
         for sqls in [
             &["SELECT 1", "SELECT 2"][..], // Two Query ('Q') messages
-            &["SELECT 1; SELECT 2"][..],   // One Query ('Q') message with two statements
         ] {
             scoped_trace!("{sqls:?}");
 

@@ -38,16 +38,58 @@ sequenceDiagram
 
 ### Backend Lifecycles & Diagnostic Hooks
 
-* **Query Lifecycle**: Queries transition through `Parse` $\rightarrow$ `Analyze` $\rightarrow$ `Plan` $\rightarrow$ `Execute` $\rightarrow$ `Commit`/`Abort`.
-* **`emit_log_hook`**: Executed whenever PostgreSQL's internal `ereport()` or `elog()` macros write a log, warning, error, or debug message. Extensions can inspect or suppress `ErrorData` fields (e.g. SQLSTATE, error message, severity, line number).
-* **Transaction Aborts**: (`ERROR` / `FATAL`) When a transaction fails, PostgreSQL aborts the transaction and rolls back database state. Shared memory writes (IPC queues) are independent of database transaction rollbacks and remain intact.
-* **Backend Crashes**: (SIGSEGV / Panic) If a backend process crashes, Postmaster catches `SIGCHLD`, sends `SIGQUIT` to all other backends to stop execution, resets shared memory, and runs crash recovery.
+- **Query Lifecycle**: Queries transition through `Parse` $\rightarrow$ `Analyze` $\rightarrow$ `Plan` $\rightarrow$ `Execute` $\rightarrow$ `Commit`/`Abort`.
+- **`emit_log_hook`**: Executed whenever PostgreSQL's internal `ereport()` or `elog()` macros write a log, warning, error, or debug message.
+  Extensions can inspect or suppress `ErrorData` fields (e.g. SQLSTATE, error message, severity, line number).
+- **Transaction Aborts**: (`ERROR` / `FATAL`) When a transaction fails, PostgreSQL aborts the transaction and rolls back database state.
+  Shared memory writes (IPC queues) are independent of database transaction rollbacks and remain intact.
+- **Backend Crashes**: (SIGSEGV / Panic) If a backend process crashes, Postmaster catches `SIGCHLD`, sends `SIGQUIT` to all other backends to stop execution, resets shared memory, and runs crash recovery.
+
+---
+
+## Transaction Lifecycles & Statement Grouping
+
+A PostgreSQL client backend has at most **one top-level transaction** active at any given moment. Every SQL statement executes inside a transaction:
+
+### 1. Single-Statement Autocommit
+When a client is idle and sends a single statement, PostgreSQL starts a transaction, runs the statement, and immediately commits it before returning `ReadyForQuery`.
+`xact_callback` fires at the end of that statement.
+
+### 2. Multi-Statement Simple Query ('Q')
+When a client sends multiple semicolon-separated statements in a single Simple Query string:
+- If not already in an explicit `BEGIN` block, PostgreSQL enters an **implicit transaction block**.
+- All statements in the string share the **same transaction** and commit atomically (or all roll back together).
+- `xact_callback` does **not** fire between ordinary statements in the batch; only when the transaction commits or aborts.
+- **Mid-Batch Transaction Boundaries**: If the multi-statement string contains explicit `BEGIN`, `COMMIT`, `ROLLBACK` or commands that cannot run inside a transaction (e.g., `VACUUM`, `CREATE INDEX CONCURRENTLY`), PostgreSQL commits/aborts the transaction and starts a new transaction for the remaining statements.
+
+### 3. Explicit Transaction Blocks (`BEGIN`, `COMMIT`)
+- Issuing `BEGIN` (or `START TRANSACTION`) transitions the backend into an **explicit transaction block**.
+- Subsequent statements across multiple client round-trips execute inside that **same single transaction**.
+- `xact_callback` fires only when `COMMIT`, `END`, `ROLLBACK`, or an unhandled error terminates the transaction block; not after each individual statement inside the block.
+
+### 4. Special Cases & Edge Conditions for Telemetry
+
+- **Subtransactions (`SAVEPOINT` and PL/pgSQL `EXCEPTION`)**:
+  A top-level transaction can push a nested stack of subtransactions via SQL `SAVEPOINT` or PL/pgSQL `BEGIN ... EXCEPTION` blocks.
+  Subtransactions do **not** fire `xact_callback`; they fire `subxact_callback`.
+- **Inverted Lifetimes (`CALL`, `VACUUM`, `CLUSTER`)**:
+  Certain utility commands executed outside an explicit `BEGIN` block can commit the active transaction and start a new one *while `ProcessUtility_hook` is still on the call stack*:
+  - Stored procedures invoked via `CALL` can execute `COMMIT` or `ROLLBACK` internally.
+  - Maintenance commands like `VACUUM` and `CLUSTER` start and commit multiple independent transactions sequentially across relations or phases.
+  - Consequently, `xact_callback` can fire **one or more times inside** a single `ProcessUtility_hook` invocation.
+- **Multiple Open Portals (Cursors and Extended Query Protocol)**:
+  A client can interleave partial `FETCH` or Extended Query Protocol `Execute` messages (with row limits) across multiple open portals/cursors simultaneously.
+  However, all open portals still execute sequentially within the **same single active transaction**.
+- **Rollback in Aborted Transactions (`TBLOCK_ABORT`)**:
+  When a statement inside an explicit transaction block fails with an error, PostgreSQL immediately calls `AbortTransaction()` and triggers `xact_callback(XACT_EVENT_ABORT)`.
+  The backend enters `TBLOCK_ABORT` (*"current transaction is aborted, commands ignored until end of transaction block"*).
+  When the client subsequently sends `ROLLBACK`, PostgreSQL executes `CleanupTransaction()` to reset state, but **does not fire `xact_callback` a second time**.
 
 ---
 
 ## SQL Hook Execution Matrix
 
-The following tables map each SQL command to the hooks it triggers. Numbers indicate the order hooks are called, while a dash indicates the hook is not called.
+The following tables map each SQL command to the hooks it triggers when executed as a **standalone autocommit statement**. Numbers indicate the order hooks are called, while a dash indicates the hook is not called. (Inside an explicit `BEGIN ... COMMIT` block or multi-statement batch, `xact_callback` is deferred until the transaction itself ends.)
 
 ### Utility Commands
 

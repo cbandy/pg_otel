@@ -11,7 +11,7 @@ mod tests {
     fn nested_default_budget_emits_only_top_level_span() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE test_proc_default() LANGUAGE plpgsql AS $$
             BEGIN
                 PERFORM 1;
@@ -21,7 +21,7 @@ mod tests {
         )?;
 
         harness.enable_tracing()?;
-        harness.client.batch_execute("CALL test_proc_default();")?;
+        harness.simple_query("CALL test_proc_default();")?;
 
         let all_spans = harness.collect_spans(time::Duration::from_secs(1));
 
@@ -35,7 +35,7 @@ mod tests {
     fn nested_opt_in_emits_internal_child_spans() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE TEMP TABLE test_items (id int);
             CREATE OR REPLACE PROCEDURE test_proc_opt_in() LANGUAGE plpgsql AS $$
             BEGIN
@@ -46,10 +46,8 @@ mod tests {
         )?;
 
         harness.enable_tracing()?;
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 10;
-            CALL test_proc_opt_in();",
-        )?;
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query("CALL test_proc_opt_in()")?;
 
         let all_spans = harness.collect_spans_count(3, time::Duration::from_secs(1));
 
@@ -77,7 +75,7 @@ mod tests {
     fn caller_governance_prevents_callee_self_activation() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE test_proc_governed() LANGUAGE plpgsql AS $$
             BEGIN
                 PERFORM 1;
@@ -89,7 +87,7 @@ mod tests {
 
         harness.enable_tracing()?;
         // Caller has default otel.trace_nested_statements = 0
-        harness.client.batch_execute("CALL test_proc_governed();")?;
+        harness.simple_query("CALL test_proc_governed();")?;
 
         let all_spans = harness.collect_spans(time::Duration::from_secs(1));
 
@@ -103,7 +101,7 @@ mod tests {
     fn dba_kill_switch_suppresses_all_nested_spans() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE test_proc_kill_switch() LANGUAGE plpgsql AS $$
             BEGIN
                 PERFORM 1;
@@ -113,12 +111,10 @@ mod tests {
         )?;
 
         harness.enable_tracing()?;
-        harness.client.batch_execute(
-            "SET otel.max_nested_statements = 0;
-            SET LOCAL otel.trace_nested_statements = 10;
-            CALL test_proc_kill_switch();
-            SET otel.max_nested_statements = 50;",
-        )?;
+        harness.simple_query("SET otel.max_nested_statements = 0")?;
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query("CALL test_proc_kill_switch()")?;
+        harness.simple_query("SET otel.max_nested_statements = 50")?;
 
         let all_spans = harness.collect_spans(time::Duration::from_secs(1));
 
@@ -133,9 +129,9 @@ mod tests {
         harness.enable_tracing()?;
 
         // Allocate budget of 3 nested statements, but loop 10 times
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 3;
-            DO $$
+        harness.simple_query("SET otel.trace_nested_statements = 3;")?;
+        harness.simple_query(
+            "DO $$
             BEGIN
                 FOR i IN 1..10 LOOP
                     PERFORM 1;
@@ -169,7 +165,7 @@ mod tests {
     fn callee_silencing_preserves_caller_budget() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE inner_silenced() LANGUAGE plpgsql AS $$
             BEGIN
                 PERFORM 1;
@@ -189,10 +185,8 @@ mod tests {
         )?;
 
         harness.enable_tracing()?;
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 10;
-            CALL outer_proc();",
-        )?;
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query("CALL outer_proc()")?;
 
         let all_spans = harness.collect_spans_count(4, time::Duration::from_secs(1));
 
@@ -227,7 +221,7 @@ mod tests {
     fn trigger_execution_detects_trigger_attribute() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE TEMP TABLE audit_log (msg text);
             CREATE TEMP TABLE main_table (id int);
 
@@ -244,10 +238,8 @@ mod tests {
         )?;
 
         harness.enable_tracing()?;
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 5;
-            INSERT INTO main_table VALUES (42);",
-        )?;
+        harness.simple_query("SET otel.trace_nested_statements = 5")?;
+        harness.simple_query("INSERT INTO main_table VALUES (42)")?;
 
         let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(1));
 
@@ -275,7 +267,7 @@ mod tests {
     fn nested_notice_correlates_with_active_span() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE proc_with_notice() LANGUAGE plpgsql AS $$
             BEGIN
                 RAISE NOTICE 'notice from nested procedure';
@@ -286,10 +278,8 @@ mod tests {
         )?;
 
         harness.enable_telemetry("traces,logs")?;
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 5;
-            CALL proc_with_notice();",
-        )?;
+        harness.simple_query("SET otel.trace_nested_statements = 5")?;
+        harness.simple_query("CALL proc_with_notice()")?;
 
         let all_spans = harness.collect_spans_count(1, time::Duration::from_secs(1));
         verify_that!(all_spans, len(eq(1)))?;
@@ -314,7 +304,7 @@ mod tests {
     fn nested_parallel_query_child_spans() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(cfg_select! {
+        harness.simple_query(cfg_select! {
             any(feature = "pg15") => {
                 "SET force_parallel_mode = regress; SET max_parallel_workers_per_gather = 1"
             }
@@ -323,7 +313,7 @@ mod tests {
             }
         })?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE TABLE t_par_nested AS SELECT generate_series(1, 1000) AS id;
             CREATE OR REPLACE PROCEDURE proc_parallel() LANGUAGE plpgsql AS $$
             BEGIN
@@ -335,9 +325,9 @@ mod tests {
         harness.enable_tracing()?;
 
         // Case 1: With nested statement budget enabled (CALL -> nested SELECT -> parallel worker SELECT)
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 10;
-            CALL proc_parallel() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */;",
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query(
+            "CALL proc_parallel() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
         )?;
 
         let all_spans = harness.collect_spans_count(3, time::Duration::from_secs(2));
@@ -385,8 +375,9 @@ mod tests {
         )?;
 
         // Case 2: With nested statement budget = 0 (CALL -> parallel worker SELECT)
-        harness.client.batch_execute(
-            "CALL proc_parallel() /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */;",
+        harness.simple_query("SET otel.trace_nested_statements = 0")?;
+        harness.simple_query(
+            "CALL proc_parallel() /* traceparent='00-33333333333333333333333333333333-4444444444444444-01',tracestate='congo=2' */",
         )?;
 
         let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
@@ -426,7 +417,7 @@ mod tests {
     fn nested_context_is_immutable() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(
+        harness.simple_query(
             "CREATE OR REPLACE PROCEDURE proc_set_traceparent() LANGUAGE plpgsql AS $$
             BEGIN
                 SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01';
@@ -451,7 +442,7 @@ mod tests {
             "ALTER PROCEDURE proc_comment_override() SET otel.traceparent = '00-33333333333333333333333333333333-4444444444444444-01'",
             "ALTER PROCEDURE proc_comment_override() SET otel.tracestate = 'congo=2'",
         ] {
-            verify_that!(harness.client.batch_execute(alter_sql), err(anything()))?;
+            verify_that!(harness.simple_query(alter_sql), err(anything()))?;
             let spans = harness.collect_spans_count(1, time::Duration::from_secs(1));
             verify_that!(
                 spans,
@@ -474,8 +465,8 @@ mod tests {
             "CALL proc_set_traceparent() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
             "CALL proc_set_tracestate() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
         ] {
-            verify_that!(harness.client.batch_execute(call_sql), err(anything()))?;
-            harness.client.batch_execute("SELECT 1")?;
+            verify_that!(harness.simple_query(call_sql), err(anything()))?;
+            harness.simple_query("SELECT 1")?;
 
             let spans = harness.collect_spans_count(2, time::Duration::from_secs(1));
             verify_that!(
@@ -508,9 +499,9 @@ mod tests {
         }
 
         // SQLCommenter headers on nested statements are ignored and keep the caller's context
-        harness.client.batch_execute(
-            "SET LOCAL otel.trace_nested_statements = 10;
-            CALL proc_comment_override() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */;",
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query(
+            "CALL proc_comment_override() /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
         )?;
 
         let spans = harness.collect_spans_count(2, time::Duration::from_secs(1));

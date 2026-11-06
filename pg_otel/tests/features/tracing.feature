@@ -69,7 +69,7 @@ Feature: Tracing and Spans
       | trace_state       | rojo=1                           |
       | db.operation.name | SELECT                           |
 
-  Scenario: Multiple Queries
+  Scenario: Multiple Simple Queries
     Two queries without parallelization should produce two spans.
     The Span IDs should differ and the Trace IDs should differ.
     This is "autocommit" and the implicit transaction does *not* produce a span.
@@ -140,7 +140,7 @@ Feature: Tracing and Spans
       | trace_state       | *none*      |
       | db.operation.name | SELECT      |
 
-  Scenario: Single Query in Transaction
+  Scenario: Simple Query in Transaction
     An explicit transaction statement produces a transaction span with child query and commit spans.
 
     Given I am authenticated
@@ -169,7 +169,7 @@ Feature: Tracing and Spans
       | parent_id         | *transaction* |
       | db.operation.name | COMMIT        |
 
-  Scenario: Multiple Queries in Transaction
+  Scenario: Simple Queries in Transaction
     An explicit transaction statement is the parent of every span up to and including the commit span.
 
     Given I am authenticated
@@ -608,3 +608,169 @@ Feature: Tracing and Spans
       | trace_id          | *transaction* |
       | parent_id         | *transaction* |
       | db.operation.name | COMMIT        |
+
+  Scenario: Batch Queries
+    Multiple statements executed in a single command run in an implicit transaction block.
+    This produces a transaction span with child query spans.
+
+    Given I am authenticated
+    When I execute: SELECT 1; SELECT 2
+    Then I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+
+  Scenario: Batch Query Error
+    When a statement fails within an implicit transaction batch, the transaction aborts.
+    The transaction span and the failing statement span both have error status and SQLSTATE.
+    Statements that completed before the error succeed.
+
+    Given I am authenticated
+    When I execute: SELECT 1; SELECT 1/0; SELECT 2
+    Then I should see a span with:
+      | kind                    | server        |
+      | status                  | error         |
+      | span_id                 | *generated*   |
+      | trace_id                | *generated*   |
+      | parent_id               | *none*        |
+      | db.operation.name       | TRANSACTION   |
+      | db.response.status_code | 22012         |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind                    | server        |
+      | status                  | error         |
+      | span_id                 | *generated*   |
+      | trace_id                | *transaction* |
+      | parent_id               | *transaction* |
+      | db.operation.name       | SELECT        |
+      | db.response.status_code | 22012         |
+
+  Scenario: Queries with Mid-Batch Explicit Transaction
+    An explicit BEGIN mid-batch promotes the implicit batch transaction to an explicit transaction.
+    All statements parent to the single overarching transaction span.
+
+    Given I am authenticated
+    When I execute: SELECT 1; BEGIN; SELECT 2; COMMIT
+    Then I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | COMMIT        |
+
+  Scenario: Queries with Mid-Batch Commit
+    An explicit COMMIT mid-batch commits the first transaction block.
+    Subsequent statements continue in a new implicit transaction block.
+
+    Given I am authenticated
+    When I execute: SELECT 1; COMMIT; SELECT 2
+    Then I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | COMMIT        |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *generated*   |
+      | parent_id         | *none*        |
+      | db.operation.name | TRANSACTION   |
+    And I should see a span with:
+      | kind              | server        |
+      | status            | unset         |
+      | span_id           | *generated*   |
+      | trace_id          | *transaction* |
+      | parent_id         | *transaction* |
+      | db.operation.name | SELECT        |
+
+  Scenario: Batch Queries with Comment Context
+    Context attached to a statement within an implicit transaction batch causes a Link to the transaction.
+    Statements without context inherit the batch transaction's trace.
+
+    Given I am authenticated
+    When I execute: SELECT 1 /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */; SELECT 2
+    Then I should see a span with:
+      | kind              | server           |
+      | status            | unset            |
+      | span_id           | *generated*      |
+      | trace_id          | *generated*      |
+      | parent_id         | *none*           |
+      | db.operation.name | TRANSACTION      |
+    And I should see a span with:
+      | kind              | server           |
+      | status            | unset            |
+      | span_id           | *generated*      |
+      | trace_id          | 11111111111111111111111111111111 |
+      | parent_id         | 2222222222222222 |
+      | link_span_id      | *transaction*    |
+      | link_trace_id     | *transaction*    |
+      | db.operation.name | SELECT           |
+    And I should see a span with:
+      | kind              | server           |
+      | status            | unset            |
+      | span_id           | *generated*      |
+      | trace_id          | *transaction*    |
+      | parent_id         | *transaction*    |
+      | db.operation.name | SELECT           |

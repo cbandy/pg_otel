@@ -129,6 +129,23 @@ pub extern "C-unwind" fn _PG_init() {
 
         #[pgrx::pg_guard]
         unsafe extern "C-unwind" fn executor_end_hook(query: *mut pg_sys::QueryDesc) {
+            // Invariants guaranteed by PostgreSQL core:
+            // 1. `query`: standard_ExecutorEnd() asserts `Assert(queryDesc != NULL)`.
+            // 2. `qd.plannedstmt`: CreateQueryDesc() unconditionally dereferences `plannedstmt->commandType`.
+            //    Remains valid on QueryDesc until FreeQueryDesc().
+            // 3. `qd.sourceText`: PortalDefineQuery() asserts `AssertArg(sourceText != NULL)`.
+            //
+            // If these assertions fail, investigate third-party extensions or custom backend code
+            // that may have allocated a raw QueryDesc without CreateQueryDesc() or PortalDefineQuery().
+            let qd =
+                unsafe { query.as_ref() }.expect("ExecutorEnd_hook: expected QueryDesc not null");
+            unsafe { qd.plannedstmt.as_ref() }
+                .expect("ExecutorEnd_hook: expected plannedstmt not null");
+            assert!(
+                !qd.sourceText.is_null(),
+                "ExecutorEnd_hook: expected sourceText not null"
+            );
+
             let details = unsafe { query_desc_offsets(query) };
             log_event("ExecutorEnd_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXECUTOR_END } {
@@ -212,6 +229,23 @@ pub extern "C-unwind" fn _PG_init() {
             query: *mut pg_sys::QueryDesc,
             eflags: i32,
         ) {
+            // Invariants guaranteed by PostgreSQL core:
+            // 1. `query`: ExecutorStart() dereferences `queryDesc->plannedstmt->queryId` for `pgstat_report_query_id`.
+            //    standard_ExecutorStart() also asserts `Assert(queryDesc != NULL)`.
+            // 2. `qd.plannedstmt`: CreateQueryDesc() unconditionally dereferences `plannedstmt->commandType`.
+            // 3. `qd.sourceText`: PortalDefineQuery() asserts `AssertArg(sourceText != NULL)`.
+            //
+            // If these assertions fail, investigate third-party extensions or custom backend code
+            // that may have allocated a raw QueryDesc without CreateQueryDesc() or PortalDefineQuery().
+            let qd =
+                unsafe { query.as_ref() }.expect("ExecutorStart_hook: expected QueryDesc not null");
+            unsafe { qd.plannedstmt.as_ref() }
+                .expect("ExecutorStart_hook: expected plannedstmt not null");
+            assert!(
+                !qd.sourceText.is_null(),
+                "ExecutorStart_hook: expected sourceText not null"
+            );
+
             let details = unsafe { query_desc_offsets(query) };
             log_event("ExecutorStart_hook", "start", &details);
             if let Some(next) = unsafe { HOOK_EXECUTOR_START } {
@@ -375,6 +409,22 @@ pub extern "C-unwind" fn _PG_init() {
                     dr: *mut pg_sys::DestReceiver,
                     qc: *mut pg_sys::QueryCompletion,
                 ) {
+                    // Invariants guaranteed by PostgreSQL core:
+                    // 1. `ps`: ProcessUtility() always wraps utility statements in a PlannedStmt.
+                    // 2. `pstmt.utilityStmt`: The AST payload; utility execution requires an active utility node.
+                    // 3. `qs`: Core Postgres enforces `Assert(queryString != NULL)` in ProcessUtility().
+                    //
+                    // If these assertions fail, investigate third-party extensions or custom backend code
+                    // invoking ProcessUtility / standard_ProcessUtility directly with null pointers.
+                    let pstmt = unsafe { ps.as_ref() }
+                        .expect("ProcessUtility_hook: expected PlannedStmt not null");
+                    unsafe { pstmt.utilityStmt.as_ref() }
+                        .expect("ProcessUtility_hook: expected utilityStmt not null");
+                    assert!(
+                        !qs.is_null(),
+                        "ProcessUtility_hook: expected queryString not null"
+                    );
+
                     let details = unsafe { planned_stmt_offsets(ps, qs) };
                     log_event("ProcessUtility_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_PROCESS_UTILITY } {
@@ -398,6 +448,22 @@ pub extern "C-unwind" fn _PG_init() {
                     dr: *mut pg_sys::DestReceiver,
                     qc: *mut pg_sys::QueryCompletion,
                 ) {
+                    // Invariants guaranteed by PostgreSQL core:
+                    // 1. `ps`: ProcessUtility() always wraps utility statements in a PlannedStmt.
+                    // 2. `pstmt.utilityStmt`: The AST payload; utility execution requires an active utility node.
+                    // 3. `qs`: Core Postgres enforces `Assert(queryString != NULL)` in ProcessUtility().
+                    //
+                    // If any of these assertions fail, investigate third-party extensions or custom backend code
+                    // invoking ProcessUtility / standard_ProcessUtility directly with null pointers.
+                    let pstmt = unsafe { ps.as_ref() }
+                        .expect("ProcessUtility_hook: expected PlannedStmt not null");
+                    unsafe { pstmt.utilityStmt.as_ref() }
+                        .expect("ProcessUtility_hook: expected utilityStmt not null");
+                    assert!(
+                        !qs.is_null(),
+                        "ProcessUtility_hook: expected queryString not null"
+                    );
+
                     let details = unsafe { planned_stmt_offsets(ps, qs) };
                     log_event("ProcessUtility_hook", "start", &details);
                     if let Some(next) = unsafe { HOOK_PROCESS_UTILITY } {

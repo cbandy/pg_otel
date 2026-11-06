@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 
+mod batches;
 mod errors;
 mod nested;
 mod queries;
 mod transactions;
 mod utility;
 
+use postgres::SimpleQueryMessage;
 use prost::Message;
 use std::{thread, time};
 
@@ -42,6 +44,15 @@ impl TracingHarness {
     /// Drains any residual spans from the mock collector and sets `otel.export = 'traces'`.
     fn enable_tracing(&mut self) -> Result<(), postgres::Error> {
         self.enable_telemetry("traces")
+    }
+
+    /// Send one [Query](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY)
+    /// message ('Q') to the backend.
+    ///
+    /// To execute an [Extended Query](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY)
+    /// flow (Parse, Describe, Bind, Execute), use `client.query` instead.
+    fn simple_query(&mut self, query: &str) -> Result<Vec<SimpleQueryMessage>, postgres::Error> {
+        self.client.simple_query(query)
     }
 
     fn collect_logs_until<F>(&self, timeout: time::Duration, mut condition: F) -> Vec<LogRecord>

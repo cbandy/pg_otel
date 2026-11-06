@@ -221,6 +221,28 @@ pub struct SpanContext {
 }
 
 impl SpanContext {
+    /// Derives a child span context from a parent, inheriting the trace ID, trace flags,
+    /// and trace state, while generating a new random span ID.
+    pub fn child_of(parent: &Self) -> Self {
+        Self {
+            span_id: SpanId::random(),
+            trace_id: parent.trace_id,
+            trace_flags: parent.trace_flags,
+            trace_state: parent.trace_state.clone(),
+        }
+    }
+
+    /// Generates a new root trace context with a random trace ID, random span ID,
+    /// and standard random sampled trace flags (`0x03`).
+    pub fn root() -> Self {
+        Self {
+            span_id: SpanId::random(),
+            trace_id: TraceId::random(),
+            trace_flags: TraceFlags::W3C_RANDOM | TraceFlags::W3C_SAMPLED,
+            trace_state: Rc::default(),
+        }
+    }
+
     // Representation defined by W3C Trace Context, Traceparent § 3.2
     pub fn w3c_traceparent(&self) -> String {
         format!(
@@ -384,7 +406,7 @@ impl<'a> CommenterIterator<'a> {
         };
 
         #[inline(always)]
-        fn hex(byte: u8) -> Option<u8> {
+        fn hex(byte: &u8) -> Option<u8> {
             match byte {
                 b'0'..=b'9' => Some(byte - b'0'),
                 b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -396,10 +418,11 @@ impl<'a> CommenterIterator<'a> {
         let mut result = String::with_capacity(encoded.len());
         result.push_str(head);
 
+        #[allow(clippy::get_first)]
         loop {
             if let (Some(hi), Some(lo)) = (
-                tail.bytes().nth(0).and_then(hex),
-                tail.bytes().nth(1).and_then(hex),
+                tail.as_bytes().get(0).and_then(hex),
+                tail.as_bytes().get(1).and_then(hex),
             ) {
                 // Append the decoded value and step past it.
                 result.push(((hi << 4) | lo) as char);
@@ -500,8 +523,8 @@ fn rfind_quote(s: &str, quote: char) -> Option<usize> {
 #[pgrx::pg_schema]
 mod tests {
     #[cfg(test)]
-    use super::{CommenterIterator, Headers, SpanContext, Str, TraceFlags};
-    use super::{SpanId, TraceId};
+    use super::{CommenterIterator, Headers, Str, TraceFlags};
+    use super::{SpanContext, SpanId, TraceId};
     use googletest::prelude::*;
 
     #[test]
@@ -906,6 +929,23 @@ mod tests {
             SpanContext::try_from(Headers::new(&unsampled.w3c_traceparent(), None)),
             ok(eq(&unsampled))
         );
+    }
+
+    #[pgrx::pg_test]
+    fn test_context_root_and_child() {
+        let root = SpanContext::root();
+        assert!(root.span_id.is_valid());
+        assert!(root.trace_id.is_valid());
+        assert!(root.trace_flags.is_random());
+        assert!(root.trace_flags.is_sampled());
+        assert!(root.trace_state.is_empty());
+
+        let child = SpanContext::child_of(&root);
+        assert_that!(child.trace_id, eq(root.trace_id));
+        assert_that!(child.trace_flags, eq(root.trace_flags));
+        assert_that!(&child.trace_state, eq(&root.trace_state));
+        assert_that!(child.span_id, not(eq(root.span_id)));
+        assert!(child.span_id.is_valid());
     }
 
     #[pgrx::pg_test]
