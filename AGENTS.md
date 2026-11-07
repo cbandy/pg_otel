@@ -6,7 +6,7 @@ This is a pgrx extension for emitting telemetry about PostgreSQL at runtime.
 
 - **Workspace Crates**:
   - `pg_otel`: The OpenTelemetry extension.
-  - `sequencing`: Standalone contract-test extension for empirically cataloging PostgreSQL behavior before changing `pg_otel`.
+  - `sequencing`: Standalone contract-test extension for empirically cataloging PostgreSQL behavior before changing `pg_otel`. Retains tests for older PostgreSQL releases for reference, even after they are retired from active CI.
 - **Testing**: Use `cargo pgrx test` (NOT `cargo test`) to run tests.
 - **Workflow**: Test with `cargo pgrx test pg15` for fast iteration; before completing changes that touch hooks, shared memory, or Postgres internals, run `cargo fmt --check`, `cargo clippy --all-targets`, and verify across every `pgXX` feature in the crate's `Cargo.toml`.
 - **PostgreSQL Ground Truth**: Verify hook signatures and Postgres behavior against the C headers and backend source in `${PGRX_HOME:-~/.pgrx}/` (or via `cargo pgrx info path <pgXX>`) rather than assuming single-version behavior generalizes.

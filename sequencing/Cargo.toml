@@ -24,6 +24,8 @@ postgres.workspace = true
 [features]
 default = ["pg15"]
 pg_test = ["dep:googletest", "dep:postgres"]
+# Historical reference: assertions for older engines supported by pgrx (pg13, pg14)
+# are preserved for comparison but are not exercised in CI (which targets actively supported pg_otel versions).
 pg13 = ["pgrx-tests/pg13", "pgrx/pg13"]
 pg14 = ["pgrx-tests/pg14", "pgrx/pg14"]
 pg15 = ["pgrx-tests/pg15", "pgrx/pg15"]
