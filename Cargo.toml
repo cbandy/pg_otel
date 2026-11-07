@@ -8,6 +8,7 @@ members = ["pg_otel", "sequencing"]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
+license = "MIT"
 
 [workspace.dependencies]
 atoi = "3.1"
