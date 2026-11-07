@@ -1,6 +1,6 @@
 # pg_otel
 
-A loadable module for PostgreSQL that exports server log messages
+A loadable module for PostgreSQL that exports telemetry (traces and logs)
 to an OpenTelemetry [collector][].
 
 [collector]: https://docs.opentelemetry.io/concepts/data-collection/
@@ -26,19 +26,19 @@ If your collector is somewhere else, you need to put its URL in `otel.otlp_endpo
 ALTER SYSTEM SET otel.otlp_endpoint TO 'https://my-collector:4318';
 ```
 
-With that in place, the `otel.export` setting starts or stops the flow of logs.
+With that in place, the `otel.export` setting starts or stops the flow of telemetry.
 These settings affect every connection to PostgreSQL, so the server needs to
 [reload][] to finally apply them.
 
 ```sql
-ALTER SYSTEM SET otel.export TO 'logs';
+ALTER SYSTEM SET otel.export TO 'traces, logs';
 SELECT pg_reload_conf();
 ```
 
-You should see logs in your collector and connected logging systems right away.
+You should see traces and logs in your collector and connected observability systems right away.
 Congratulations! 🎉
 
-If you want to stop exporting logs, [reset][] `otel.export` to its empty default.
+If you want to stop exporting telemetry, [reset][] `otel.export` to its empty default.
 
 ```sql
 ALTER SYSTEM RESET otel.export;
@@ -59,7 +59,7 @@ environment. Their respective [environment variables][sdk-env] also work.
 ```
             name            |        default        | unit |                       description
 ----------------------------+-----------------------+------+-----------------------------------------------------------
- otel.export                |                       |      | Signals to export over OTLP
+ otel.export                |                       |      | Signals to export over OTLP (traces, logs)
  otel.otlp_endpoint         | http://localhost:4318 |      | Target URL to which the exporter sends signals
  otel.otlp_timeout          | 10000                 | ms   | Maximum time the exporter will wait for each batch export
  otel.resource_attributes   |                       |      | Key-value pairs to be used as resource attributes
@@ -76,3 +76,30 @@ The following settings cannot be changed at this time:
 ```
 
 [sdk-env]: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables
+
+
+## Development
+
+`pg_otel` is built in Rust using [`pgrx`](https://github.com/pgcentralfoundation/pgrx).
+
+### Testing
+
+Run tests with `cargo pgrx test`:
+
+```bash
+# Test against a specific PostgreSQL version
+cargo pgrx test pg15 -p pg_otel
+cargo pgrx test pg16 -p pg_otel
+
+# Run sequencing hook tests
+cargo pgrx test pg16 -p sequencing
+```
+
+### Running Locally
+
+```bash
+# Launch an interactive psql session with pg_otel preloaded
+cargo pgrx start   pg16 -p pg_otel --postgresql-conf 'shared_preload_libraries=pg_otel'
+cargo pgrx connect pg16 -p pg_otel
+cargo pgrx stop    pg16 -p pg_otel
+```
