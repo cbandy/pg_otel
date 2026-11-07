@@ -1,0 +1,105 @@
+name: Checks
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+  push: { branches: [main] }
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  test:
+    name: test (${{ matrix.runner }}, pg${{ matrix.postgresql }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+
+      # on push to main, run every version on x86 and arm
+      # on PRs, run every version on x86 and one version on arm
+      matrix:
+        event: ["${{ github.event_name }}"]
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+        postgresql: [15, 16, 17, 18, 19]
+        exclude:
+          - { event: pull_request, runner: ubuntu-26.04-arm, postgresql: 15 }
+          - { event: pull_request, runner: ubuntu-26.04-arm, postgresql: 16 }
+          - { event: pull_request, runner: ubuntu-26.04-arm, postgresql: 17 }
+          - { event: pull_request, runner: ubuntu-26.04-arm, postgresql: 18 }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: ./.github/actions/install-cargo-llvm-cov
+
+      - name: Install Postgres ${{ matrix.postgresql }}
+        uses: ./.github/actions/install-postgres
+        with:
+          major-version: ${{ matrix.postgresql }}
+
+      - name: Gather versions
+        id: versions
+        run: |
+          cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "pgrx") | "pgrx=\(.version)"' >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo-pgrx
+        uses: actions/cache@v6
+        id: cache-pgrx
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: cargo-pgrx-${{ runner.arch }}-${{ steps.versions.outputs.pgrx }}
+
+      - name: Install cargo-pgrx
+        if: steps.cache-pgrx.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-pgrx --version '${{ steps.versions.outputs.pgrx }}'
+
+      - name: Initialize pgrx
+        run: cargo pgrx init '--pg${{ matrix.postgresql }}=/usr/lib/postgresql/${{ matrix.postgresql }}/bin/pg_config'
+
+      - name: Run sequencing tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo pgrx test 'pg${{ matrix.postgresql }}' -p sequencing
+
+      - name: Run pg_otel tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo pgrx test 'pg${{ matrix.postgresql }}' -p pg_otel
+
+      - name: Generate code coverage report
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov report --lcov --output-path lcov.info
+          {
+            echo '### Code Coverage (Postgres ${{ matrix.postgresql }} on ${{ runner.arch }})'
+            echo
+            echo '```text'; cargo llvm-cov report; echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Cargo clippy (advisory)
+        run: cargo clippy --workspace --all-targets --no-default-features --features 'pg${{ matrix.postgresql }}'
+        continue-on-error: true

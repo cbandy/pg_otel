@@ -1,0 +1,68 @@
+# https://docs.github.com/en/actions/tutorials/create-actions/create-a-composite-action
+# $schema: https://json.schemastore.org/github-action.json
+
+name: Install Postgres
+description: Install a specific major version of PostgreSQL from the PGDG apt repository
+
+inputs:
+  major-version:
+    required: true
+    description: >
+      The major version of Postgres to install: 16, 17, etc.
+
+outputs:
+  full-version:
+    value: '${{ steps.install.outputs.full-version }}'
+    description: >
+      The full version string reported by `postgres --version`
+
+  major-version:
+    value: '${{ steps.install.outputs.major-version }}'
+    description: >
+      The PostgreSQL major version number that was installed
+
+  version:
+    value: '${{ steps.install.outputs.parsed-version }}'
+    description: >
+      The parsed release version number of PostgreSQL: 16.2, 17.1, etc.
+
+runs:
+  using: composite
+  steps:
+    - name: Update Package Repository
+      shell: bash
+      env:
+        PG_MAJOR: '${{ inputs.major-version }}'
+      run: |
+        key=$(wget -qO- 'https://www.postgresql.org/media/keys/ACCC4CF8.asc')
+
+        sudo tee /etc/apt/sources.list.d/apt.postgresql.org.sources <<-APT
+        Types: deb
+        URIs: https://apt.postgresql.org/pub/repos/apt
+        Suites: $(. /etc/os-release && echo "${VERSION_CODENAME}-pgdg")
+        Components: main ${PG_MAJOR}
+        Signed-By:
+        $(awk '{ printf " " } /^$/ { printf "." } { print $0 }' <<< "${key}")
+        APT
+
+        sudo apt-get update
+
+    - name: Install Postgres
+      shell: bash
+      id: install
+      env:
+        PG_MAJOR: '${{ inputs.major-version }}'
+      run: |
+        sudo apt install --yes postgresql-common
+        sudo tee -a /etc/postgresql-common/createcluster.conf <<< 'create_main_cluster = false'
+
+        sudo apt install --yes "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}"
+        sudo chown -R "$(id -u):$(id -g)" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
+        echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "${GITHUB_PATH}"
+
+        version=$("/usr/lib/postgresql/${PG_MAJOR}/bin/postgres" --version)
+
+        tee -a "${GITHUB_STEP_SUMMARY}" <<< 'Installed `'"${version}"'`'
+        echo "full-version=${version}" >> "${GITHUB_OUTPUT}"
+        echo "major-version=${PG_MAJOR}" >> "${GITHUB_OUTPUT}"
+        awk '{ print "parsed-version=" $3 }' <<< "${version}" >> "${GITHUB_OUTPUT}"

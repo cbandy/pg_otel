@@ -1,0 +1,58 @@
+# https://docs.github.com/en/actions/tutorials/create-actions/create-a-composite-action
+# $schema: https://json.schemastore.org/github-action.json
+
+name: Install cargo-llvm-cov
+description: Download and install cargo-llvm-cov into ~/.cargo/bin
+
+outputs:
+  full-version:
+    value: '${{ steps.install.outputs.full-version }}'
+    description: >
+      The full version string reported by `cargo llvm-cov --version`
+
+  version:
+    value: '${{ steps.install.outputs.parsed-version }}'
+    description: >
+      The semantic version of cargo-llvm-cov
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-llvm-cov
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: '0.9.1'
+        CHECKSUMS: >-
+          {
+            "0.9.1": {
+              "aarch64-unknown-linux-musl": "sha256:49c0085628392a8d727c4464d91ec417c613c5015f5197cd16d5c05aa3fb5ad1",
+               "x86_64-unknown-linux-musl": "sha256:3fca950394a3c49457657c158b1619cec8dfd2647ae5b48746734c0ab969a522"
+            }
+          }
+      run: |
+        case "$(uname -m)" in
+          x86_64) arch="x86_64" ;;
+          aarch64|arm64) arch="aarch64" ;;
+          *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+        esac
+
+        target="${arch}-unknown-linux-musl"
+        archive="cargo-llvm-cov-${target}.tar.gz"
+        project='github.com/taiki-e/cargo-llvm-cov'
+
+        checksum=$(<<< "${CHECKSUMS}" jq -r --arg t "${target}" '
+          .[env.VERSION][$t] // ("Error: no checksum found for version \(env.VERSION) on \($t)" | halt_error(1))
+        ') || exit
+
+        gh release download "v${VERSION}" --repo "${project}" --pattern "${archive}" --dir '/tmp' --clobber
+        echo "${checksum#*:}  /tmp/${archive}" | cksum -a "${checksum%%:*}" -c - || exit
+
+        mkdir -p "${HOME}/.cargo/bin"
+        tar -xzC "${HOME}/.cargo/bin" -f "/tmp/${archive}"
+        chmod +x "${HOME}/.cargo/bin/cargo-llvm-cov"
+
+        version=$(cargo llvm-cov --version) || exit
+        echo "full-version=${version}" >> "${GITHUB_OUTPUT}"
+        awk '{ print "parsed-version=" $NF }' <<< "${version}" >> "${GITHUB_OUTPUT}"
