@@ -11,6 +11,7 @@ This is a pgrx extension for emitting telemetry about PostgreSQL at runtime.
 - **Workflow**: Test with `cargo pgrx test pg15` for fast iteration; before completing changes that touch hooks, shared memory, or Postgres internals, run `cargo fmt --check`, `cargo clippy --all-targets`, and verify across every `pgXX` feature in the crate's `Cargo.toml`.
 - **PostgreSQL Ground Truth**: Verify hook signatures and Postgres behavior against the C headers and backend source in `${PGRX_HOME:-~/.pgrx}/` (or via `cargo pgrx info path <pgXX>`) rather than assuming single-version behavior generalizes.
 - **Version Conditionals**: In `std::cfg_select!`, match older PostgreSQL versions explicitly and place the newest behavior in the `_ =>` catch-all arm.
+- **Boundary Type Adaptation**: Keep internal domain logic free of defensive guards (such as `.max(0)`) by adapting raw PostgreSQL C primitives into semantic Rust types (`u32`, `Option<&CStr>`) directly at the GUC boundary in `pg_otel::config`.
 
 ## Architectural Decision Records (ADRs)
 

@@ -27,3 +27,10 @@ When generating, modifying, or refactoring code for `pg_otel`, you must strictly
 - **Constraint**: The telemetry exporter background worker (`bgworker`) should favor a single-threaded event loop (e.g., single-threaded async executor or non-blocking polling).
 - **Why**: Minimizes memory footprint and avoids process-lifecycle complexities in PostgreSQL's worker model.
 - **Rule**: Only introduce auxiliary threads in the background worker if strictly necessary for foreign library integrations, and never in code paths shared with backend hooks.
+
+## 4. FFI Pointer Safety & Alignment in Hooks
+- **Constraint**: Do not check `ptr.is_aligned()` before `unsafe { ptr.as_ref() }` on typed hook arguments (Postgres guarantees `MAXALIGN` by construction).
+- **Rule**:
+  - **DO**: Use `if let Some(v) = unsafe { ptr.as_ref() }` directly on typed hook arguments.
+  - **DON'T**: Do not add defensive `ptr.is_aligned()` checks on typed C arguments.
+  - **EXCEPTION**: Pointer arithmetic over byte buffers (e.g., `shmem.rs`) MUST enforce or validate alignment.

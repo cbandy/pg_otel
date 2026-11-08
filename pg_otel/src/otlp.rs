@@ -268,10 +268,28 @@ pub mod ext {
         }
     }
 
-    impl LogRecordExt for LogRecord {}
     pub trait LogRecordExt {
         fn build() -> LogRecordBuilder {
             LogRecordBuilder::default()
+        }
+
+        fn time(&mut self, at: time::SystemTime);
+        fn observed_time(&mut self, at: time::SystemTime);
+    }
+
+    impl LogRecordExt for LogRecord {
+        fn time(&mut self, at: time::SystemTime) {
+            self.time_unix_nano = at
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+        }
+
+        fn observed_time(&mut self, at: time::SystemTime) {
+            self.observed_time_unix_nano = at
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
         }
     }
 
@@ -279,8 +297,18 @@ pub mod ext {
     pub struct LogRecordBuilder(LogRecord);
     #[allow(dead_code)]
     impl LogRecordBuilder {
+        pub fn time(mut self, v: time::SystemTime) -> Self {
+            self.0.time(v);
+            self
+        }
+
         pub fn time_unix_nano(mut self, v: u64) -> Self {
             self.0.time_unix_nano = v;
+            self
+        }
+
+        pub fn observed_time(mut self, v: time::SystemTime) -> Self {
+            self.0.observed_time(v);
             self
         }
 
@@ -656,6 +684,22 @@ mod tests {
             record.body.unwrap().value,
             Some(Value::StringValue("test log message".to_string()))
         );
+    }
+
+    #[test]
+    fn test_log_record_builder_times() {
+        let t1 = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_890);
+        let t2 = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(2_345_678_901);
+
+        let record = LogRecord::build().time(t1).observed_time(t2).finish();
+        assert_eq!(record.time_unix_nano, 1_234_567_890);
+        assert_eq!(record.observed_time_unix_nano, 2_345_678_901);
+
+        let mut record2 = LogRecord::build().finish();
+        record2.time(t1);
+        record2.observed_time(t2);
+        assert_eq!(record2.time_unix_nano, 1_234_567_890);
+        assert_eq!(record2.observed_time_unix_nano, 2_345_678_901);
     }
 
     #[test]

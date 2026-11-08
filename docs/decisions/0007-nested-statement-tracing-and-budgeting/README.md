@@ -123,12 +123,12 @@ The active statement tracking replaces the single-slot `ACTIVE_STATEMENT_SPAN` w
 struct ActiveStatement {
     span: Span,
     depth: usize,
-    scope_budget: Cell<i32>,
+    scope_budget: Cell<u32>,
 }
 
 thread_local! {
     static SPAN_STACK: RefCell<Vec<ActiveStatement>> = const { RefCell::new(Vec::new()) };
-    static REMAINING_BUDGET: Cell<i32> = const { Cell::new(0) };
+    static REMAINING_BUDGET: Cell<u32> = const { Cell::new(0) };
     static DROPPED_NESTED_STATEMENTS: Cell<usize> = const { Cell::new(0) };
 }
 ```

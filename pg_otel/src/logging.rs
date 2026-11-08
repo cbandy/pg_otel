@@ -1,104 +1,16 @@
 // SPDX-License-Identifier: MIT
 
-use crate::PG_OTEL_LIBRARY;
 use pgrx::pg_sys;
 use std::{ffi, time};
 
-pub fn install_hooks() {
-    debug_assert!(crate::assert_postmaster_startup());
-
-    /// All logging in Postgres is done through the `ereport` macro that
-    /// (1) populates an `ErrorData` struct,
-    /// (2) passes it to `emit_log_hook`, then
-    /// (3) sends it to the logging collector or stderr.
-    ///
-    /// NOTE: The hook is **not** called when the `output_to_server` field is false.
-    /// NOTE: The hook may **not** change the contents of `ErrorData` **except** to change `output_to_server` to false.
-    ///
-    /// - https://doxygen.postgresql.org/structErrorData.html
-    /// - https://doxygen.postgresql.org/elog_8c.html
-    ///
-    /// # Safety
-    ///
-    /// This variable is assigned during Postmaster startup and inherited by every child process.
-    static mut HOOK_EMIT_LOG: pg_sys::emit_log_hook_type = None;
-    unsafe {
-        HOOK_EMIT_LOG = pg_sys::emit_log_hook;
-        pg_sys::emit_log_hook = Some(emit_log_hook);
-    }
-
-    /// Called by Postgres when a log message is not suppressed by GUC `log_min_messages`.
-    ///
-    /// - https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-MIN-MESSAGES
-    ///
-    /// # Safety
-    ///
-    /// This is called by Postgres (from C into Rust) and *MUST* have the [`pgrx::pg_guard`] attribute.
-    #[pgrx::pg_guard]
-    unsafe extern "C-unwind" fn emit_log_hook(edata: *mut pg_sys::ErrorData) {
-        use pgrx::bgworkers::BackgroundWorker;
-
-        // SAFETY: It is safe to read this variable because this hook is called by Postgres.
-        let worker = unsafe { !pg_sys::MyBgworkerEntry.is_null() };
-        let exporter = worker && BackgroundWorker::get_extra() == "E";
-        if !exporter
-            && edata.is_aligned()
-            && let Some(record) = unsafe { edata.as_ref() }
-            && record.elevel >= pg_sys::PGERROR as i32
-            && record.sqlerrcode != 0
-        {
-            let state = unsafe { pg_sys::unpack_sql_state(record.sqlerrcode) };
-            if let Ok(state_str) = unsafe { ffi::CStr::from_ptr(state).to_str() } {
-                let query = unsafe {
-                    if !pg_sys::debug_query_string.is_null() {
-                        ffi::CStr::from_ptr(pg_sys::debug_query_string)
-                            .to_str()
-                            .ok()
-                    } else {
-                        None
-                    }
-                };
-                crate::tracing::record_error(state_str, query);
-            }
-        }
-
-        // Export log messages when configured to do so. Sending messages *from* the exporter *to* the
-        // exporter could cause a feedback loop, so don't do that. These messages still go to the next
-        // log processor which is usually Postgres' built-in logging collector or stderr.
-        if exporter || !crate::ENABLED.get().logs() {
-            return call_remaining_hooks(edata);
-        }
-
-        // Get the current time before calling other hooks.
-        let now = time::SystemTime::now();
-
-        // Call other hooks so they can manipulate edata before we record it.
-        call_remaining_hooks(edata);
-
-        // Gather context and send the log message to the background worker.
-        // When logging breaks down, print to STDERR as a last resort.
-        if edata.is_aligned()
-            && let Some(record) = unsafe { edata.as_ref() }
-            && record.output_to_server
-            && let Err(error) = export_log_record(&now, &record)
-        {
-            eprintln!("{PG_OTEL_LIBRARY}: unable to move log internally: {error}");
-        }
-
-        // SAFETY: HOOK_EMIT_LOG is assigned above, during startup; it is safe to read here.
-        // SAFETY: pg_guard_ffi_boundary handles any Postgres error that occurs inside the next hook.
-        fn call_remaining_hooks(edata: *mut pg_sys::ErrorData) {
-            if let Some(next) = unsafe { HOOK_EMIT_LOG } {
-                unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(edata)) };
-            }
-        }
-    }
-}
-
 /// Combines timestamp, edata, and Postgres process metadata into an OTLP LogsData payload
 /// and pushes it into the shared memory queue.
-fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) -> eyre::Result<()> {
+pub(crate) fn emit_log(timestamp: time::SystemTime, edata: &pg_sys::ErrorData) -> eyre::Result<()> {
     use crate::otlp::*;
+
+    if !edata.output_to_server {
+        return Ok(());
+    }
 
     // TODO: let encoding = unsafe { pg_sys::GetMessageEncoding() };
 
@@ -234,12 +146,7 @@ fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) ->
     let mut record = LogRecord::build()
         .attributes(attributes.finish().values)
         .body(new_str_unchecked(edata.message))
-        .time_unix_nano(
-            timestamp
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
-        );
+        .time(timestamp);
 
     if let Some((t, n)) = severity {
         record = record.severity_number(n).severity_text(t);
@@ -254,7 +161,8 @@ fn export_log_record(timestamp: &time::SystemTime, edata: &pg_sys::ErrorData) ->
 
     let mut buffer = crate::BytesMut::new();
     prost::Message::encode(&record.finish(), &mut buffer)?;
-    Ok(crate::exporter::send_one(&buffer))
+    crate::exporter::send_one(&buffer);
+    Ok(())
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -270,8 +178,8 @@ mod tests {
         crate::acquire_test_lock();
 
         // setup: clear the mock collector
-        let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
-        reqwest::blocking::get(&endpoint).unwrap();
+        let endpoint = crate::config::otlp_endpoint().join("/test/logs").unwrap();
+        reqwest::blocking::get(endpoint.clone()).unwrap();
 
         pgrx::Spi::run("SET LOCAL otel.export = 'logs'").unwrap();
         pgrx::warning!("integration test log record message");
@@ -284,8 +192,11 @@ mod tests {
         while !done && start.elapsed() < time::Duration::from_secs(1) {
             thread::sleep(time::Duration::from_millis(50));
 
-            let body = reqwest::blocking::get(&endpoint).unwrap().bytes().unwrap();
-            done = body.len() == 0 && data.len() > 0;
+            let body = reqwest::blocking::get(endpoint.clone())
+                .unwrap()
+                .bytes()
+                .unwrap();
+            done = body.is_empty() && !data.is_empty();
             data.extend(LogsData::decode(body).unwrap().resource_logs);
         }
 
