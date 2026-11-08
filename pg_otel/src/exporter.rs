@@ -1,141 +1,33 @@
 // SPDX-License-Identifier: MIT
 
-mod config;
-
 use crate::shmem::{Queue, QueueSharedMemory};
-use crate::{GucInt32, GucString};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
-use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use pgrx::pg_sys;
-use std::{ffi, time};
-use url::Url as URL;
+use std::time;
 
-static GUC_BATCH_MAX_DELAY_MS: GucInt32 = GucInt32::new(1000);
-static GUC_BATCH_MAX_ITEMS: GucInt32 = GucInt32::new(512);
-static GUC_COMPRESSION: GucString = GucString::new(Some(c"none"));
-static GUC_ENDPOINT: GucString = GucString::new(Some(c"http://localhost:4318"));
-static GUC_HEADERS: GucString = GucString::new(None);
-static GUC_PROTOCOL: GucString = GucString::new(Some(c"http/protobuf"));
-static GUC_TIMEOUT_MS: GucInt32 = GucInt32::new(10000);
-
-// IPC queue in shared memory.
+// IPC queue in shared memory. Other backends will produce telemetry to be consumed by the
+// background worker.
 static QUEUE: QueueSharedMemory = QueueSharedMemory::new(c"pg_otel_exporter_queue", || {
     1024 * 1024 // TODO: make configurable, PGC_POSTMASTER
 });
 
-pub fn define_guc_variables() {
-    use pgrx::guc::{GucCheckError, GucContext, GucFlags, GucRegistry};
-
-    // SAFETY: GUC hooks must have `#[pgrx::pg_guard]` or `#[pgrx::pg_guc_hook]`.
-    unsafe {
-        GucRegistry::define_string_guc_with_hooks(
-            c"otel.otlp_endpoint",
-            c"Base OTLP collector endpoint URL",
-            c"Base URL of an OpenTelemetry collector.",
-            &GUC_ENDPOINT,
-            GucContext::Sighup, // server reload
-            GucFlags::empty(),  // none
-            Some(check_endpoint),
-            None,
-            None,
-        );
-
-        #[pgrx::pg_guc_hook(check)]
-        fn check_endpoint(value: Option<ffi::CString>) -> Result<(), GucCheckError> {
-            eyre::OptionExt::ok_or_eyre(value.as_deref(), "required")
-                .and_then(config::Endpoint::validate)
-                .map_err(|e| GucCheckError::new(e.to_string()))
-        }
-    }
-
-    // SAFETY: GUC hooks must have `#[pgrx::pg_guard]` or `#[pgrx::pg_guc_hook]`.
-    unsafe {
-        GucRegistry::define_string_guc_with_hooks(
-            c"otel.otlp_headers",
-            c"OTLP headers for all signals (superuser only)",
-            c"Headers sent with OTLP export requests. May contain sensitive credentials. Restricted to superusers.",
-            &GUC_HEADERS,
-            GucContext::Sighup, // server reload
-            GucFlags::SUPERUSER_ONLY,
-            Some(check_headers),
-            None,
-            None,
-        );
-
-        #[pgrx::pg_guc_hook(check)]
-        fn check_headers(value: Option<ffi::CString>) -> Result<(), GucCheckError> {
-            if let Some(value) = value {
-                config::Headers::validate(&value).map_err(|e| GucCheckError::new(e.to_string()))?;
-            }
-            Ok(())
-        }
-    }
-
-    GucRegistry::define_string_guc(
-        c"otel.otlp_protocol",
-        c"OTLP transport protocol",
-        c"Exporter protocol (http/protobuf or http/json).",
-        &GUC_PROTOCOL,
-        GucContext::Sighup, // server reload
-        GucFlags::empty(),  // none
-    );
-
-    GucRegistry::define_int_guc(
-        c"otel.otlp_batch_max_items",
-        c"Max items per OTLP export batch",
-        c"Maximum number of logs or spans exported in a single OTLP batch.",
-        &GUC_BATCH_MAX_ITEMS,
-        1,
-        i32::MAX / 4,
-        GucContext::Sighup, // server reload
-        GucFlags::empty(),  // none
-    );
-    GucRegistry::define_int_guc(
-        c"otel.otlp_batch_max_delay",
-        c"Max wait time before exporting a batch",
-        c"Maximum duration (in milliseconds) the exporter waits before flushing.",
-        &GUC_BATCH_MAX_DELAY_MS,
-        0,
-        time::Duration::from_hours(1).as_millis() as i32,
-        GucContext::Sighup, // server reload
-        GucFlags::UNIT_MS,
-    );
-    GucRegistry::define_int_guc(
-        c"otel.otlp_timeout",
-        c"Send timeout",
-        c"Request timeout duration in milliseconds.",
-        &GUC_TIMEOUT_MS,
-        1,
-        i32::MAX,
-        GucContext::Sighup, // server reload
-        GucFlags::UNIT_MS,
-    );
-    GucRegistry::define_string_guc(
-        c"otel.otlp_compression",
-        c"HTTP payload compression",
-        c"Payload compression algorithm (none, gzip, or zstd).",
-        &GUC_COMPRESSION,
-        GucContext::Sighup, // server reload
-        GucFlags::empty(),  // none
-    );
-}
-
-pub fn install_hooks() {
+pub fn initialize_worker() {
     debug_assert!(crate::assert_postmaster_startup());
 
+    // TODO: remove this lint after pgrx-0.20
+    #[allow(unexpected_cfgs)]
+    {
+        pgrx::pg_shmem_init!(QUEUE);
+    }
+
     // Set the "extra" value so hooks know when they are running inside this worker.
-    BackgroundWorkerBuilder::new("OpenTelemetry exporter")
-        .set_start_time(BgWorkerStartTime::PostmasterStart)
+    pgrx::bgworkers::BackgroundWorkerBuilder::new("OpenTelemetry exporter")
+        .set_start_time(pgrx::bgworkers::BgWorkerStartTime::PostmasterStart)
         .set_restart_time(Some(time::Duration::from_secs(1)))
         .set_function("exporter_main")
         .set_library(crate::PG_OTEL_LIBRARY)
         .set_extra("E")
         .load();
-
-    #[allow(unexpected_cfgs)]
-    {
-        pgrx::pg_shmem_init!(QUEUE);
-    }
 }
 
 pub fn send(data: &crate::BytesMut, notify: bool) {
@@ -200,8 +92,8 @@ fn export_batch(batch: &[Vec<u8>]) {
 }
 
 fn export_otlp(path: &str, content: &str, body: Vec<u8>) {
-    let endpoint = config::Endpoint::from(&GUC_ENDPOINT).unwrap();
-    let timeout = time::Duration::from_millis(GUC_TIMEOUT_MS.get().max(1) as u64);
+    let endpoint = crate::config::otlp_endpoint();
+    let timeout = crate::config::otlp_timeout();
 
     let mut request = match reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -213,7 +105,7 @@ fn export_otlp(path: &str, content: &str, body: Vec<u8>) {
         }
     };
 
-    for (k, v) in config::Headers::from(&GUC_HEADERS) {
+    for (k, v) in crate::config::otlp_headers() {
         request = request.header(k, v);
     }
 
@@ -227,7 +119,7 @@ fn export_otlp(path: &str, content: &str, body: Vec<u8>) {
     if let status = response.status()
         && !status.is_success()
     {
-        return pgrx::warning!("pg_otel: export HTTP {path} failed with status: {status}");
+        pgrx::warning!("pg_otel: export HTTP {path} failed with status: {status}");
     }
 }
 
@@ -241,7 +133,7 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     pgrx::log!("{} is starting", BackgroundWorker::get_name());
 
     let mut batch = Vec::new();
-    let mut limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
+    let mut limit = crate::config::otlp_batch_max_items();
     QUEUE.set_latch(unsafe { pg_sys::MyLatch });
 
     let mut shutdown_deadline: Option<time::Instant> = None;
@@ -256,7 +148,7 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
             unsafe { pg_sys::ConfigReloadPending = 0 };
             unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
 
-            limit = GUC_BATCH_MAX_ITEMS.get().max(1) as usize;
+            limit = crate::config::otlp_batch_max_items();
         }
 
         while let Some(data) = QUEUE.pop() {
@@ -289,11 +181,11 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
                 break;
             }
 
-            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+            crate::config::otlp_batch_max_delay()
                 .min(deadline.saturating_duration_since(now))
                 .min(time::Duration::from_millis(100))
         } else {
-            time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
+            crate::config::otlp_batch_max_delay()
         };
 
         // Sleep until (1) `next_wait` elapses, (2) the latch is set by a `QUEUE` producer, or (3)
@@ -317,16 +209,6 @@ pub extern "C-unwind" fn exporter_main(_arg: pg_sys::Datum) {
     }
 
     pgrx::log!("{} stopped", BackgroundWorker::get_name());
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-pub fn endpoint() -> String {
-    GUC_ENDPOINT
-        .get()
-        .as_deref()
-        .map(ffi::CStr::to_string_lossy)
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[cfg(test)]

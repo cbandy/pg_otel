@@ -8,32 +8,36 @@ This document provides a comprehensive catalog of all hooks and callback registr
 
 Unlike callback registries that maintain a linked list of subscribers, most PostgreSQL hooks are exposed as mutable global function pointers.
 
-To allow multiple extensions to coexist without overwriting each other, extensions **must** follow the standard chaining pattern:
+To allow multiple extensions to coexist without overwriting each other, extensions **must** follow the standard chaining pattern.
+In Rust `pgrx`, hooks must also account for FFI safety and longjmp exception boundaries:
 
-```c
-/* Static variable to preserve previously installed hook */
-static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
+```rust
+static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 
-static void
-my_ExecutorStart_hook(QueryDesc *queryDesc, int eflags)
-{
-    /* 1. Pre-execution telemetry */
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn my_executor_start_hook(qd: *mut pg_sys::QueryDesc, ef: i32) {
+    // 1. Pre-execution telemetry: safely convert typed pointer
+    if let Some(query) = unsafe { qd.as_ref() } {
+        // ...
+    }
 
-    /* 2. Chain to previous hook if present; otherwise call standard fallback */
-    if (prev_ExecutorStart_hook)
-        prev_ExecutorStart_hook(queryDesc, eflags);
-    else
-        standard_ExecutorStart(queryDesc, eflags);
+    // 2. Chain to previous hook if present; otherwise call standard fallback.
+    // Wrap the call in `pg_guard_ffi_boundary` to handle any Postgres longjmps safely.
+    if let Some(next) = unsafe { PREV_EXECUTOR_START } {
+        unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(qd, ef)) };
+    } else {
+        unsafe { pg_sys::standard_ExecutorStart(qd, ef) };
+    }
 
-    /* 3. Post-execution telemetry */
+    // 3. Post-execution telemetry
 }
 
-void
-_PG_init(void)
-{
-    /* Save existing hook and install our custom hook */
-    prev_ExecutorStart_hook = ExecutorStart_hook;
-    ExecutorStart_hook = my_ExecutorStart_hook;
+pub fn install_hooks() {
+    unsafe {
+        // Save existing hook and install our custom hook
+        PREV_EXECUTOR_START = pg_sys::ExecutorStart_hook;
+        pg_sys::ExecutorStart_hook = Some(my_executor_start_hook);
+    }
 }
 ```
 

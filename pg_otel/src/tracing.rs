@@ -2,16 +2,13 @@
 
 use crate::context::{Headers, SpanContext};
 use crate::otlp::*;
-use crate::{GucInt32, GucString};
 use core::cell::{Cell, RefCell};
 use core::ptr;
 use pgrx::pg_sys::{self, PgNode};
 use std::{ffi, time};
 
-static GUC_MAX_NESTED_STATEMENTS: GucInt32 = GucInt32::new(50);
-static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
-static GUC_TRACEPARENT: GucString = GucString::new(None);
-static GUC_TRACESTATE: GucString = GucString::new(None);
+#[cfg(any(test, feature = "pg_test"))]
+mod tests;
 
 thread_local! {
     /// Tracks the starting byte offset of the unparsed remainder in a multi-statement simple query batch.
@@ -89,12 +86,12 @@ struct StatementSpan {
     span: Span,
     context: SpanContext,
     depth: usize,
-    scope_budget: Cell<i32>,
+    scope_budget: Cell<u32>,
     dropped_children: Cell<usize>,
 }
 
 impl StatementSpan {
-    fn new(span: Span, context: SpanContext, depth: usize, scope_budget: i32) -> Self {
+    fn new(span: Span, context: SpanContext, depth: usize, scope_budget: u32) -> Self {
         Self {
             span,
             context,
@@ -155,10 +152,8 @@ impl StatementSpan {
         if depth == 1 {
             TransactionSpan::start(None, now);
 
-            let initial_budget = GUC_TRACE_NESTED_STATEMENTS
-                .get()
-                .min(GUC_MAX_NESTED_STATEMENTS.get())
-                .max(0);
+            let initial_budget = crate::config::nested_statements_request()
+                .min(crate::config::nested_statements_max());
             REMAINING_BUDGET.set(initial_budget);
 
             let (context, builder) = Self::derive_context(pstmt, sql);
@@ -181,8 +176,8 @@ impl StatementSpan {
                 if let Some(parent) = stack.last()
                     && parent.scope_budget.get() > 0
                     && REMAINING_BUDGET.get() > 0
-                    && GUC_TRACE_NESTED_STATEMENTS.get() > 0
-                    && GUC_MAX_NESTED_STATEMENTS.get() > 0
+                    && crate::config::nested_statements_request() > 0
+                    && crate::config::nested_statements_max() > 0
                 {
                     parent.scope_budget.set(parent.scope_budget.get() - 1);
                     REMAINING_BUDGET.set(REMAINING_BUDGET.get() - 1);
@@ -191,8 +186,7 @@ impl StatementSpan {
                         .scope_budget
                         .get()
                         .min(REMAINING_BUDGET.get())
-                        .min(GUC_TRACE_NESTED_STATEMENTS.get())
-                        .max(0);
+                        .min(crate::config::nested_statements_request());
 
                     parent
                         .scope_budget
@@ -413,7 +407,7 @@ impl TransactionSpan {
             return ctx.clone();
         }
 
-        let ctx = if let Some(incoming) = take_guc_context() {
+        let ctx = if let Some(incoming) = crate::config::take_trace_context() {
             self.span.parent_span_id = incoming.span_id.into();
             SpanContext::child_of(&incoming)
         } else {
@@ -442,9 +436,12 @@ struct ErrorRecord {
 
 thread_local! {
     static EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static IN_GUC_UPDATE: Cell<bool> = const { Cell::new(false) };
-    static REMAINING_BUDGET: Cell<i32> = const { Cell::new(0) };
+    static REMAINING_BUDGET: Cell<u32> = const { Cell::new(0) };
     static LAST_ERROR: RefCell<Option<ErrorRecord>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn execution_depth() -> usize {
+    EXECUTION_DEPTH.get()
 }
 
 pub(crate) fn current_span_context() -> Option<SpanContext> {
@@ -455,173 +452,35 @@ pub(crate) fn current_span_context() -> Option<SpanContext> {
         })
 }
 
-pub(crate) fn record_error(sqlstate: &str, query: Option<&str>) {
-    LAST_ERROR.set(Some(ErrorRecord {
-        sqlstate: sqlstate.to_string(),
-        query: query.map(|s| s.to_string()),
-    }));
-}
+/// Called from [`pg_sys::emit_log_hook`] when tracing is enabled.
+pub(crate) fn emit_log(record: &pg_sys::ErrorData) {
+    use pg_sys::errcodes::PgSqlErrorCode;
 
-pub fn define_guc_variables() {
-    use pgrx::guc::{GucContext, GucFlags, GucRegistry};
-
-    GucRegistry::define_int_guc(
-        c"otel.max_nested_statements",
-        c"Maximum nested statement span limit",
-        c"Maximum number of nested statement spans that may be emitted across a statement.",
-        &GUC_MAX_NESTED_STATEMENTS,
-        0,
-        i32::MAX / 4,
-        GucContext::Suset,
-        GucFlags::empty(),
-    );
-
-    GucRegistry::define_int_guc(
-        c"otel.trace_nested_statements",
-        c"Requested nested statement span budget",
-        c"Requested number of nested statement spans to emit for procedures and triggers.",
-        &GUC_TRACE_NESTED_STATEMENTS,
-        0,
-        i32::MAX / 4,
-        GucContext::Userset,
-        GucFlags::empty(),
-    );
-
-    unsafe {
-        GucRegistry::define_string_guc_with_hooks(
-            c"otel.traceparent",
-            c"W3C traceparent context",
-            c"W3C traceparent header for distributed tracing context propagation.",
-            &GUC_TRACEPARENT,
-            GucContext::Userset,
-            GucFlags::empty(),
-            Some(check_traceparent),
-            None,
-            None,
-        );
-
-        GucRegistry::define_string_guc_with_hooks(
-            c"otel.tracestate",
-            c"W3C tracestate context",
-            c"W3C tracestate header for distributed tracing context propagation.",
-            &GUC_TRACESTATE,
-            GucContext::Userset,
-            GucFlags::empty(),
-            Some(check_tracestate),
-            None,
-            None,
-        );
-    }
-}
-
-#[pgrx::pg_guc_hook(check)]
-fn check_traceparent(
-    value: Option<ffi::CString>,
-    source: pg_sys::GucSource::Type,
-) -> Result<(), pgrx::guc::GucCheckError> {
-    let Some(v) = value else { return Ok(()) };
-    let s = v
-        .to_str()
-        .map_err(|e| pgrx::guc::GucCheckError::new(e.to_string()))?;
-
-    if !s.is_empty() {
-        if !IN_GUC_UPDATE.get() {
-            if source == pg_sys::GucSource::PGC_S_TEST {
-                return Err(pgrx::guc::GucCheckError::new(
-                    "otel.traceparent cannot be persisted",
-                ));
-            }
-            if EXECUTION_DEPTH.get() > 1 {
-                return Err(pgrx::guc::GucCheckError::new(
-                    "cannot set otel.traceparent inside a nested statement",
-                ));
-            }
-        }
-        let headers = Headers::new(s, None);
-        SpanContext::try_from(headers)
-            .map_err(|_| pgrx::guc::GucCheckError::new("invalid traceparent format"))?;
-    }
-    Ok(())
-}
-
-#[pgrx::pg_guc_hook(check)]
-fn check_tracestate(
-    value: Option<ffi::CString>,
-    source: pg_sys::GucSource::Type,
-) -> Result<(), pgrx::guc::GucCheckError> {
-    let Some(v) = value else { return Ok(()) };
-    let s = v
-        .to_str()
-        .map_err(|e| pgrx::guc::GucCheckError::new(e.to_string()))?;
-
-    if !s.is_empty() && !IN_GUC_UPDATE.get() {
-        if source == pg_sys::GucSource::PGC_S_TEST {
-            return Err(pgrx::guc::GucCheckError::new(
-                "otel.tracestate cannot be persisted",
-            ));
-        }
-        if EXECUTION_DEPTH.get() > 1 {
-            return Err(pgrx::guc::GucCheckError::new(
-                "cannot set otel.tracestate inside a nested statement",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn guc_cstr(guc: &GucString) -> Option<&ffi::CStr> {
-    unsafe {
-        let v = *guc.as_ptr();
-        if v.is_null() || *v == 0 {
-            None
-        } else {
-            Some(ffi::CStr::from_ptr(v))
-        }
-    }
-}
-
-/// Reads W3C trace context from `otel.traceparent` and `otel.tracestate` GUCs without clearing them.
-///
-/// Used primarily by parallel query workers, where GUC state is restored by PostgreSQL from the
-/// leader backend.
-fn read_guc_context() -> Option<SpanContext> {
-    let tp_str = guc_cstr(&GUC_TRACEPARENT)?.to_str().ok()?;
-    let ts_str = guc_cstr(&GUC_TRACESTATE).and_then(|s| s.to_str().ok());
-    let headers = Headers::new(tp_str, ts_str);
-    SpanContext::try_from(headers).ok()
-}
-
-/// Clears the `otel.traceparent` and `otel.tracestate` GUC parameters in session state.
-fn clear_guc_context() {
-    IN_GUC_UPDATE.set(true);
-    unsafe {
-        pg_sys::SetConfigOption(
-            c"otel.traceparent".as_ptr(),
-            c"".as_ptr(),
-            pg_sys::GucContext::PGC_USERSET,
-            pg_sys::GucSource::PGC_S_SESSION,
-        );
-        pg_sys::SetConfigOption(
-            c"otel.tracestate".as_ptr(),
-            c"".as_ptr(),
-            pg_sys::GucContext::PGC_USERSET,
-            pg_sys::GucSource::PGC_S_SESSION,
-        );
-    }
-    IN_GUC_UPDATE.set(false);
-}
-
-/// Reads W3C trace context from session GUCs and resets them to empty strings.
-///
-/// GUC trace context is single-use and cleared immediately to prevent session pollution
-/// across pooled connections.
-fn take_guc_context() -> Option<SpanContext> {
-    let ctx = read_guc_context();
-    if ctx.is_some() || guc_cstr(&GUC_TRACEPARENT).is_some() || guc_cstr(&GUC_TRACESTATE).is_some()
+    // Capture errors that abort execution (ERROR, FATAL, PANIC) and carry a valid SQLSTATE.
+    // This information is needed later, when Postgres calls transaction abort callbacks.
+    if record.elevel < pg_sys::PGERROR as i32
+        || record.sqlerrcode == PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION as i32
     {
-        clear_guc_context();
+        return;
     }
-    ctx
+
+    // `unpack_sql_state` returns a pointer to a static buffer; make a copy here.
+    let unpacked = unsafe { pg_sys::unpack_sql_state(record.sqlerrcode) };
+    let Ok(sqlstate) = (unsafe { ffi::CStr::from_ptr(unpacked) })
+        .to_str()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+
+    // Make a copy of `debug_query_string` when present.
+    let query = unsafe { pg_sys::debug_query_string };
+    let query = (!query.is_null())
+        .then(|| unsafe { ffi::CStr::from_ptr(query).to_str().ok() })
+        .flatten()
+        .map(str::to_owned);
+
+    LAST_ERROR.set(Some(ErrorRecord { sqlstate, query }));
 }
 
 /// Extracts incoming trace context for a statement, preferring SQL comments over session GUCs.
@@ -630,7 +489,7 @@ fn take_statement_context(
     sql: Option<&str>,
 ) -> Option<SpanContext> {
     // Consume and clear any pending session context GUCs.
-    let guc_ctx = take_guc_context();
+    let guc_ctx = crate::config::take_trace_context();
 
     let comment_ctx = sql
         .and_then(|s| {
@@ -740,144 +599,15 @@ fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) ->
     "UNKNOWN".to_string()
 }
 
-pub fn install_hooks() {
-    debug_assert!(crate::assert_postmaster_startup());
-
-    static mut HOOK_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
-    unsafe {
-        HOOK_PROCESS_UTILITY = pg_sys::ProcessUtility_hook;
-        pg_sys::ProcessUtility_hook = Some(process_utility_hook);
-    }
-
-    #[pgrx::pg_guard]
-    #[allow(clippy::too_many_arguments)]
-    unsafe extern "C-unwind" fn process_utility_hook(
-        ps: *mut pg_sys::PlannedStmt,
-        qs: *const ffi::c_char,
-        ro: bool,
-        pc: pg_sys::ProcessUtilityContext::Type,
-        pl: pg_sys::ParamListInfo,
-        qe: *mut pg_sys::QueryEnvironment,
-        dr: *mut pg_sys::DestReceiver,
-        qc: *mut pg_sys::QueryCompletion,
-    ) {
-        // SAFETY: HOOK_PROCESS_UTILITY is assigned above, during startup; it is safe to read here.
-        // SAFETY: pg_guard_ffi_boundary handles any Postgres error that occurs inside the next hook.
-        let call_remaining_hooks = || unsafe {
-            if let Some(next) = HOOK_PROCESS_UTILITY {
-                pg_sys::ffi::pg_guard_ffi_boundary(|| next(ps, qs, ro, pc, pl, qe, dr, qc));
-            } else {
-                pg_sys::standard_ProcessUtility(ps, qs, ro, pc, pl, qe, dr, qc);
-            }
-        };
-
-        if crate::ENABLED.get().spans()
-            && let Some(pstmt) = unsafe { ps.as_ref() }
-            && let Some(tree) = unsafe { pstmt.utilityStmt.as_ref() }
-        {
-            let sql = (!qs.is_null())
-                .then(|| unsafe { ffi::CStr::from_ptr(qs).to_str().ok() })
-                .flatten();
-            process_utility(pstmt, tree, sql, call_remaining_hooks);
-        } else {
-            call_remaining_hooks();
-        }
-    }
-
-    unsafe { pg_sys::RegisterXactCallback(Some(xact_callback), ptr::null_mut()) };
-    unsafe { pg_sys::RegisterSubXactCallback(Some(subxact_callback), ptr::null_mut()) };
-
-    #[pgrx::pg_guard]
-    unsafe extern "C-unwind" fn xact_callback(
-        event: pg_sys::XactEvent::Type,
-        _arg: pgrx::void_mut_ptr,
-    ) {
-        use pg_sys::XactEvent::*;
-        match event {
-            XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => transaction_abort(),
-            XACT_EVENT_COMMIT => transaction_commit(),
-            _ => (),
-        }
-    }
-
-    #[pgrx::pg_guard]
-    unsafe extern "C-unwind" fn subxact_callback(
-        event: pg_sys::SubXactEvent::Type,
-        _my_sub_id: pg_sys::SubTransactionId,
-        _parent_sub_id: pg_sys::SubTransactionId,
-        _arg: pgrx::void_mut_ptr,
-    ) {
-        use pg_sys::SubXactEvent::*;
-        if event == SUBXACT_EVENT_ABORT_SUB {
-            subxact_abort();
-        }
-    }
-
-    static mut HOOK_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
-    unsafe {
-        HOOK_EXECUTOR_START = pg_sys::ExecutorStart_hook;
-        pg_sys::ExecutorStart_hook = Some(executor_start_hook);
-    }
-
-    #[pgrx::pg_guard]
-    unsafe extern "C-unwind" fn executor_start_hook(qd: *mut pg_sys::QueryDesc, ef: i32) {
-        if crate::ENABLED.get().spans()
-            && let Some(query) = unsafe { qd.as_ref() }
-            && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
-        {
-            executor_start(
-                pstmt,
-                (!query.sourceText.is_null())
-                    .then(|| unsafe { ffi::CStr::from_ptr(query.sourceText).to_str().ok() })
-                    .flatten(),
-            );
-        }
-
-        // SAFETY: HOOK_EXECUTOR_START is assigned above, during startup; it is safe to read here.
-        // SAFETY: pg_guard_ffi_boundary handles any Postgres error that occurs inside the next hook.
-        if let Some(next) = unsafe { HOOK_EXECUTOR_START } {
-            unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(qd, ef)) };
-        } else {
-            unsafe { pg_sys::standard_ExecutorStart(qd, ef) };
-        }
-    }
-
-    static mut HOOK_EXECUTOR_END: pg_sys::ExecutorEnd_hook_type = None;
-    unsafe {
-        HOOK_EXECUTOR_END = pg_sys::ExecutorEnd_hook;
-        pg_sys::ExecutorEnd_hook = Some(executor_end_hook);
-    }
-
-    #[pgrx::pg_guard]
-    unsafe extern "C-unwind" fn executor_end_hook(qd: *mut pg_sys::QueryDesc) {
-        if let Some(next) = unsafe { HOOK_EXECUTOR_END } {
-            unsafe { pg_sys::ffi::pg_guard_ffi_boundary(|| next(qd)) };
-        } else {
-            unsafe { pg_sys::standard_ExecutorEnd(qd) };
-        }
-
-        if crate::ENABLED.get().spans()
-            && let Some(query) = unsafe { qd.as_ref() }
-            && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
-        {
-            executor_end(
-                pstmt,
-                (!query.sourceText.is_null())
-                    .then(|| unsafe { ffi::CStr::from_ptr(query.sourceText).to_str().ok() })
-                    .flatten(),
-            );
-        }
-    }
-}
-
-fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
+/// Called from [`pg_sys::ExecutorStart_hook`] when tracing is enabled.
+pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     let now = time::SystemTime::now();
     let depth = EXECUTION_DEPTH.get() + 1;
     EXECUTION_DEPTH.set(depth);
 
     if unsafe { pg_sys::ParallelWorkerNumber >= 0 } {
         if depth == 1
-            && let Some(ctx) = read_guc_context()
+            && let Some(ctx) = crate::config::read_trace_context()
         {
             StatementSpan::start_parallel_worker(&ctx, Some(pstmt), sql, now);
         }
@@ -896,34 +626,12 @@ fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     if pstmt.parallelModeNeeded
         && let Some(context) = current_span_context()
     {
-        let tp = context.w3c_traceparent();
-        IN_GUC_UPDATE.set(true);
-        unsafe {
-            // TODO: Make this nul-terminated without allocating.
-            let v = ffi::CString::new(tp).unwrap();
-            pg_sys::SetConfigOption(
-                c"otel.traceparent".as_ptr(),
-                v.as_ptr(),
-                pg_sys::GucContext::PGC_USERSET,
-                pg_sys::GucSource::PGC_S_SESSION,
-            );
-            // TODO: Make this nul-terminated without allocating.
-            if !context.trace_state.is_empty()
-                && let Ok(ts) = ffi::CString::new(&*context.trace_state)
-            {
-                pg_sys::SetConfigOption(
-                    c"otel.tracestate".as_ptr(),
-                    ts.as_ptr(),
-                    pg_sys::GucContext::PGC_USERSET,
-                    pg_sys::GucSource::PGC_S_SESSION,
-                );
-            }
-        }
-        IN_GUC_UPDATE.set(false);
+        crate::config::set_trace_context(&context.w3c_traceparent(), &context.trace_state);
     }
 }
 
-fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
+/// Called from [`pg_sys::ExecutorEnd_hook`] when tracing is enabled.
+pub(crate) fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     let depth = EXECUTION_DEPTH.get();
     if depth == 0 {
         return;
@@ -947,7 +655,7 @@ fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     }
 
     if pstmt.parallelModeNeeded {
-        clear_guc_context();
+        crate::config::clear_trace_context();
     }
 
     if depth == 1
@@ -959,8 +667,13 @@ fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     StatementSpan::finish(depth);
 }
 
-fn process_utility<F>(pstmt: &pg_sys::PlannedStmt, tree: &pg_sys::Node, sql: Option<&str>, hooks: F)
-where
+/// Called from [`pg_sys::ProcessUtility_hook`] when tracing is enabled.
+pub(crate) fn process_utility<F>(
+    pstmt: &pg_sys::PlannedStmt,
+    tree: &pg_sys::Node,
+    sql: Option<&str>,
+    hooks: F,
+) where
     F: FnOnce(),
 {
     use pg_sys::{NodeTag, TransactionStmtKind as StmtKind};
@@ -1063,7 +776,11 @@ fn abort_statements(now: time::SystemTime, last_error: Option<ErrorRecord>) -> O
     }
 }
 
-fn transaction_abort() {
+/// Called unconditionally via [`pg_sys::RegisterXactCallback`] on transaction abort.
+///
+/// Drains all active statement spans, marks them with error status, finalizes the transaction span,
+/// and resets `EXECUTION_DEPTH` to 0.
+pub(crate) fn transaction_abort() {
     let now = time::SystemTime::now();
     EXECUTION_DEPTH.set(0);
     REMAINING_BUDGET.set(0);
@@ -1109,7 +826,10 @@ fn transaction_abort() {
     }
 }
 
-fn subxact_abort() {
+/// Called unconditionally via [`pg_sys::RegisterSubXactCallback`] on subtransaction abort.
+///
+/// Drains active statement spans, clears `LAST_ERROR`, and resets `EXECUTION_DEPTH` to 0.
+pub(crate) fn subtransaction_abort() {
     let now = time::SystemTime::now();
     let last_error = LAST_ERROR.take();
     EXECUTION_DEPTH.set(0);
@@ -1118,11 +838,12 @@ fn subxact_abort() {
     let _ = abort_statements(now, last_error);
 }
 
-fn transaction_commit() {
+/// Called unconditionally via [`pg_sys::RegisterXactCallback`] on transaction commit.
+///
+/// Finalizes and exports any remaining statement spans and the transaction span, then resets
+/// `EXECUTION_DEPTH` to 0.
+pub(crate) fn transaction_commit() {
     let now = time::SystemTime::now();
     EXECUTION_DEPTH.set(0);
     TransactionSpan::finish(now);
 }
-
-#[cfg(any(test, feature = "pg_test"))]
-mod tests;

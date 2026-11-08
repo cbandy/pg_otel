@@ -10,32 +10,37 @@ mod utility;
 use postgres::SimpleQueryMessage;
 use prost::Message;
 use std::{thread, time};
+use url::Url as URL;
 
 use crate::otlp::*;
 
 struct TracingHarness {
     client: postgres::Client,
-    endpoint: String,
+    traces: URL,
+    logs: URL,
 }
 
 impl TracingHarness {
     fn new() -> Result<Self, postgres::Error> {
         crate::acquire_test_lock();
         let client = crate::connect_test_client();
-        let endpoint = format!("{}/test/traces", crate::exporter::endpoint());
+        let base = crate::config::otlp_endpoint();
 
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            traces: base.join("/test/traces").unwrap(),
+            logs: base.join("/test/logs").unwrap(),
+        })
     }
 
     /// Drains any residual telemetry for the specified signals from the mock collector
     /// and sets `otel.export = …`.
     fn enable_telemetry(&mut self, signals: &str) -> Result<(), postgres::Error> {
-        let base = crate::exporter::endpoint();
         if signals.contains("trace") || signals.contains("span") {
-            let _ = reqwest::blocking::get(format!("{base}/test/traces"));
+            let _ = reqwest::blocking::get(self.traces.clone());
         }
         if signals.contains("log") {
-            let _ = reqwest::blocking::get(format!("{base}/test/logs"));
+            let _ = reqwest::blocking::get(self.logs.clone());
         }
         self.client
             .batch_execute(&format!("SET otel.export = '{signals}'"))
@@ -62,12 +67,11 @@ impl TracingHarness {
         let start = time::Instant::now();
         let mut data = Vec::new();
         let mut done = false;
-        let endpoint = format!("{}/test/logs", crate::exporter::endpoint());
 
         while !done && start.elapsed() < timeout {
             thread::sleep(time::Duration::from_millis(50));
 
-            if let Ok(response) = reqwest::blocking::get(&endpoint)
+            if let Ok(response) = reqwest::blocking::get(self.logs.clone())
                 && let Ok(body) = response.bytes()
             {
                 let is_empty = body.is_empty();
@@ -107,7 +111,7 @@ impl TracingHarness {
         while !done && start.elapsed() < timeout {
             thread::sleep(time::Duration::from_millis(50));
 
-            if let Ok(response) = reqwest::blocking::get(&self.endpoint)
+            if let Ok(response) = reqwest::blocking::get(self.traces.clone())
                 && let Ok(body) = response.bytes()
             {
                 let is_empty = body.is_empty();
