@@ -79,6 +79,20 @@ thread_local! {
     /// This tracks nested procedural calls, triggers, and statements, preserving
     /// the parent-child span hierarchy and allocated nesting budgets.
     static STATEMENT_STACK: RefCell<Vec<StatementSpan>> = const { RefCell::new(Vec::new()) };
+
+    /// Ambient request trace context when statement spans are not active.
+    ///
+    /// Preserves incoming trace context (from SQLCommenter, GUCs, or parallel leader propagation)
+    /// for log correlation even when statement tracing is disabled.
+    static AMBIENT_CONTEXT: RefCell<Option<SpanContext>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_ambient_context(ctx: Option<SpanContext>) {
+    AMBIENT_CONTEXT.with_borrow_mut(|c| *c = ctx);
+}
+
+pub(crate) fn clear_ambient_context() {
+    AMBIENT_CONTEXT.with_borrow_mut(|c| *c = None);
 }
 
 #[derive(Debug)]
@@ -350,6 +364,10 @@ impl TransactionSpan {
         explicit: Option<(Option<&pg_sys::PlannedStmt>, Option<&str>)>,
         now: time::SystemTime,
     ) {
+        if !crate::config::trace_transactions() {
+            return;
+        }
+
         CURRENT_TRANSACTION.with_borrow_mut(|t| {
             let is_explicit = explicit.is_some();
 
@@ -447,6 +465,7 @@ pub(crate) fn execution_depth() -> usize {
 pub(crate) fn current_span_context() -> Option<SpanContext> {
     STATEMENT_STACK
         .with_borrow(|s| s.last().map(|entry| entry.context.clone()))
+        .or_else(|| AMBIENT_CONTEXT.with_borrow(|c| c.clone()))
         .or_else(|| {
             CURRENT_TRANSACTION.with_borrow(|t| t.as_ref().and_then(|xact| xact.context.clone()))
         })
@@ -492,6 +511,7 @@ fn take_statement_context(
     let guc_ctx = crate::config::take_trace_context();
 
     let comment_ctx = sql
+        .filter(|_| crate::config::sqlcommenter())
         .and_then(|s| {
             let (loc, len) = pstmt.map_or((-1, 0), |p| (p.stmt_location, p.stmt_len));
             let body = batch_statement_slice(s, loc, len).unwrap_or(s);
@@ -599,7 +619,7 @@ fn get_operation_name(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) ->
     "UNKNOWN".to_string()
 }
 
-/// Called from [`pg_sys::ExecutorStart_hook`] when tracing is enabled.
+/// Called from [`pg_sys::ExecutorStart_hook`] when tracing or logging is enabled.
 pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     let now = time::SystemTime::now();
     let depth = EXECUTION_DEPTH.get() + 1;
@@ -609,7 +629,14 @@ pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
         if depth == 1
             && let Some(ctx) = crate::config::read_trace_context()
         {
-            StatementSpan::start_parallel_worker(&ctx, Some(pstmt), sql, now);
+            if crate::config::export_traces()
+                && crate::config::trace_statements()
+                && crate::config::trace_parallel_workers()
+            {
+                StatementSpan::start_parallel_worker(&ctx, Some(pstmt), sql, now);
+            } else {
+                set_ambient_context(Some(ctx));
+            }
         }
         return;
     }
@@ -621,7 +648,14 @@ pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
         return;
     }
 
-    StatementSpan::start(Some(pstmt), sql, depth, now);
+    if crate::config::export_traces() && crate::config::trace_statements() {
+        StatementSpan::start(Some(pstmt), sql, depth, now);
+    } else {
+        let incoming = take_statement_context(Some(pstmt), sql);
+        if depth == 1 || incoming.is_some() {
+            set_ambient_context(incoming);
+        }
+    }
 
     if pstmt.parallelModeNeeded
         && let Some(context) = current_span_context()
@@ -630,7 +664,7 @@ pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     }
 }
 
-/// Called from [`pg_sys::ExecutorEnd_hook`] when tracing is enabled.
+/// Called from [`pg_sys::ExecutorEnd_hook`] when tracing or logging is enabled.
 pub(crate) fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     let depth = EXECUTION_DEPTH.get();
     if depth == 0 {
@@ -639,10 +673,11 @@ pub(crate) fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
     EXECUTION_DEPTH.set(depth - 1);
 
     if unsafe { pg_sys::ParallelWorkerNumber >= 0 } {
-        if depth == 1
-            && let Some(entry) = STATEMENT_STACK.with_borrow_mut(|s| s.pop())
-        {
-            entry.finish_and_export(time::SystemTime::now());
+        if depth == 1 {
+            if let Some(entry) = STATEMENT_STACK.with_borrow_mut(|s| s.pop()) {
+                entry.finish_and_export(time::SystemTime::now());
+            }
+            clear_ambient_context();
         }
         return;
     }
@@ -664,10 +699,14 @@ pub(crate) fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
         batch_advance_cursor(sql, pstmt.stmt_location, pstmt.stmt_len);
     }
 
-    StatementSpan::finish(depth);
+    if crate::config::export_traces() && crate::config::trace_statements() {
+        StatementSpan::finish(depth);
+    } else if depth == 1 {
+        clear_ambient_context();
+    }
 }
 
-/// Called from [`pg_sys::ProcessUtility_hook`] when tracing is enabled.
+/// Called from [`pg_sys::ProcessUtility_hook`] when tracing or logging is enabled.
 pub(crate) fn process_utility<F>(
     pstmt: &pg_sys::PlannedStmt,
     tree: &pg_sys::Node,
@@ -688,15 +727,22 @@ pub(crate) fn process_utility<F>(
         .map(|xact| xact.kind)
     {
         Some(StmtKind::TRANS_STMT_BEGIN | StmtKind::TRANS_STMT_START) => {
-            TransactionSpan::start(Some((Some(pstmt), sql)), now);
+            if crate::config::export_traces() && crate::config::trace_transactions() {
+                TransactionSpan::start(Some((Some(pstmt), sql)), now);
+            } else {
+                let incoming = take_statement_context(Some(pstmt), sql);
+                set_ambient_context(incoming);
+            }
 
             hooks();
         }
         Some(kind @ (StmtKind::TRANS_STMT_COMMIT | StmtKind::TRANS_STMT_ROLLBACK)) => {
-            if kind == StmtKind::TRANS_STMT_COMMIT {
-                StatementSpan::start_control("COMMIT", Some(pstmt), sql, depth, now);
-            } else {
-                StatementSpan::start_control("ROLLBACK", Some(pstmt), sql, depth, now);
+            if crate::config::export_traces() && crate::config::trace_statements() {
+                if kind == StmtKind::TRANS_STMT_COMMIT {
+                    StatementSpan::start_control("COMMIT", Some(pstmt), sql, depth, now);
+                } else {
+                    StatementSpan::start_control("ROLLBACK", Some(pstmt), sql, depth, now);
+                }
             }
 
             // Postgres handles COMMIT and ROLLBACK differently when the transaction is already
@@ -714,6 +760,7 @@ pub(crate) fn process_utility<F>(
             // transaction here.
             if txn_aborted {
                 TransactionSpan::finish(now);
+                clear_ambient_context();
             }
         }
         // Do not produce spans for individual SET and RESET statements.
@@ -721,11 +768,24 @@ pub(crate) fn process_utility<F>(
             hooks();
         }
         _ => {
-            StatementSpan::start(Some(pstmt), sql, depth, now);
+            if crate::config::export_traces() && crate::config::trace_statements() {
+                StatementSpan::start(Some(pstmt), sql, depth, now);
 
-            hooks();
+                hooks();
 
-            StatementSpan::finish(depth);
+                StatementSpan::finish(depth);
+            } else {
+                let incoming = take_statement_context(Some(pstmt), sql);
+                if is_top_level || incoming.is_some() {
+                    set_ambient_context(incoming);
+                }
+
+                hooks();
+
+                if is_top_level {
+                    clear_ambient_context();
+                }
+            }
         }
     }
 
@@ -824,6 +884,7 @@ pub(crate) fn transaction_abort() {
     if let Some(xact) = xact_to_export {
         xact.finish_and_export(now);
     }
+    clear_ambient_context();
 }
 
 /// Called unconditionally via [`pg_sys::RegisterSubXactCallback`] on subtransaction abort.
@@ -834,6 +895,7 @@ pub(crate) fn subtransaction_abort() {
     let last_error = LAST_ERROR.take();
     EXECUTION_DEPTH.set(0);
     REMAINING_BUDGET.set(0);
+    clear_ambient_context();
 
     let _ = abort_statements(now, last_error);
 }
@@ -845,5 +907,6 @@ pub(crate) fn subtransaction_abort() {
 pub(crate) fn transaction_commit() {
     let now = time::SystemTime::now();
     EXECUTION_DEPTH.set(0);
+    clear_ambient_context();
     TransactionSpan::finish(now);
 }

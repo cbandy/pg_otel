@@ -11,7 +11,7 @@ mod tests {
     fn simple_query_single_span() -> Result<()> {
         let mut harness = TracingHarness::new()?;
         harness.enable_tracing()?;
-        harness.client.batch_execute("SELECT 1")?;
+        harness.simple_query("SELECT 1")?;
 
         let all_spans = harness.collect_spans(time::Duration::from_secs(1));
 
@@ -30,7 +30,7 @@ mod tests {
     fn query_resource_attached() -> Result<()> {
         let mut harness = TracingHarness::new()?;
         harness.enable_tracing()?;
-        harness.client.batch_execute("SELECT 1")?;
+        harness.simple_query("SELECT 1")?;
 
         let resource_spans = harness.collect_resource_spans(time::Duration::from_secs(1));
         verify_that!(resource_spans, len(gt(0)))?;
@@ -55,7 +55,7 @@ mod tests {
     fn query_with_comment_context() -> Result<()> {
         let mut harness = TracingHarness::new()?;
         harness.enable_tracing()?;
-        harness.client.batch_execute(
+        harness.simple_query(
             "SELECT 1 /* traceparent='00-11111111111111111111111111111111-2222222222222222-01',tracestate='rojo=1' */",
         )?;
 
@@ -109,7 +109,7 @@ mod tests {
 
             harness.enable_tracing()?;
             for sql in sqls {
-                harness.client.batch_execute(sql)?;
+                harness.simple_query(sql)?;
             }
 
             let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
@@ -162,7 +162,7 @@ mod tests {
 
             harness.enable_tracing()?;
             for sql in sqls {
-                harness.client.batch_execute(sql)?;
+                harness.simple_query(sql)?;
             }
 
             let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
@@ -207,7 +207,7 @@ mod tests {
     fn parallel_query_child_spans() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(cfg_select! {
+        harness.simple_query(cfg_select! {
             any(feature = "pg15") => {
                 "SET force_parallel_mode = regress; SET max_parallel_workers_per_gather = 1"
             }
@@ -216,11 +216,10 @@ mod tests {
             }
         })?;
 
-        harness
-            .client
-            .batch_execute("CREATE TABLE t_par AS SELECT generate_series(1, 1000) AS id")?;
+        harness.simple_query("CREATE TABLE t_par AS SELECT generate_series(1, 1000) AS id")?;
+        harness.simple_query("SET otel.trace_parallel_workers = on")?;
         harness.enable_tracing()?;
-        harness.client.batch_execute("SELECT count(*) FROM t_par")?;
+        harness.simple_query("SELECT count(*) FROM t_par")?;
 
         let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
 
@@ -259,7 +258,7 @@ mod tests {
     fn parallel_query_child_spans_include_context() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        harness.client.batch_execute(cfg_select! {
+        harness.simple_query(cfg_select! {
             any(feature = "pg15") => {
                 "SET force_parallel_mode = regress; SET max_parallel_workers_per_gather = 1"
             }
@@ -268,9 +267,8 @@ mod tests {
             }
         })?;
 
-        harness
-            .client
-            .batch_execute("CREATE TABLE t_par_ctx AS SELECT generate_series(1, 1000) AS id")?;
+        harness.simple_query("CREATE TABLE t_par_ctx AS SELECT generate_series(1, 1000) AS id")?;
+        harness.simple_query("SET otel.trace_parallel_workers = on")?;
         harness.enable_tracing()?;
 
         for sqls in [
@@ -284,7 +282,7 @@ mod tests {
             ][..],
         ] {
             for sql in sqls {
-                harness.client.batch_execute(sql)?;
+                harness.simple_query(sql)?;
             }
 
             let all_spans = harness.collect_spans_count(2, time::Duration::from_secs(2));
@@ -329,5 +327,104 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn trace_target_matrix() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+        harness.simple_query(cfg_select! {
+            any(feature = "pg15") => {
+                "SET force_parallel_mode = regress; SET max_parallel_workers_per_gather = 1"
+            }
+            _ => {
+                "SET debug_parallel_query = regress; SET max_parallel_workers_per_gather = 1"
+            }
+        })?;
+        harness.simple_query("CREATE TABLE t_matrix AS SELECT generate_series(1, 1000) AS id")?;
+
+        #[rustfmt::skip]
+        let cases = [
+            // (export, set (txns,  stmts, parallel), has (txns,  stmts, parallel))
+            (   false,      (true,  true,  true ),        (false, false, false)   ), // Main off, targets on
+            (   true,       (false, false, false),        (false, false, false)   ), // Main on, targets off
+
+            (   true,       (true,  false, false),        (true,  false, false)   ), // Transactions only
+            (   true,       (false, true,  false),        (false, true,  false)   ), // Statements only
+            (   true,       (true,  false, true ),        (true,  false, false)   ), // Parallel needs statements
+            (   true,       (false, true,  true ),        (false, true,  true )   ), // Transactions off
+
+            (   true,       (true,  true,  false),        (true,  true,  false)   ), // Defaults
+            (   true,       (true,  true,  true ),        (true,  true,  true )   ), // Full visibility
+        ];
+
+        for (export, (txns, stmts, parallel), (has_txn, has_stmt, has_parallel)) in cases {
+            harness.simple_query(&format!(
+                "SET otel.export_traces = {export}; \
+                 SET otel.trace_transactions = {txns}; \
+                 SET otel.trace_statements = {stmts}; \
+                 SET otel.trace_parallel_workers = {parallel};"
+            ))?;
+
+            harness.simple_query("BEGIN; SELECT count(*) FROM t_matrix; COMMIT;")?;
+
+            let spans = harness.collect_spans(time::Duration::from_millis(200));
+
+            let txn_count = spans.iter().filter(|s| s.name == "TRANSACTION").count();
+            let leader_count = spans
+                .iter()
+                .filter(|s| s.name == "SELECT" && s.kind == SpanKind::Server as i32)
+                .count();
+            let parallel_count = spans
+                .iter()
+                .filter(|s| s.name == "SELECT" && s.kind == SpanKind::Internal as i32)
+                .count();
+            let commit_count = spans.iter().filter(|s| s.name == "COMMIT").count();
+
+            verify_that!(txn_count, eq(if has_txn { 1 } else { 0 }))?;
+            verify_that!(leader_count, eq(if has_stmt { 1 } else { 0 }))?;
+            verify_that!(commit_count, eq(if has_stmt { 1 } else { 0 }))?;
+            verify_that!(parallel_count, eq(if has_parallel { 1 } else { 0 }))?;
+        }
+
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
+    fn sqlcommenter_disabled() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+        harness.simple_query("SET otel.sqlcommenter = off")?;
+        harness.enable_tracing()?;
+        harness.simple_query(
+            "SELECT 1 /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */;",
+        )?;
+
+        let spans = harness.collect_spans(time::Duration::from_millis(100));
+        verify_that!(spans, len(eq(1)))?;
+        let span = &spans[0];
+        verify_that!(span.trace_id, not(eq(&vec![0x11u8; 16])))?;
+        verify_that!(span.parent_span_id, is_empty())
+    }
+
+    #[pgrx::pg_test]
+    fn log_correlation_without_tracing() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+        harness.enable_telemetry("logs")?;
+        harness.simple_query("SET otel.export_traces = off; SET otel.export_logs = on;")?;
+
+        harness.simple_query(
+            "DO $$ BEGIN RAISE WARNING 'warning without trace export'; END $$ /* traceparent='00-11111111111111111111111111111111-2222222222222222-01' */;",
+        )?;
+
+        let logs = harness.collect_logs_count(1, time::Duration::from_secs(2));
+        let warning_log = logs
+            .iter()
+            .find(|l| l.severity_text == "WARNING")
+            .or_fail()?;
+        verify_that!(warning_log.trace_id, eq(&vec![0x11u8; 16]))?;
+        verify_that!(warning_log.span_id, eq(&vec![0x22u8; 8]))?;
+
+        // Verify no trace spans were emitted
+        let spans = harness.collect_spans(time::Duration::from_millis(100));
+        verify_that!(spans, is_empty())
     }
 }

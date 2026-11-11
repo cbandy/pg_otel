@@ -61,7 +61,7 @@ Their respective [environment variables][sdk-env] also work.
 |             name             |        default        | unit |
 +------------------------------+-----------------------+------+
 | otel.export_logs             | off                   |      | Controls whether error and log messages are exported
-| otel.export_traces           | off                   |      | Controls whether statement execution traces are exported
+| otel.export_traces           | off                   |      | Controls whether trace spans are exported
 | otel.otlp_batch_max_delay    | 1000                  | ms   | Max wait time before exporting a batch
 | otel.otlp_batch_max_items    | 512                   |      | Max items per OTLP export batch
 | otel.otlp_endpoint           | http://localhost:4318 |      | URL to which the exporter sends telemetry
@@ -69,6 +69,10 @@ Their respective [environment variables][sdk-env] also work.
 | otel.otlp_timeout            | 10000                 | ms   | Maximum time to deliver an export batch
 | otel.resource_attributes     |                       |      | Instance metadata attached to all telemetry
 | otel.service_name            | postgresql            |      | Logical name of this service
+| otel.sqlcommenter            | on                    |      | Controls whether SQL comments are parsed for trace context
+| otel.trace_parallel_workers  | off                   |      | Controls whether parallel worker processes emit spans
+| otel.trace_statements        | on                    |      | Controls whether SQL statements are traced
+| otel.trace_transactions      | on                    |      | Controls whether transaction boundaries are traced
 +------------------------------+-----------------------+------+
 ```
 

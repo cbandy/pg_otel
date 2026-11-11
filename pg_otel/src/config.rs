@@ -97,8 +97,12 @@ static GUC_MAX_NESTED_STATEMENTS: GucInt32 = GucInt32::new(50);
 static GUC_PROTOCOL: GucString = GucString::new(Some(c"http/protobuf"));
 static GUC_RESOURCE_ATTRIBUTES: GucString = GucString::new(None);
 static GUC_SERVICE_NAME: GucString = GucString::new(Some(c"postgresql"));
+static GUC_SQLCOMMENTER: GucBool = GucBool::new(true);
 static GUC_TIMEOUT_MS: GucInt32 = GucInt32::new(10000);
 static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
+static GUC_TRACE_PARALLEL_WORKERS: GucBool = GucBool::new(false);
+static GUC_TRACE_STATEMENTS: GucBool = GucBool::new(true);
+static GUC_TRACE_TRANSACTIONS: GucBool = GucBool::new(true);
 static GUC_TRACEPARENT: GucString = GucString::new(None);
 static GUC_TRACESTATE: GucString = GucString::new(None);
 
@@ -123,17 +127,17 @@ pub fn define_guc_variables() {
         c"Export log records",
         c"Controls whether error and log messages are exported.",
         &GUC_EXPORT_LOGS,
-        GucContext::Userset, // self-service for everyone, any time
-        GucFlags::empty(),   // visible to everyone
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
     );
 
     GucRegistry::define_bool_guc(
         c"otel.export_traces",
         c"Export trace spans",
-        c"Controls whether statement execution traces and spans are exported.",
+        c"Controls whether trace spans are exported.",
         &GUC_EXPORT_TRACES,
-        GucContext::Userset, // self-service for everyone, any time
-        GucFlags::empty(),   // visible to everyone
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
     );
 
     unsafe {
@@ -281,7 +285,7 @@ pub fn define_guc_variables() {
         &GUC_MAX_NESTED_STATEMENTS,
         0,
         i32::MAX / 4,
-        GucContext::Suset, // superuser can set for session, user, database
+        GucContext::Suset, // superuser or granted role can set for session, user, database
         GucFlags::empty(), // visible to everyone
     );
 
@@ -294,6 +298,42 @@ pub fn define_guc_variables() {
         i32::MAX / 4,
         GucContext::Userset, // self-service for everyone, any time
         GucFlags::empty(),   // visible to everyone
+    );
+
+    GucRegistry::define_bool_guc(
+        c"otel.sqlcommenter",
+        c"Parse SQLCommenter comments for trace context",
+        c"Controls whether SQL query comments are inspected for distributed trace context.",
+        &GUC_SQLCOMMENTER,
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
+    );
+
+    GucRegistry::define_bool_guc(
+        c"otel.trace_parallel_workers",
+        c"Trace parallel query workers",
+        c"Controls whether parallel worker processes emit internal execution spans.",
+        &GUC_TRACE_PARALLEL_WORKERS,
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
+    );
+
+    GucRegistry::define_bool_guc(
+        c"otel.trace_statements",
+        c"Trace SQL statement execution",
+        c"Controls whether SQL statements are traced.",
+        &GUC_TRACE_STATEMENTS,
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
+    );
+
+    GucRegistry::define_bool_guc(
+        c"otel.trace_transactions",
+        c"Trace database transactions",
+        c"Controls whether transaction boundaries (BEGIN, COMMIT, ROLLBACK) are traced.",
+        &GUC_TRACE_TRANSACTIONS,
+        GucContext::Suset, // superuser or granted role can set for session, user, database
+        GucFlags::empty(), // visible to everyone
     );
 
     unsafe {
@@ -572,6 +612,26 @@ pub fn nested_statements_max() -> u32 {
 /// Returns the requested nested statement span budget for this session configured by GUC `otel.trace_nested_statements`.
 pub fn nested_statements_request() -> u32 {
     GUC_TRACE_NESTED_STATEMENTS.get().max(0) as u32
+}
+
+/// Returns whether statement execution tracing is enabled by GUC `otel.trace_statements`.
+pub fn trace_statements() -> bool {
+    GUC_TRACE_STATEMENTS.get()
+}
+
+/// Returns whether transaction boundary tracing is enabled by GUC `otel.trace_transactions`.
+pub fn trace_transactions() -> bool {
+    GUC_TRACE_TRANSACTIONS.get()
+}
+
+/// Returns whether parallel worker execution tracing is enabled by GUC `otel.trace_parallel_workers`.
+pub fn trace_parallel_workers() -> bool {
+    GUC_TRACE_PARALLEL_WORKERS.get()
+}
+
+/// Returns whether SQLCommenter comment parsing is enabled by GUC `otel.sqlcommenter`.
+pub fn sqlcommenter() -> bool {
+    GUC_SQLCOMMENTER.get()
 }
 
 /// Clears the session GUCs `otel.traceparent` and `otel.tracestate`.

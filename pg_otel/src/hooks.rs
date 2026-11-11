@@ -134,7 +134,7 @@ pub fn install() {
             }
         };
 
-        if crate::config::export_traces()
+        if (crate::config::export_traces() || crate::config::export_logs())
             && let Some(pstmt) = unsafe { ps.as_ref() }
             && let Some(tree) = unsafe { pstmt.utilityStmt.as_ref() }
         {
@@ -207,7 +207,7 @@ pub fn install() {
     /// This is called by Postgres via C FFI and must have the `#[pgrx::pg_guard]` attribute.
     #[pgrx::pg_guard]
     unsafe extern "C-unwind" fn executor_start_hook(qd: *mut pg_sys::QueryDesc, ef: i32) {
-        if crate::config::export_traces()
+        if (crate::config::export_traces() || crate::config::export_logs())
             && let Some(query) = unsafe { qd.as_ref() }
             && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
         {
@@ -245,7 +245,7 @@ pub fn install() {
             unsafe { pg_sys::standard_ExecutorEnd(qd) };
         }
 
-        if crate::config::export_traces()
+        if (crate::config::export_traces() || crate::config::export_logs())
             && let Some(query) = unsafe { qd.as_ref() }
             && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
         {
