@@ -55,11 +55,18 @@ fn export_batch(batch: &[Vec<u8>]) {
         .filter_map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
         .collect();
 
+    let spans: Vec<Span> = batch
+        .iter()
+        .filter_map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
+        .collect();
+
+    let resource = crate::config::resource();
+
     if !records.is_empty() {
         let path = "v1/logs";
 
         let scope_logs = ScopeLogs::new(scope.clone(), records);
-        let resource_logs = ResourceLogs::new(None, vec![scope_logs]);
+        let resource_logs = ResourceLogs::new(resource.clone(), vec![scope_logs]);
         let service_request = ExportLogsServiceRequest::new(vec![resource_logs]);
 
         let mut body = Vec::new();
@@ -70,16 +77,11 @@ fn export_batch(batch: &[Vec<u8>]) {
         }
     }
 
-    let spans: Vec<Span> = batch
-        .iter()
-        .filter_map(|bytes| prost::Message::decode(bytes.as_slice()).ok())
-        .collect();
-
     if !spans.is_empty() {
         let path = "v1/traces";
 
         let scope_spans = ScopeSpans::new(scope.clone(), spans);
-        let resource_spans = ResourceSpans::create(None, vec![scope_spans]);
+        let resource_spans = ResourceSpans::create(resource, vec![scope_spans]);
         let service_request = ExportTraceServiceRequest::new(vec![resource_spans]);
 
         let mut body = Vec::new();

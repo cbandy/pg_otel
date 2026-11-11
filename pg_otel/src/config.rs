@@ -31,11 +31,13 @@
 //! - [`with_stack_cstr`] copies strings into a stack buffer for null-terminated parsing, safely
 //!   falling back to a temporary `CString` allocation when needed.
 
+use crate::PG_OTEL_LIBRARY;
 use core::cell::Cell;
 use pgrx::pg_sys;
 use std::{ffi, time};
 use url::Url as URL;
 
+type GucBool = pgrx::guc::GucSetting<bool>;
 type GucInt32 = pgrx::guc::GucSetting<i32>;
 type GucString = pgrx::guc::GucSetting<Option<ffi::CString>>;
 
@@ -88,18 +90,19 @@ static GUC_BATCH_MAX_DELAY_MS: GucInt32 = GucInt32::new(1000);
 static GUC_BATCH_MAX_ITEMS: GucInt32 = GucInt32::new(512);
 static GUC_COMPRESSION: GucString = GucString::new(Some(c"none"));
 static GUC_ENDPOINT: GucString = GucString::new(Some(c"http://localhost:4318"));
+static GUC_EXPORT_LOGS: GucBool = GucBool::new(false);
+static GUC_EXPORT_TRACES: GucBool = GucBool::new(false);
 static GUC_HEADERS: GucString = GucString::new(None);
 static GUC_MAX_NESTED_STATEMENTS: GucInt32 = GucInt32::new(50);
 static GUC_PROTOCOL: GucString = GucString::new(Some(c"http/protobuf"));
-static GUC_SIGNALS_ENABLED: GucString = GucString::new(None);
+static GUC_RESOURCE_ATTRIBUTES: GucString = GucString::new(None);
+static GUC_SERVICE_NAME: GucString = GucString::new(Some(c"postgresql"));
 static GUC_TIMEOUT_MS: GucInt32 = GucInt32::new(10000);
 static GUC_TRACE_NESTED_STATEMENTS: GucInt32 = GucInt32::new(0);
 static GUC_TRACEPARENT: GucString = GucString::new(None);
 static GUC_TRACESTATE: GucString = GucString::new(None);
 
 thread_local! {
-    static EXPORT_LOGS: Cell<bool> = const { Cell::new(false) };
-    static EXPORT_SPANS: Cell<bool> = const { Cell::new(false) };
     static UPDATING_SELF: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -115,49 +118,28 @@ pub fn define_guc_variables() {
         GucCheckError::default().with_detail(detail.to_string())
     }
 
-    unsafe {
-        GucRegistry::define_string_guc_with_hooks(
-            c"otel.export",
-            c"Telemetry signals to export",
-            c"Comma-separated list of signals to export (traces, logs).",
-            &GUC_SIGNALS_ENABLED,
-            GucContext::Userset, // TODO
-            GucFlags::empty()
-                | GucFlags::from_bits_retain(pg_sys::GUC_IS_NAME as i32)
-                | GucFlags::from_bits_retain(pg_sys::GUC_LIST_INPUT as i32)
-                | GucFlags::from_bits_retain(pg_sys::GUC_NOT_WHILE_SEC_REST as i32),
-            Some(check_signals),
-            Some(assign_signals),
-            None,
-        );
+    GucRegistry::define_bool_guc(
+        c"otel.export_logs",
+        c"Export log records",
+        c"Controls whether error and log messages are exported.",
+        &GUC_EXPORT_LOGS,
+        GucContext::Userset, // self-service for everyone, any time
+        GucFlags::empty(),   // visible to everyone
+    );
 
-        #[pgrx::pg_guc_hook(check)]
-        fn check_signals(value: Option<ffi::CString>) -> Result<(), GucCheckError> {
-            if let Some(value) = value.as_deref() {
-                value
-                    .to_str()
-                    .map_err(eyre::Report::from)
-                    .and_then(Signals::parse)
-                    .map_err(check_error)?;
-            }
-            Ok(())
-        }
-
-        #[pgrx::pg_guc_hook(assign)]
-        fn assign_signals(value: Option<ffi::CString>) {
-            let (logs, spans) = value
-                .map(|v| Signals::parse(&v.to_string_lossy()).unwrap())
-                .unwrap_or((false, false));
-
-            EXPORT_LOGS.set(logs);
-            EXPORT_SPANS.set(spans);
-        }
-    }
+    GucRegistry::define_bool_guc(
+        c"otel.export_traces",
+        c"Export trace spans",
+        c"Controls whether statement execution traces and spans are exported.",
+        &GUC_EXPORT_TRACES,
+        GucContext::Userset, // self-service for everyone, any time
+        GucFlags::empty(),   // visible to everyone
+    );
 
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.otlp_endpoint",
-            c"Base OTLP collector endpoint URL",
+            c"URL to which the exporter sends telemetry",
             c"Base URL of an OpenTelemetry collector.",
             &GUC_ENDPOINT,
             GucContext::Sighup, // config file, affects entire server, requires reload
@@ -178,7 +160,7 @@ pub fn define_guc_variables() {
     unsafe {
         GucRegistry::define_string_guc_with_hooks(
             c"otel.otlp_headers",
-            c"OTLP headers for all signals (superuser only)",
+            c"OTLP request headers (superuser only)",
             c"Headers sent with OTLP export requests. May contain sensitive credentials. Restricted to superusers.",
             &GUC_HEADERS,
             GucContext::Sighup, // config file, affects entire server, requires reload
@@ -200,10 +182,10 @@ pub fn define_guc_variables() {
     GucRegistry::define_string_guc(
         c"otel.otlp_protocol",
         c"OTLP transport protocol",
-        c"Exporter protocol (http/protobuf or http/json).",
+        c"Exporter protocol (http/protobuf).",
         &GUC_PROTOCOL,
-        GucContext::Sighup, // config file, affects entire server, requires reload
-        GucFlags::empty(),  // visible to everyone
+        GucContext::Internal, // read-only; informational
+        GucFlags::empty(),    // visible to everyone
     );
 
     GucRegistry::define_int_guc(
@@ -228,8 +210,8 @@ pub fn define_guc_variables() {
     );
     GucRegistry::define_int_guc(
         c"otel.otlp_timeout",
-        c"Send timeout",
-        c"Request timeout duration in milliseconds.",
+        c"Maximum time to deliver an export batch",
+        c"Maximum time allowed to contact the collector, send a batch, and receive an acknowledgment, including all request attempts and retries.",
         &GUC_TIMEOUT_MS,
         1,
         i32::MAX,
@@ -244,6 +226,53 @@ pub fn define_guc_variables() {
         GucContext::Sighup, // config file, affects entire server, requires reload
         GucFlags::empty(),  // visible to everyone
     );
+
+    unsafe {
+        GucRegistry::define_string_guc_with_hooks(
+            c"otel.resource_attributes",
+            c"Instance metadata attached to all telemetry",
+            c"Comma-separated key=value pairs identifying this Postgres instance and environment. Attached to all exported telemetry. Keys and values may be percent-encoded.",
+            &GUC_RESOURCE_ATTRIBUTES,
+            GucContext::Sighup, // config file, affects entire server, requires reload
+            GucFlags::empty(),  // visible to everyone
+            Some(check_resource_attributes),
+            None,
+            None,
+        );
+
+        #[pgrx::pg_guc_hook(check)]
+        fn check_resource_attributes(value: Option<ffi::CString>) -> Result<(), GucCheckError> {
+            if let Some(value) = value {
+                ResourceAttributes::validate(&value).map_err(check_error)?;
+            }
+            Ok(())
+        }
+    }
+
+    unsafe {
+        GucRegistry::define_string_guc_with_hooks(
+            c"otel.service_name",
+            c"Logical name of this service",
+            c"Sets the 'service.name' resource attribute attached to all exported telemetry.",
+            &GUC_SERVICE_NAME,
+            GucContext::Sighup, // config file, affects entire server, requires reload
+            GucFlags::empty(),  // visible to everyone
+            Some(check_service_name),
+            None,
+            None,
+        );
+
+        #[pgrx::pg_guc_hook(check)]
+        fn check_service_name(value: Option<ffi::CString>) -> Result<(), GucCheckError> {
+            if let Some(value) = value {
+                let s = value.to_str().map_err(check_error)?;
+                if s.trim().is_empty() {
+                    return Err(check_error("service name cannot be empty"));
+                }
+            }
+            Ok(())
+        }
+    }
 
     GucRegistry::define_int_guc(
         c"otel.max_nested_statements",
@@ -339,6 +368,125 @@ pub fn define_guc_variables() {
     }
 }
 
+/// Reads standard OpenTelemetry environment variables and applies non-blank values to GUCs.
+///
+/// PostgreSQL considers the origin of a value when assigning it to GUC variables. Values from
+/// a source with higher precedence override those with a lower precedence:
+///
+/// 1. default values `PGC_S_DEFAULT` (lowest)
+/// 2. environment variables `PGC_S_ENV_VAR`
+/// 3. configuration files `PGC_S_FILE`
+/// 4. command line arguments `PGC_S_ARGV`
+///
+/// This aligns with the OpenTelemetry specification, which has an explicit configuration file take
+/// precedence over environment variables:
+///
+/// <https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables>
+pub fn read_environment() {
+    debug_assert!(crate::assert_postmaster_startup());
+
+    // Set a GUC using PGC_POSTMASTER with PGC_S_ENV_VAR, the same as PostgreSQL's
+    // `InitializeGUCOptionsFromEnvironment`. This has a higher precedence than default
+    // values and lower precedence than `postgresql.conf` and `ALTER SYSTEM`.
+    fn set<const N: usize>(name: &ffi::CStr, value: &str) {
+        GucString::set::<N>(
+            name,
+            value,
+            pg_sys::GucContext::PGC_POSTMASTER, // currently in postmaster startup
+            pg_sys::GucSource::PGC_S_ENV_VAR,   // override default, overridden by file
+            pg_sys::WARNING as i32,             // log issues and continue startup
+        );
+    }
+
+    // Most of OpenTelemetry can be disabled with this one neat trick. Propagators must remain
+    // active and can be configured in `OTEL_PROPAGATORS`.
+    if std::env::var("OTEL_SDK_DISABLED").is_ok_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+        set::<4>(c"otel.export_logs", "off");
+        set::<4>(c"otel.export_traces", "off");
+    } else {
+        for (env_name, guc_name) in [
+            ("OTEL_TRACES_EXPORTER", c"otel.export_traces"),
+            ("OTEL_LOGS_EXPORTER", c"otel.export_logs"),
+        ] {
+            if let Ok(v) = std::env::var(env_name)
+                && let trimmed = v.trim()
+                && !trimmed.is_empty()
+            {
+                match trimmed {
+                    s if s.eq_ignore_ascii_case("otlp") => set::<4>(guc_name, "on"),
+                    s if s.eq_ignore_ascii_case("none") => set::<4>(guc_name, "off"),
+                    _ => {
+                        pgrx::ereport!(
+                            pgrx::PgLogLevel::WARNING,
+                            pgrx::PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+                            format!(
+                                "unsupported exporter '{trimmed}' in {env_name}; only 'otlp' and 'none' are supported"
+                            ),
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("OTEL_METRICS_EXPORTER")
+            && let trimmed = v.trim()
+            && !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("none")
+        {
+            pgrx::ereport!(
+                pgrx::PgLogLevel::WARNING,
+                pgrx::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "metrics export is not supported by {PG_OTEL_LIBRARY}; ignoring OTEL_METRICS_EXPORTER='{trimmed}'"
+                ),
+            );
+        }
+
+        if let Ok(v) = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
+            && let trimmed = v.trim()
+            && !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("http/protobuf")
+        {
+            pgrx::ereport!(
+                pgrx::PgLogLevel::WARNING,
+                pgrx::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "protocol '{trimmed}' is not supported by {PG_OTEL_LIBRARY}; only 'http/protobuf' is supported"
+                ),
+            );
+        }
+    }
+
+    let mappings: &[(&str, &ffi::CStr)] = &[
+        ("OTEL_SERVICE_NAME", c"otel.service_name"),
+        ("OTEL_RESOURCE_ATTRIBUTES", c"otel.resource_attributes"),
+        ("OTEL_EXPORTER_OTLP_COMPRESSION", c"otel.otlp_compression"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", c"otel.otlp_endpoint"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", c"otel.otlp_headers"),
+        ("OTEL_EXPORTER_OTLP_TIMEOUT", c"otel.otlp_timeout"),
+    ];
+
+    for &(env_name, guc_name) in mappings {
+        if let Ok(v) = std::env::var(env_name)
+            && let trimmed = v.trim()
+            && !trimmed.is_empty()
+        {
+            set::<512>(guc_name, trimmed);
+        }
+    }
+}
+
+/// Returns whether export of OpenTelemetry log records is enabled by GUC `otel.export_logs`.
+pub fn export_logs() -> bool {
+    GUC_EXPORT_LOGS.get()
+}
+
+/// Returns whether export of OpenTelemetry trace spans is enabled by GUC `otel.export_traces`.
+pub fn export_traces() -> bool {
+    GUC_EXPORT_TRACES.get()
+}
+
 /// Returns the maximum delay to buffer telemetry items before exporting configured by GUC `otel.otlp_batch_max_delay_ms`.
 pub fn otlp_batch_max_delay() -> time::Duration {
     time::Duration::from_millis(GUC_BATCH_MAX_DELAY_MS.get() as u64)
@@ -364,14 +512,56 @@ pub fn otlp_timeout() -> time::Duration {
     time::Duration::from_millis(GUC_TIMEOUT_MS.get().max(1) as u64)
 }
 
-/// Returns whether export of OpenTelemetry log records is enabled by GUC `otel.export`.
-pub fn logs_enabled() -> bool {
-    EXPORT_LOGS.get()
+/// Builds the OpenTelemetry [`Resource`] containing `service.name`, `service.version`, and configured attributes.
+pub fn resource() -> crate::otlp::Resource {
+    use crate::otlp::{AnyValue, AnyValueExt, KeyValue, KeyValueExt, Resource, ResourceExt};
+
+    let mut attrs = resource_attributes();
+    let configured_service_name = service_name();
+
+    let final_service_name = match attrs.iter().find(|(k, _)| k == "service.name") {
+        Some((_, custom_name)) if configured_service_name == "postgresql" => custom_name.clone(),
+        _ => configured_service_name,
+    };
+
+    if let Some(existing) = attrs.iter_mut().find(|(k, _)| k == "service.name") {
+        existing.1 = final_service_name;
+    } else {
+        attrs.push(("service.name".to_string(), final_service_name));
+    }
+
+    if !attrs.iter().any(|(k, _)| k == "service.version") {
+        let version = service_version();
+        if !version.is_empty() {
+            attrs.push(("service.version".to_string(), version.to_string()));
+        }
+    }
+
+    let kv_pairs: Vec<KeyValue> = attrs
+        .into_iter()
+        .map(|(k, v)| KeyValue::new(k, AnyValue::new_string(v)))
+        .collect();
+
+    Resource::build().attributes(kv_pairs).finish()
 }
 
-/// Returns whether export of OpenTelemetry trace spans is enabled by GUC `otel.export`.
-pub fn spans_enabled() -> bool {
-    EXPORT_SPANS.get()
+/// Returns the parsed resource attributes configured by GUC `otel.resource_attributes`.
+pub fn resource_attributes() -> Vec<(String, String)> {
+    ResourceAttributes::from(&GUC_RESOURCE_ATTRIBUTES)
+}
+
+/// Returns the logical service name configured by GUC `otel.service_name`.
+pub fn service_name() -> String {
+    GUC_SERVICE_NAME
+        .as_cstr()
+        .and_then(|c| c.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| "postgresql".to_string())
+}
+
+/// Returns the default service version (PostgreSQL server version).
+pub fn service_version() -> &'static str {
+    pg_sys::PG_VERSION.to_str().unwrap_or("")
 }
 
 /// Returns the maximum ceiling on nested statement spans across a query configured by GUC `otel.max_nested_statements`.
@@ -547,21 +737,58 @@ impl Headers {
     }
 }
 
-struct Signals;
+struct ResourceAttributes;
 
-impl Signals {
-    /// Parses a comma-separated list of signals (e.g. `logs,spans`) into `(logs, spans)` booleans.
-    pub fn parse(raw: &str) -> eyre::Result<(bool, bool)> {
-        let (mut logs, mut spans) = (false, false);
-        for part in raw.split(',') {
-            match part.trim() {
-                "" => (),
-                "log" | "logs" => logs = true,
-                "span" | "spans" | "trace" | "traces" => spans = true,
-                v => eyre::bail!("unrecognized signal: {:?}", v),
+impl ResourceAttributes {
+    pub fn from(trusted: &GucString) -> Vec<(String, String)> {
+        trusted
+            .as_cstr()
+            .and_then(|c| c.to_str().ok())
+            .map(|s| Self::parse(s).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    pub fn validate(untrusted: &ffi::CStr) -> eyre::Result<()> {
+        Self::parse(untrusted.to_str()?)?;
+        Ok(())
+    }
+
+    pub fn parse(raw: &str) -> eyre::Result<Vec<(String, String)>> {
+        let mut results = Vec::new();
+        if raw.trim().is_empty() {
+            return Ok(results);
+        }
+
+        for token in raw.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let Some((k_raw, v_raw)) = trimmed.split_once('=') else {
+                eyre::bail!("invalid resource attribute syntax: missing '=' in '{trimmed}'");
+            };
+
+            let k = crate::encoding::percent_decode(k_raw.trim())?;
+            if k.is_empty() {
+                eyre::bail!(
+                    "invalid resource attribute syntax: key cannot be empty in '{trimmed}'"
+                );
+            }
+
+            let v = crate::encoding::percent_decode(v_raw.trim())?;
+
+            let k_string = k.into_owned();
+            let v_string = v.into_owned();
+
+            if let Some(existing) = results.iter_mut().find(|(k, _)| k == &k_string) {
+                existing.1 = v_string;
+            } else {
+                results.push((k_string, v_string));
             }
         }
-        Ok((logs, spans))
+
+        Ok(results)
     }
 }
 
@@ -587,27 +814,6 @@ fn with_stack_cstr<const N: usize, R>(s: &str, f: impl FnOnce(&ffi::CStr) -> R) 
 mod tests {
     use super::*;
     use googletest::prelude::*;
-
-    #[test]
-    fn signals() {
-        assert_that!(Signals::parse(""), ok(eq(&(false, false))));
-        assert_that!(Signals::parse(",, "), ok(eq(&(false, false))));
-
-        assert_that!(Signals::parse("log"), ok(eq(&(true, false))));
-        assert_that!(Signals::parse("logs"), ok(eq(&(true, false))));
-
-        assert_that!(Signals::parse("span"), ok(eq(&(false, true))));
-        assert_that!(Signals::parse("traces"), ok(eq(&(false, true))));
-
-        assert_that!(Signals::parse("trace,log"), ok(eq(&(true, true))));
-        assert_that!(Signals::parse("logs, span"), ok(eq(&(true, true))));
-
-        assert_that!(Signals::parse("all"), err(anything()));
-        assert_that!(Signals::parse("none"), err(anything()));
-        assert_that!(Signals::parse("logs,none"), err(anything()));
-        assert_that!(Signals::parse("off"), err(anything()));
-        assert_that!(Signals::parse("invalid"), err(anything()));
-    }
 
     #[test]
     fn headers_parse_basic() {
@@ -694,5 +900,109 @@ mod tests {
         // Reject interior nul byte
         let res = with_stack_cstr::<16, _>("bad\0str", |_| ());
         assert_that!(res, none());
+    }
+
+    #[test]
+    fn resource_attributes_parse_basic() {
+        let input = "service.name=my-service,deployment.environment=production";
+        assert_that!(
+            ResourceAttributes::parse(input),
+            ok(unordered_elements_are![
+                (eq("service.name"), eq("my-service")),
+                (eq("deployment.environment"), eq("production")),
+            ])
+        );
+    }
+
+    #[test]
+    fn resource_attributes_parse_percent_encoded() {
+        let input = "service.name=my%20service,tags=foo%2Cbar%3Dbaz,unicode=%C3%BCber";
+        assert_that!(
+            ResourceAttributes::parse(input),
+            ok(unordered_elements_are![
+                (eq("service.name"), eq("my service")),
+                (eq("tags"), eq("foo,bar=baz")),
+                (eq("unicode"), eq("über")),
+            ])
+        );
+    }
+
+    #[test]
+    fn resource_attributes_parse_whitespace_and_empty() {
+        let input = "  k1 = v1 , , k2 = v2 , ";
+        assert_that!(
+            ResourceAttributes::parse(input),
+            ok(unordered_elements_are![
+                (eq("k1"), eq("v1")),
+                (eq("k2"), eq("v2")),
+            ])
+        );
+
+        assert_that!(ResourceAttributes::parse(""), ok(is_empty()));
+        assert_that!(ResourceAttributes::parse("   "), ok(is_empty()));
+    }
+
+    #[test]
+    fn resource_attributes_duplicate_keys() {
+        let input = "k1=first,k2=foo,k1=second";
+        assert_that!(
+            ResourceAttributes::parse(input),
+            ok(unordered_elements_are![
+                (eq("k1"), eq("second")),
+                (eq("k2"), eq("foo")),
+            ])
+        );
+    }
+
+    #[test]
+    fn resource_attributes_parse_invalid_syntax() {
+        let input = "missing_delimiter";
+        assert_that!(
+            ResourceAttributes::parse(input),
+            err(displays_as(contains_substring(
+                "invalid resource attribute syntax: missing '='"
+            )))
+        );
+
+        let input_empty_key = "=value";
+        assert_that!(
+            ResourceAttributes::parse(input_empty_key),
+            err(displays_as(contains_substring(
+                "invalid resource attribute syntax: key cannot be empty"
+            )))
+        );
+
+        let input_invalid_hex = "k=%ZZ";
+        assert_that!(
+            ResourceAttributes::parse(input_invalid_hex),
+            err(displays_as(contains_substring("is not valid hex")))
+        );
+
+        let input_truncated = "k=%2";
+        assert_that!(
+            ResourceAttributes::parse(input_truncated),
+            err(displays_as(contains_substring("truncated sequence")))
+        );
+    }
+
+    #[test]
+    fn resource_default_construction() {
+        use crate::otlp::{AnyValue, AnyValueExt, KeyValue, KeyValueExt};
+
+        let res = resource();
+        assert_that!(
+            res.attributes,
+            contains(eq(&KeyValue::new(
+                "service.name",
+                AnyValue::new_string("postgresql")
+            )))
+        );
+        assert_that!(
+            res.attributes,
+            contains(eq(&KeyValue::new(
+                "service.version",
+                AnyValue::new_string(service_version())
+            )))
+        );
     }
 }

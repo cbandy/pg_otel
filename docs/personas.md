@@ -18,7 +18,7 @@ This document describes the key personas that `pg_otel` is designed to serve, in
   * Demands predictable resource caps (shared memory buffer size, background worker CPU/memory limits).
   * Requires dynamic reconfigurability without database restarts (`pg_reload_conf()`, GUCs).
 - **Design Impact on `pg_otel`**:
-  * Safe-by-default: loading the library does nothing until explicitly enabled via `otel.export`.
+  * Safe-by-default: loading the library does nothing until explicitly enabled via `otel.export_logs` or `otel.export_traces`.
   * Invariant: backends and hooks must never block client queries or spawn threads. Backpressure must drop telemetry rather than pause transactions.
   * Configuration exposed as standard PostgreSQL GUCs (`otel.*`).
 

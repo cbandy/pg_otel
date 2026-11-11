@@ -2,6 +2,7 @@
 
 mod config;
 mod context;
+mod encoding;
 mod exporter;
 mod hooks;
 mod logging;
@@ -50,6 +51,7 @@ pub extern "C-unwind" fn _PG_init() {
     assert!(assert_postmaster_startup());
 
     crate::config::define_guc_variables();
+    crate::config::read_environment();
     crate::exporter::initialize_worker();
     crate::hooks::install();
 }
