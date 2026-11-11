@@ -181,7 +181,7 @@ mod tests {
         let endpoint = crate::config::otlp_endpoint().join("/test/logs").unwrap();
         reqwest::blocking::get(endpoint.clone()).unwrap();
 
-        pgrx::Spi::run("SET LOCAL otel.export = 'logs'").unwrap();
+        pgrx::Spi::run("SET LOCAL otel.export_logs = on").unwrap();
         pgrx::warning!("integration test log record message");
 
         let start = time::Instant::now();
@@ -203,6 +203,13 @@ mod tests {
         assert_that!(
             data,
             contains(matches_pattern!(crate::otlp::ResourceLogs {
+                resource: some(matches_pattern!(crate::otlp::Resource {
+                    attributes: contains(eq(&crate::otlp::KeyValue::new(
+                        "service.name",
+                        AnyValue::new_string("postgresql"),
+                    ))),
+                    ..
+                })),
                 scope_logs: contains(matches_pattern!(crate::otlp::ScopeLogs {
                     log_records: contains(matches_pattern!(crate::otlp::LogRecord {
                         attributes: contains(eq(&crate::otlp::KeyValue::new(

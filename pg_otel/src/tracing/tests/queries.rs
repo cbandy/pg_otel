@@ -27,6 +27,31 @@ mod tests {
     }
 
     #[pgrx::pg_test]
+    fn query_resource_attached() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+        harness.enable_tracing()?;
+        harness.client.batch_execute("SELECT 1")?;
+
+        let resource_spans = harness.collect_resource_spans(time::Duration::from_secs(1));
+        verify_that!(resource_spans, len(gt(0)))?;
+        let resource = resource_spans[0]
+            .resource
+            .as_ref()
+            .expect("missing resource");
+        verify_that!(
+            resource.attributes,
+            contains(eq(&KeyValue::new_string("service.name", "postgresql")))
+        )?;
+        verify_that!(
+            resource.attributes,
+            contains(eq(&KeyValue::new_string(
+                "service.version",
+                crate::config::service_version()
+            )))
+        )
+    }
+
+    #[pgrx::pg_test]
     fn query_with_comment_context() -> Result<()> {
         let mut harness = TracingHarness::new()?;
         harness.enable_tracing()?;

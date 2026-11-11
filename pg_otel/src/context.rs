@@ -197,7 +197,7 @@ impl core::fmt::Debug for TraceFlags {
     }
 }
 
-pub type Str<'a> = std::borrow::Cow<'a, str>;
+type Str<'a> = std::borrow::Cow<'a, str>;
 
 /// W3C Trace Context headers extracted from a statement or session.
 #[derive(Debug, PartialEq)]
@@ -368,12 +368,12 @@ impl<'a> CommenterIterator<'a> {
 
     // Reverses the double-encoding defined by [SQLCommenter](https://google.github.io/sqlcommenter/spec#parsing).
     fn decode(encoded: &'a str) -> Str<'a> {
-        Self::reverse_percent_encoding(Self::reverse_backslashes(Str::Borrowed(encoded)))
+        crate::encoding::percent_decode_lossy(Self::reverse_backslashes(encoded))
     }
 
-    fn reverse_backslashes(encoded: Str<'a>) -> Str<'a> {
+    fn reverse_backslashes(encoded: &'a str) -> Str<'a> {
         let Some((head, mut tail)) = encoded.split_once('\\') else {
-            return encoded;
+            return Str::Borrowed(encoded);
         };
 
         let mut result = String::with_capacity(encoded.len());
@@ -398,48 +398,6 @@ impl<'a> CommenterIterator<'a> {
         }
 
         Str::Owned(result)
-    }
-
-    fn reverse_percent_encoding(encoded: Str) -> Str {
-        let Some((head, mut tail)) = encoded.split_once('%') else {
-            return encoded;
-        };
-
-        #[inline(always)]
-        fn hex(byte: &u8) -> Option<u8> {
-            match byte {
-                b'0'..=b'9' => Some(byte - b'0'),
-                b'a'..=b'f' => Some(byte - b'a' + 10),
-                b'A'..=b'F' => Some(byte - b'A' + 10),
-                _ => None,
-            }
-        }
-
-        let mut result = String::with_capacity(encoded.len());
-        result.push_str(head);
-
-        #[allow(clippy::get_first)]
-        loop {
-            if let (Some(hi), Some(lo)) = (
-                tail.as_bytes().get(0).and_then(hex),
-                tail.as_bytes().get(1).and_then(hex),
-            ) {
-                // Append the decoded value and step past it.
-                result.push(((hi << 4) | lo) as char);
-                tail = &tail[2..];
-            } else {
-                // Append '%' when the encoding is invalid or incomplete.
-                result.push('%');
-            }
-
-            if let Some((head, next)) = tail.split_once('%') {
-                result.push_str(head);
-                tail = next;
-            } else {
-                result.push_str(tail);
-                return Str::Owned(result);
-            }
-        }
     }
 }
 
@@ -546,6 +504,11 @@ mod tests {
         assert_that!(CommenterIterator::decode("foo%2"), eq("foo%2"));
         assert_that!(CommenterIterator::decode("foo%"), eq("foo%"));
         assert_that!(CommenterIterator::decode("foo%ZZ%20bar"), eq("foo%ZZ bar"));
+
+        // valid percent encoding and multi-byte UTF-8
+        assert_that!(CommenterIterator::decode("foo%20bar"), eq("foo bar"));
+        assert_that!(CommenterIterator::decode("foo%C3%BCbar"), eq("fooübar"));
+        assert_that!(CommenterIterator::decode("emoji%E2%9C%A8"), eq("emoji✨"));
     }
 
     #[test]

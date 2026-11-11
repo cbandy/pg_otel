@@ -79,13 +79,13 @@ pub fn install() {
             return;
         }
 
-        if crate::config::spans_enabled()
+        if crate::config::export_traces()
             && let Some(record) = unsafe { edata.as_ref() }
         {
             crate::tracing::emit_log(record);
         }
 
-        if crate::config::logs_enabled() {
+        if crate::config::export_logs() {
             // Get the current time before calling other hooks.
             let now = time::SystemTime::now();
 
@@ -134,7 +134,7 @@ pub fn install() {
             }
         };
 
-        if crate::config::spans_enabled()
+        if crate::config::export_traces()
             && let Some(pstmt) = unsafe { ps.as_ref() }
             && let Some(tree) = unsafe { pstmt.utilityStmt.as_ref() }
         {
@@ -166,7 +166,7 @@ pub fn install() {
     ) {
         use pg_sys::SubXactEvent::*;
 
-        // NOTE: This does NOT check `spans_enabled` because these functions clean up anything
+        // NOTE: This does NOT check `export_traces` because these functions clean up anything
         // created by the start hooks.
         if event == SUBXACT_EVENT_ABORT_SUB {
             crate::tracing::subtransaction_abort();
@@ -185,7 +185,7 @@ pub fn install() {
     ) {
         use pg_sys::XactEvent::*;
 
-        // NOTE: This does NOT check `spans_enabled` because these functions clean up anything
+        // NOTE: This does NOT check `export_traces` because these functions clean up anything
         // created by the start hooks.
         match event {
             XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => crate::tracing::transaction_abort(),
@@ -207,7 +207,7 @@ pub fn install() {
     /// This is called by Postgres via C FFI and must have the `#[pgrx::pg_guard]` attribute.
     #[pgrx::pg_guard]
     unsafe extern "C-unwind" fn executor_start_hook(qd: *mut pg_sys::QueryDesc, ef: i32) {
-        if crate::config::spans_enabled()
+        if crate::config::export_traces()
             && let Some(query) = unsafe { qd.as_ref() }
             && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
         {
@@ -245,7 +245,7 @@ pub fn install() {
             unsafe { pg_sys::standard_ExecutorEnd(qd) };
         }
 
-        if crate::config::spans_enabled()
+        if crate::config::export_traces()
             && let Some(query) = unsafe { qd.as_ref() }
             && let Some(pstmt) = unsafe { query.plannedstmt.as_ref() }
         {

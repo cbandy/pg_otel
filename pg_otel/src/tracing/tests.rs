@@ -34,19 +34,21 @@ impl TracingHarness {
     }
 
     /// Drains any residual telemetry for the specified signals from the mock collector
-    /// and sets `otel.export = …`.
+    /// and sets `otel.export_traces` and/or `otel.export_logs`.
     fn enable_telemetry(&mut self, signals: &str) -> Result<(), postgres::Error> {
+        let mut sql = String::new();
         if signals.contains("trace") || signals.contains("span") {
             let _ = reqwest::blocking::get(self.traces.clone());
+            sql.push_str("SET otel.export_traces = on; ");
         }
         if signals.contains("log") {
             let _ = reqwest::blocking::get(self.logs.clone());
+            sql.push_str("SET otel.export_logs = on; ");
         }
-        self.client
-            .batch_execute(&format!("SET otel.export = '{signals}'"))
+        self.client.batch_execute(&sql)
     }
 
-    /// Drains any residual spans from the mock collector and sets `otel.export = 'traces'`.
+    /// Drains any residual spans from the mock collector and sets `otel.export_traces = on`.
     fn enable_tracing(&mut self) -> Result<(), postgres::Error> {
         self.enable_telemetry("traces")
     }
@@ -148,5 +150,24 @@ impl TracingHarness {
         self.collect_spans_until(timeout, |spans, _| {
             spans.iter().any(|s| s.name == "TRANSACTION")
         })
+    }
+
+    fn collect_resource_spans(&self, timeout: time::Duration) -> Vec<ResourceSpans> {
+        let start = time::Instant::now();
+        let mut data = Vec::new();
+
+        while start.elapsed() < timeout {
+            thread::sleep(time::Duration::from_millis(50));
+
+            if let Ok(response) = reqwest::blocking::get(self.traces.clone())
+                && let Ok(body) = response.bytes()
+                && !body.is_empty()
+                && let Ok(decoded) = TracesData::decode(body)
+            {
+                data.extend(decoded.resource_spans);
+                break;
+            }
+        }
+        data
     }
 }
