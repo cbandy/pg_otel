@@ -322,6 +322,7 @@ mod tests {
             $$;",
         )?;
 
+        harness.simple_query("SET otel.trace_parallel_workers = on")?;
         harness.enable_tracing()?;
 
         // Case 1: With nested statement budget enabled (CALL -> nested SELECT -> parallel worker SELECT)
