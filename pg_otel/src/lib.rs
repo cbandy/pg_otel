@@ -11,6 +11,7 @@ mod shmem;
 mod tracing;
 
 pub(crate) use prost::bytes::BytesMut;
+pub(crate) type Str<'a> = std::borrow::Cow<'a, str>;
 
 use pgrx::pg_sys;
 

@@ -2,7 +2,7 @@
 
 //! URL percent-decoding utilities per RFC 3986.
 
-type Str<'a> = std::borrow::Cow<'a, str>;
+use crate::Str;
 
 #[inline(always)]
 fn hex(byte: u8) -> Option<u8> {
