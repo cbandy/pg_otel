@@ -4,8 +4,10 @@ mod sqlcommenter;
 
 use self::sqlcommenter::CommenterIterator;
 use crate::Str;
-use core::cell::Cell;
-use pgrx::{pg_sys, void_mut_ptr};
+use core::cell::{Cell, RefCell};
+use pgrx::pg_sys::{self, PgNode};
+use pgrx::void_mut_ptr;
+use std::ffi;
 use std::rc::Rc;
 
 thread_local! {
@@ -335,6 +337,577 @@ impl<'a> Headers<'a> {
         let comment = sql.trim_end().strip_suffix("*/")?;
         let (_, comment) = comment.rsplit_once("/*")?;
         Self::from_comment(comment)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StackEntry {
+    /// C1: Transaction caller context (from `BEGIN` comment/GUC or late-bound `SET LOCAL`).
+    TransactionCaller(SpanContext),
+    /// T: Generated context for the `TRANSACTION` span.
+    TransactionSpan(SpanContext),
+    /// C2 or C_leader: Statement caller context (from statement comment/GUC or parallel leader).
+    StatementCaller(SpanContext),
+    /// S1, S2..Sn, or S_worker: Generated context for a statement span.
+    StatementSpan {
+        context: SpanContext,
+        depth: usize,
+        scope_budget: u32,
+    },
+}
+
+impl StackEntry {
+    fn context(&self) -> &SpanContext {
+        match self {
+            Self::TransactionCaller(c)
+            | Self::TransactionSpan(c)
+            | Self::StatementCaller(c)
+            | Self::StatementSpan { context: c, .. } => c,
+        }
+    }
+}
+
+thread_local! {
+    /// Active contexts ordered from Root (`index 0`) to Current (`last`):
+    /// `[C1?, T?, C2?, S1?, S2?, ...]` (or `[C_leader?, S_worker?]` in parallel workers).
+    static CONTEXT_STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) };
+
+    /// Tracks the starting byte offset of the unparsed remainder in a multi-statement simple query batch.
+    ///
+    /// Since PostgreSQL 18, `PlannedStmt::stmt_location` advances past leading comments to the first SQL keyword.
+    /// The value here marks where the previous statement ended so leading comments can be recovered without backward scanning.
+    /// It also anchors synthetic error spans when a batch aborts.
+    static BATCH_CURSOR: Cell<usize> = const { Cell::new(0) };
+
+    /// Whether the backend is currently inside a `COMMIT` or `ROLLBACK` utility statement.
+    static IN_COMMIT_OR_ROLLBACK: Cell<bool> = const { Cell::new(false) };
+
+    /// Whether the current transaction was started explicitly via `BEGIN` / `START`.
+    static IS_EXPLICIT_TRANSACTION: Cell<bool> = const { Cell::new(false) };
+
+    /// Statement execution depth (`0` when idle, `1` for top-level statement, `> 1` for nested).
+    static STATEMENT_DEPTH: Cell<usize> = const { Cell::new(0) };
+
+    /// Whether `[C1?, T?]` has already been resolved for the current transaction.
+    static TRANSACTION_RESOLVED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Advances the batch SQL cursor to the position immediately after the completed statement's terminating semicolon.
+///
+/// PostgreSQL documents on `PlannedStmt` in `plannodes.h` that:
+/// - `stmt_location` is the start byte offset, or -1 if unknown.
+/// - `stmt_len` is the length in bytes; `0` means "rest of string".
+///
+/// The definitions in `gram.y` ensure that when `stmt_len > 0`,
+/// `stmt_location + stmt_len` points directly at the terminating `;` token.
+///
+/// When the statement extends to EOF or reaches the end of the query string,
+/// the cursor resets to `0` ahead of the next query.
+fn batch_advance_cursor(sql: &str, stmt_location: i32, stmt_len: i32) {
+    if stmt_location < 0 || stmt_len <= 0 {
+        BATCH_CURSOR.set(0);
+        return;
+    }
+    let stmt_end = (stmt_location + stmt_len) as usize;
+    let next_pos = if sql.as_bytes().get(stmt_end) == Some(&b';') {
+        stmt_end + 1
+    } else {
+        stmt_end
+    };
+    let reached_end = sql
+        .get(next_pos..)
+        .is_none_or(|s| s.trim_ascii_start().is_empty());
+
+    BATCH_CURSOR.set(if reached_end { 0 } else { next_pos });
+}
+
+/// Returns the unparsed remainder of `debug_query_string`.
+fn batch_remainder() -> Option<&'static str> {
+    let query = unsafe { pg_sys::debug_query_string };
+    if query.is_null() {
+        return None;
+    }
+    let sql = unsafe { ffi::CStr::from_ptr(query) }.to_str().ok()?;
+    Some(sql.get(BATCH_CURSOR.get()..).unwrap_or(sql))
+}
+
+/// Extracts incoming trace context for a statement, preferring SQL comments over session GUCs.
+fn take_statement_context(
+    pstmt: Option<&pg_sys::PlannedStmt>,
+    sql: Option<&str>,
+) -> Option<SpanContext> {
+    // Consume and clear any pending session context GUCs.
+    let guc_ctx = crate::config::take_trace_context();
+
+    let comment_ctx = sql
+        .filter(|_| crate::config::sqlcommenter())
+        .and_then(|s| {
+            let (start, len) = pstmt.map_or((None, None), |p| {
+                (
+                    usize::try_from(p.stmt_location).ok(),
+                    usize::try_from(p.stmt_len).ok().filter(|&l| l > 0),
+                )
+            });
+            let body = match (start, len) {
+                (Some(loc), Some(l)) => s.get(loc..loc + l),
+                (Some(loc), None) => s.get(loc..),
+                (None, _) => None,
+            }
+            .unwrap_or(s);
+
+            // Trailing comments (SQLCommenter) take precedence over leading comments.
+            //
+            // Since PostgreSQL 18, `PlannedStmt::stmt_location` points to the first SQL keyword.
+            // Leading comments therefore reside at the tail of the area between the previous
+            // statement's terminating delimiter (`BATCH_CURSOR`) and `start`.
+            std::cfg_select! {
+                any(feature = "pg15", feature = "pg16", feature = "pg17") => {
+                    Headers::from_tail(body).or_else(|| Headers::from_head(body))
+                }
+                _ => {
+                    Headers::from_tail(body).or_else(|| {
+                        let prefix = s.get(BATCH_CURSOR.get()..start?)?;
+                        Headers::from_tail(prefix)
+                    })
+                }
+            }
+        })
+        .and_then(|h| SpanContext::try_from(h).ok());
+
+    comment_ctx.or(guc_ctx)
+}
+
+/// Resolves `[C1?, T?]` at most once when inside a transaction block.
+fn ensure_transaction_context() {
+    if TRANSACTION_RESOLVED.get() || !unsafe { pg_sys::IsTransactionBlock() } {
+        return;
+    }
+
+    CONTEXT_STACK.with_borrow_mut(|s| {
+        // Add `C1` to the stack if `process_utility_start()` did not find it attached to `BEGIN`.
+        if s.is_empty()
+            && let Some(c1) = crate::config::take_trace_context()
+        {
+            s.push(StackEntry::TransactionCaller(c1));
+        }
+
+        // Add `T` to the stack when transaction spans are enabled and exported.
+        if crate::config::export_traces() && crate::config::trace_transactions() {
+            let t = match s.last() {
+                Some(parent) => SpanContext::child_of(parent.context()),
+                None => SpanContext::root(),
+            };
+            s.push(StackEntry::TransactionSpan(t));
+        }
+    });
+
+    TRANSACTION_RESOLVED.set(true);
+}
+
+fn push_statement_context(pstmt: Option<&pg_sys::PlannedStmt>, sql: Option<&str>) {
+    ensure_transaction_context();
+    let stmt_caller = take_statement_context(pstmt, sql);
+
+    CONTEXT_STACK.with_borrow_mut(|s| {
+        if let Some(c2) = stmt_caller {
+            s.push(StackEntry::StatementCaller(c2));
+        }
+
+        if crate::config::export_traces() && crate::config::trace_statements() {
+            let s1 = match s.last() {
+                Some(parent) => SpanContext::child_of(parent.context()),
+                None => SpanContext::root(),
+            };
+            s.push(StackEntry::StatementSpan {
+                context: s1,
+                depth: 1,
+                scope_budget: crate::config::nested_statements_request()
+                    .min(crate::config::nested_statements_max()),
+            });
+        }
+    });
+}
+
+fn push_nested_statement_context(depth: usize) {
+    if !crate::config::export_traces() || !crate::config::trace_statements() {
+        return;
+    }
+
+    CONTEXT_STACK.with_borrow_mut(|s| {
+        if let [
+            rest @ ..,
+            StackEntry::StatementSpan {
+                context: parent_ctx,
+                depth: parent_depth,
+                scope_budget: parent_budget,
+            },
+        ] = s.as_mut_slice()
+            && *parent_depth == depth - 1
+        {
+            // Read the routine-local nesting limit, if any.
+            let limit = crate::config::nested_statements_request()
+                .min(crate::config::nested_statements_max());
+
+            // Clamp the budget of the context of the already-executing routine.
+            // Return any excess to the context prior to that one, if any.
+            if *parent_budget > limit {
+                let excess = *parent_budget - limit;
+                *parent_budget = limit;
+
+                if let Some(StackEntry::StatementSpan {
+                    scope_budget: grandparent_budget,
+                    ..
+                }) = rest.last_mut()
+                {
+                    *grandparent_budget += excess;
+                }
+            }
+
+            if *parent_budget > 0 {
+                // Pay for this push onto the stack.
+                *parent_budget -= 1;
+
+                // Pass on ownership of the remaining budget.
+                let child_budget = std::mem::take(parent_budget);
+                let child_ctx = SpanContext::child_of(parent_ctx);
+
+                s.push(StackEntry::StatementSpan {
+                    context: child_ctx,
+                    depth,
+                    scope_budget: child_budget,
+                });
+            }
+        }
+    });
+}
+
+fn pop_statement_contexts() {
+    CONTEXT_STACK.with_borrow_mut(|s| {
+        while s.last().is_some_and(|e| {
+            matches!(
+                e,
+                StackEntry::StatementCaller(_) | StackEntry::StatementSpan { .. }
+            )
+        }) {
+            s.pop();
+        }
+    });
+}
+
+fn pop_nested_statement_context(depth: usize) {
+    CONTEXT_STACK.with_borrow_mut(|s| {
+        if s.last()
+            .is_some_and(|e| matches!(e, StackEntry::StatementSpan { depth: d, .. } if *d == depth))
+            && let Some(StackEntry::StatementSpan {
+                scope_budget: unused,
+                ..
+            }) = s.pop()
+            && let Some(StackEntry::StatementSpan {
+                scope_budget: parent_budget,
+                ..
+            }) = s.last_mut()
+        {
+            *parent_budget += unused;
+        }
+    });
+}
+
+fn reset_transaction_state() {
+    STATEMENT_DEPTH.set(0);
+    IS_EXPLICIT_TRANSACTION.set(false);
+    TRANSACTION_RESOLVED.set(false);
+    IN_COMMIT_OR_ROLLBACK.set(false);
+    CONTEXT_STACK.with_borrow_mut(Vec::clear);
+}
+
+/// Returns the current statement nesting depth, `0` when idle.
+pub(crate) fn depth() -> usize {
+    STATEMENT_DEPTH.get()
+}
+
+/// Returns `true` while executing a `COMMIT` or `ROLLBACK` utility statement.
+pub(crate) fn in_commit_or_rollback() -> bool {
+    IN_COMMIT_OR_ROLLBACK.get()
+}
+
+/// Returns `true` when an explicit transaction block is aborting an intermediate statement
+/// (`TBLOCK_ABORT`) and remains alive awaiting `ROLLBACK` or `COMMIT`.
+pub(crate) fn is_transaction_retained_on_abort() -> bool {
+    IS_EXPLICIT_TRANSACTION.get()
+        && unsafe { pg_sys::IsTransactionBlock() }
+        && !IN_COMMIT_OR_ROLLBACK.get()
+}
+
+/// Returns the currently active [`SpanContext`], if any.
+pub(crate) fn current() -> Option<SpanContext> {
+    CONTEXT_STACK.with_borrow(|s| s.last().map(|e| e.context().clone()))
+}
+
+/// Returns the active statement span's `(context, parent_span_id, link_context)` at the current depth, if any.
+///
+/// `link_context` is `Some(T)` iff the stack ends with `[..., TransactionSpan(T), StatementCaller(C2), StatementSpan(S1)]`.
+pub(crate) fn statement() -> Option<(SpanContext, Option<SpanId>, Option<SpanContext>)> {
+    let target_depth = STATEMENT_DEPTH.get().max(1);
+    CONTEXT_STACK.with_borrow(|s| match s.as_slice() {
+        [rest @ .., StackEntry::StatementSpan { context, depth, .. }] if *depth == target_depth => {
+            let parent_id = rest.last().map(|e| e.context().span_id);
+            let link_ctx = match rest {
+                [
+                    ..,
+                    StackEntry::TransactionSpan(tx),
+                    StackEntry::StatementCaller(_),
+                ] if *depth == 1 => Some(tx.clone()),
+                _ => None,
+            };
+            Some((context.clone(), parent_id, link_ctx))
+        }
+        _ => None,
+    })
+}
+
+/// Returns the active transaction span's `(T, parent_span_id)`, if any.
+pub(crate) fn transaction() -> Option<(SpanContext, Option<SpanId>)> {
+    CONTEXT_STACK.with_borrow(|s| {
+        let pos = s
+            .iter()
+            .position(|e| matches!(e, StackEntry::TransactionSpan(_)))?;
+        let ctx = s[pos].context().clone();
+        let parent_id = pos
+            .checked_sub(1)
+            .and_then(|p| s.get(p))
+            .map(|e| e.context().span_id);
+        Some((ctx, parent_id))
+    })
+}
+
+/// Called from [`pg_sys::emit_log_hook`] before `tracing` and `logging`.
+///
+/// When a statement fails during parsing or planning (before `ExecutorStart` or `ProcessUtility`
+/// is reached), this resolves the context for error log correlation and synthetic error spans.
+pub(crate) fn emit_log(record: &pg_sys::ErrorData) {
+    use pg_sys::errcodes::PgSqlErrorCode;
+
+    if record.elevel < pg_sys::PGERROR as i32
+        || record.sqlerrcode == PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION as i32
+    {
+        return;
+    }
+
+    if STATEMENT_DEPTH.get() == 0
+        && !IN_COMMIT_OR_ROLLBACK.get()
+        && !unsafe { pg_sys::IsAbortedTransactionBlockState() }
+    {
+        push_statement_context(None, batch_remainder());
+    }
+}
+
+/// Called from [`pg_sys::ExecutorStart_hook`] before `tracing` when telemetry is enabled.
+pub(crate) fn executor_start(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
+    if IN_COMMIT_OR_ROLLBACK.get() {
+        return;
+    }
+
+    let depth = STATEMENT_DEPTH.get() + 1;
+    STATEMENT_DEPTH.set(depth);
+
+    if unsafe { pg_sys::ParallelWorkerNumber >= 0 } {
+        if depth == 1
+            && let Some(c_leader) = crate::config::read_trace_context()
+        {
+            CONTEXT_STACK.with_borrow_mut(|s| {
+                s.push(StackEntry::StatementCaller(c_leader.clone()));
+                if crate::config::export_traces()
+                    && crate::config::trace_statements()
+                    && crate::config::trace_parallel_workers()
+                {
+                    let s_worker = SpanContext::child_of(&c_leader);
+                    s.push(StackEntry::StatementSpan {
+                        context: s_worker,
+                        depth: 1,
+                        scope_budget: 0,
+                    });
+                }
+            });
+        }
+        return;
+    }
+
+    if depth == 1 {
+        push_statement_context(Some(pstmt), sql);
+    } else {
+        push_nested_statement_context(depth);
+    }
+
+    if pstmt.parallelModeNeeded
+        && let Some(ctx) = current()
+    {
+        crate::config::set_trace_context(&ctx.w3c_traceparent(), &ctx.trace_state);
+    }
+}
+
+/// Called from [`pg_sys::ExecutorEnd_hook`] after `tracing` when telemetry is enabled.
+pub(crate) fn executor_end(pstmt: &pg_sys::PlannedStmt, sql: Option<&str>) {
+    let depth = STATEMENT_DEPTH.get();
+    if IN_COMMIT_OR_ROLLBACK.get() || depth == 0 {
+        return;
+    }
+    STATEMENT_DEPTH.set(depth - 1);
+
+    if unsafe { pg_sys::ParallelWorkerNumber >= 0 } {
+        if depth == 1 {
+            pop_statement_contexts();
+        }
+        return;
+    }
+
+    if depth == 1 {
+        pop_statement_contexts();
+    } else {
+        pop_nested_statement_context(depth);
+    }
+
+    if pstmt.parallelModeNeeded {
+        crate::config::clear_trace_context();
+    }
+
+    if depth == 1
+        && let Some(src) = sql
+    {
+        batch_advance_cursor(src, pstmt.stmt_location, pstmt.stmt_len);
+    }
+}
+
+/// Called from [`pg_sys::ProcessUtility_hook`] before `tracing` and downstream hooks.
+pub(crate) fn process_utility_start(
+    pstmt: &pg_sys::PlannedStmt,
+    tree: &pg_sys::Node,
+    sql: Option<&str>,
+) {
+    use pg_sys::{NodeTag, TransactionStmtKind as StmtKind};
+
+    let depth = STATEMENT_DEPTH.get();
+
+    match tree
+        .try_as::<pg_sys::TransactionStmt>()
+        .map(|xact| xact.kind)
+    {
+        Some(StmtKind::TRANS_STMT_BEGIN | StmtKind::TRANS_STMT_START) => {
+            IS_EXPLICIT_TRANSACTION.set(true);
+            if depth == 0
+                && !TRANSACTION_RESOLVED.get()
+                && let Some(c1) = take_statement_context(Some(pstmt), sql)
+            {
+                // Add `C1` to the stack if it is attached to this statement.
+                // Add `T` to the stack when transaction spans are enabled and exported.
+                CONTEXT_STACK.with_borrow_mut(|s| {
+                    if crate::config::export_traces() && crate::config::trace_transactions() {
+                        let t = SpanContext::child_of(&c1);
+                        s.push(StackEntry::TransactionCaller(c1));
+                        s.push(StackEntry::TransactionSpan(t));
+                    } else {
+                        s.push(StackEntry::TransactionCaller(c1));
+                    }
+                });
+                TRANSACTION_RESOLVED.set(true);
+            }
+        }
+        Some(StmtKind::TRANS_STMT_COMMIT | StmtKind::TRANS_STMT_ROLLBACK) => {
+            let new_depth = depth + 1;
+            STATEMENT_DEPTH.set(new_depth);
+            IN_COMMIT_OR_ROLLBACK.set(true);
+
+            if new_depth == 1 {
+                push_statement_context(Some(pstmt), sql);
+            }
+        }
+        _ if tree.is_a(NodeTag::T_VariableSetStmt) => {}
+        _ => {
+            let new_depth = depth + 1;
+            STATEMENT_DEPTH.set(new_depth);
+            if new_depth == 1 {
+                push_statement_context(Some(pstmt), sql);
+            } else {
+                push_nested_statement_context(new_depth);
+            }
+        }
+    }
+}
+
+/// Called from [`pg_sys::ProcessUtility_hook`] after downstream hooks and `tracing`.
+pub(crate) fn process_utility_end(
+    pstmt: &pg_sys::PlannedStmt,
+    tree: &pg_sys::Node,
+    sql: Option<&str>,
+) {
+    use pg_sys::{NodeTag, TransactionStmtKind as StmtKind};
+
+    let depth = STATEMENT_DEPTH.get();
+
+    match tree
+        .try_as::<pg_sys::TransactionStmt>()
+        .map(|xact| xact.kind)
+    {
+        Some(StmtKind::TRANS_STMT_BEGIN | StmtKind::TRANS_STMT_START) => {
+            if depth == 0
+                && let Some(src) = sql
+            {
+                batch_advance_cursor(src, pstmt.stmt_location, pstmt.stmt_len);
+            }
+        }
+        Some(StmtKind::TRANS_STMT_COMMIT | StmtKind::TRANS_STMT_ROLLBACK) => {
+            if depth == 1
+                && let Some(src) = sql
+            {
+                batch_advance_cursor(src, pstmt.stmt_location, pstmt.stmt_len);
+            }
+            if !unsafe { pg_sys::IsTransactionState() } {
+                reset_transaction_state();
+            }
+        }
+        _ if tree.is_a(NodeTag::T_VariableSetStmt) => {
+            if depth == 0
+                && let Some(src) = sql
+            {
+                batch_advance_cursor(src, pstmt.stmt_location, pstmt.stmt_len);
+            }
+        }
+        _ => {
+            if depth == 0 {
+                return;
+            }
+            STATEMENT_DEPTH.set(depth - 1);
+            if depth == 1 {
+                pop_statement_contexts();
+                if let Some(src) = sql {
+                    batch_advance_cursor(src, pstmt.stmt_location, pstmt.stmt_len);
+                }
+            } else {
+                pop_nested_statement_context(depth);
+            }
+        }
+    }
+}
+
+/// Called unconditionally via [`pg_sys::RegisterSubXactCallback`] on subtransaction abort.
+pub(crate) fn subtransaction_abort() {
+    STATEMENT_DEPTH.set(0);
+    pop_statement_contexts();
+}
+
+/// Called unconditionally via [`pg_sys::RegisterXactCallback`] on transaction commit.
+pub(crate) fn transaction_commit() {
+    reset_transaction_state();
+}
+
+/// Called unconditionally via [`pg_sys::RegisterXactCallback`] on transaction abort.
+pub(crate) fn transaction_abort() {
+    BATCH_CURSOR.set(0);
+
+    if is_transaction_retained_on_abort() {
+        STATEMENT_DEPTH.set(0);
+        pop_statement_contexts();
+    } else {
+        reset_transaction_state();
     }
 }
 

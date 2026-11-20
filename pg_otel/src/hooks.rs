@@ -79,13 +79,19 @@ pub fn install() {
             return;
         }
 
-        if crate::config::export_traces()
+        let export_traces = crate::config::export_traces();
+        let export_logs = crate::config::export_logs();
+
+        if (export_traces || export_logs)
             && let Some(record) = unsafe { edata.as_ref() }
         {
-            crate::tracing::emit_log(record);
+            crate::context::emit_log(record);
+            if export_traces {
+                crate::tracing::emit_log(record);
+            }
         }
 
-        if crate::config::export_logs() {
+        if export_logs {
             // Get the current time before calling other hooks.
             let now = time::SystemTime::now();
 
@@ -126,13 +132,28 @@ pub fn install() {
         dr: *mut pg_sys::DestReceiver,
         qc: *mut pg_sys::QueryCompletion,
     ) {
-        let call_remaining_hooks = || unsafe {
+        if (crate::config::export_traces() || crate::config::export_logs())
+            && let Some(pstmt) = unsafe { ps.as_ref() }
+            && let Some(tree) = unsafe { pstmt.utilityStmt.as_ref() }
+        {
+            // This pointer is always populated, but it might not decode as UTF-8.
+            let sql = (!qs.is_null())
+                .then(|| unsafe { ffi::CStr::from_ptr(qs).to_str().ok() })
+                .flatten();
+
+            crate::context::process_utility_start(pstmt, tree, sql);
+            if crate::config::export_traces() {
+                crate::tracing::process_utility_start(pstmt, tree);
+            }
+        }
+
+        unsafe {
             if let Some(next) = HOOK_PROCESS_UTILITY {
                 pg_sys::ffi::pg_guard_ffi_boundary(|| next(ps, qs, ro, pc, pl, qe, dr, qc));
             } else {
                 pg_sys::standard_ProcessUtility(ps, qs, ro, pc, pl, qe, dr, qc);
             }
-        };
+        }
 
         if (crate::config::export_traces() || crate::config::export_logs())
             && let Some(pstmt) = unsafe { ps.as_ref() }
@@ -143,9 +164,10 @@ pub fn install() {
                 .then(|| unsafe { ffi::CStr::from_ptr(qs).to_str().ok() })
                 .flatten();
 
-            crate::tracing::process_utility(pstmt, tree, sql, call_remaining_hooks);
-        } else {
-            call_remaining_hooks();
+            if crate::config::export_traces() {
+                crate::tracing::process_utility_end(tree);
+            }
+            crate::context::process_utility_end(pstmt, tree, sql);
         }
     }
 
@@ -170,6 +192,7 @@ pub fn install() {
         // created by the start hooks.
         if event == SUBXACT_EVENT_ABORT_SUB {
             crate::tracing::subtransaction_abort();
+            crate::context::subtransaction_abort();
         }
     }
 
@@ -188,8 +211,14 @@ pub fn install() {
         // NOTE: This does NOT check `export_traces` because these functions clean up anything
         // created by the start hooks.
         match event {
-            XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => crate::tracing::transaction_abort(),
-            XACT_EVENT_COMMIT => crate::tracing::transaction_commit(),
+            XACT_EVENT_ABORT | XACT_EVENT_PARALLEL_ABORT => {
+                crate::tracing::transaction_abort();
+                crate::context::transaction_abort();
+            }
+            XACT_EVENT_COMMIT => {
+                crate::tracing::transaction_commit();
+                crate::context::transaction_commit();
+            }
             _ => (),
         }
     }
@@ -200,7 +229,7 @@ pub fn install() {
         pg_sys::ExecutorStart_hook = Some(executor_start_hook);
     }
 
-    /// Intercepts query executor start in PostgreSQL. This calls our tracing module first.
+    /// Intercepts query executor start in PostgreSQL. This calls our modules first.
     ///
     /// # Safety
     ///
@@ -216,7 +245,10 @@ pub fn install() {
                 .then(|| unsafe { ffi::CStr::from_ptr(query.sourceText).to_str().ok() })
                 .flatten();
 
-            crate::tracing::executor_start(pstmt, sql);
+            crate::context::executor_start(pstmt, sql);
+            if crate::config::export_traces() {
+                crate::tracing::executor_start(pstmt);
+            }
         }
 
         if let Some(next) = unsafe { HOOK_EXECUTOR_START } {
@@ -232,7 +264,7 @@ pub fn install() {
         pg_sys::ExecutorEnd_hook = Some(executor_end_hook);
     }
 
-    /// Intercepts query executor end in PostgreSQL. This calls our tracing module last.
+    /// Intercepts query executor end in PostgreSQL. This calls our modules last.
     ///
     /// # Safety
     ///
@@ -254,7 +286,10 @@ pub fn install() {
                 .then(|| unsafe { ffi::CStr::from_ptr(query.sourceText).to_str().ok() })
                 .flatten();
 
-            crate::tracing::executor_end(pstmt, sql);
+            if crate::config::export_traces() {
+                crate::tracing::executor_end();
+            }
+            crate::context::executor_end(pstmt, sql);
         }
     }
 }

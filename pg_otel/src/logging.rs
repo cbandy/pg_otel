@@ -152,7 +152,7 @@ pub(crate) fn emit_log(timestamp: time::SystemTime, edata: &pg_sys::ErrorData) -
         record = record.severity_number(n).severity_text(t);
     }
 
-    if let Some(ctx) = crate::tracing::current_span_context() {
+    if let Some(ctx) = crate::context::current() {
         record = record
             .trace_id(ctx.trace_id)
             .span_id(ctx.span_id)

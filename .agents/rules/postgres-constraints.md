@@ -34,3 +34,10 @@ When generating, modifying, or refactoring code for `pg_otel`, you must strictly
   - **DO**: Use `if let Some(v) = unsafe { ptr.as_ref() }` directly on typed hook arguments.
   - **DON'T**: Do not add defensive `ptr.is_aligned()` checks on typed C arguments.
   - **EXCEPTION**: Pointer arithmetic over byte buffers (e.g., `shmem.rs`) MUST enforce or validate alignment.
+
+## 5. FFI Aliasing Rules Across Foreign C Hook Chains
+- **Constraint**: Never hold Rust references (`&T` or `&mut T`) across calls to foreign C hook chains (`call_remaining_hooks()` or `standard_*`).
+- **Why**: In Rust, an immutable reference `&T` asserts to LLVM that no pointer alias can mutate the memory. Foreign C hooks frequently mutate passed structures (such as `ErrorData` or `PlannedStmt`). Holding a reference across foreign calls causes undefined behavior when downstream C hooks mutate the struct.
+- **Rule**:
+  - **DO**: Scope pre-chain borrows into temporary blocks, drop all references before invoking foreign C functions, and re-borrow from raw pointers (`as_ref()`) afterwards.
+  - **DON'T**: Never pass a raw pointer to downstream C hooks while keeping an active Rust reference to the same memory.
