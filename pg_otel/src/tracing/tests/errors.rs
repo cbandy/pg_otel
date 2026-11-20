@@ -11,11 +11,26 @@ mod tests {
     fn simple_query_error() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        for sql in [
+        for (sql, expected_name, expected_attrs) in [
             // This fails while planning, when Postgres folds constants.
-            "SELECT 1/0",
+            (
+                "SELECT 1/0",
+                "postgresql",
+                vec![
+                    KeyValue::new_string("db.system.name", "postgresql"),
+                    KeyValue::new_string("db.response.status_code", "22012"),
+                ],
+            ),
             // This fails while running, when Postgres produces rows.
-            "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+            (
+                "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+                "SELECT",
+                vec![
+                    KeyValue::new_string("db.operation.name", "SELECT"),
+                    KeyValue::new_string("db.system.name", "postgresql"),
+                    KeyValue::new_string("db.response.status_code", "22012"),
+                ],
+            ),
         ] {
             scoped_trace!("{sql:?}");
 
@@ -28,17 +43,13 @@ mod tests {
             verify_that!(
                 all_spans,
                 elements_are![matches_pattern!(Span {
-                    name: eq("SELECT"),
+                    name: eq(expected_name),
                     kind: eq(&(SpanKind::Server as i32)),
                     status: some(eq(&SpanStatus::error(""))),
                     trace_id: not(is_empty()),
                     parent_span_id: is_empty(),
                     span_id: not(is_empty()),
-                    attributes: container_eq([
-                        KeyValue::new_string("db.operation.name", "SELECT"),
-                        KeyValue::new_string("db.system.name", "postgresql"),
-                        KeyValue::new_string("db.response.status_code", "22012"),
-                    ]),
+                    attributes: container_eq(expected_attrs),
                     ..
                 })]
             )?;
@@ -50,11 +61,14 @@ mod tests {
     fn query_error_in_transaction() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        for sql in [
+        for (sql, expected_name) in [
             // This fails while planning, when Postgres folds constants.
-            "SELECT 1/0",
+            ("SELECT 1/0", "postgresql"),
             // This fails while running, when Postgres produces rows.
-            "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+            (
+                "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+                "SELECT",
+            ),
         ] {
             scoped_trace!("{sql:?}");
 
@@ -70,7 +84,7 @@ mod tests {
                 all_spans,
                 elements_are![
                     matches_pattern!(Span {
-                        name: eq("SELECT"),
+                        name: eq(expected_name),
                         kind: eq(&(SpanKind::Server as i32)),
                         status: some(eq(&SpanStatus::error(""))),
                         trace_id: eq(&xact_span.trace_id),
@@ -194,7 +208,7 @@ mod tests {
             elements_are![
                 // Failing statement has a span
                 matches_pattern!(Span {
-                    name: eq("SELECT"),
+                    name: eq("postgresql"),
                     kind: eq(&(SpanKind::Server as i32)),
                     status: some(eq(&SpanStatus::error(""))),
                     trace_id: eq(&xact_span.trace_id),

@@ -695,11 +695,14 @@ mod tests {
     fn savepoint_error_recovery() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
-        for error_sql in [
+        for (error_sql, expected_name) in [
             // This fails while planning, when Postgres folds constants.
-            "SELECT 1/0",
+            ("SELECT 1/0", "postgresql"),
             // This fails while running, when Postgres produces rows.
-            "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+            (
+                "WITH t(x) AS MATERIALIZED (SELECT 0) SELECT 1/x FROM t",
+                "SELECT",
+            ),
         ] {
             for (sqls, error_idx) in [
                 // Six Query ('Q') messages
@@ -750,7 +753,7 @@ mod tests {
                             ..
                         }),
                         matches_pattern!(Span {
-                            name: eq("SELECT"),
+                            name: eq(expected_name),
                             kind: eq(&(SpanKind::Server as i32)),
                             status: some(eq(&SpanStatus::error(""))),
                             trace_id: eq(&xact_span.trace_id),

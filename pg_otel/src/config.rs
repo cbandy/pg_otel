@@ -362,7 +362,7 @@ pub fn define_guc_variables() {
                     if source == GucSource::PGC_S_TEST {
                         return Err(check_error("cannot persist across restarts"));
                     }
-                    if crate::tracing::execution_depth() > 1 {
+                    if crate::context::depth() > 0 {
                         return Err(check_error("cannot set inside a nested statement"));
                     }
                 }
@@ -399,7 +399,7 @@ pub fn define_guc_variables() {
                 if source == GucSource::PGC_S_TEST {
                     return Err(check_error("cannot persist across restarts"));
                 }
-                if crate::tracing::execution_depth() > 1 {
+                if crate::context::depth() > 0 {
                     return Err(check_error("cannot set inside a nested statement"));
                 }
             }

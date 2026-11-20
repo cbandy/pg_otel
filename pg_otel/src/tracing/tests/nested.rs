@@ -218,6 +218,85 @@ mod tests {
     }
 
     #[pgrx::pg_test]
+    fn callee_sub_budget_preserves_caller_budget() -> Result<()> {
+        let mut harness = TracingHarness::new()?;
+
+        harness.simple_query(
+            "CREATE OR REPLACE PROCEDURE inner_capped() LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM 1;
+                PERFORM 2;
+                PERFORM 3;
+                PERFORM 4;
+            END;
+            $$;
+            ALTER PROCEDURE inner_capped() SET otel.trace_nested_statements = 2;
+
+            CREATE OR REPLACE PROCEDURE outer_with_capped() LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM 100;
+                CALL inner_capped();
+                PERFORM 200;
+            END;
+            $$;",
+        )?;
+
+        harness.enable_tracing()?;
+
+        // Case 1: Top-level CALL to a procedure that narrows the session budget (10 -> 2).
+        // Expected spans:
+        // 1. CALL inner_capped() [Server]
+        // 2. SELECT 1 [Internal]
+        // 3. SELECT 2 [Internal]
+        // (SELECT 3 and SELECT 4 are dropped)
+        harness.simple_query("SET otel.trace_nested_statements = 10")?;
+        harness.simple_query("CALL inner_capped()")?;
+
+        let top_spans = harness.collect_spans(time::Duration::from_secs(1));
+        verify_that!(top_spans, len(eq(3)))?;
+
+        // Case 2: Nested CALL to inner_capped() inside outer_with_capped() with caller budget = 5.
+        // Expected spans (6 total: 1 root + 5 nested):
+        // 1. CALL outer_with_capped() [Server]
+        // 2. SELECT 100 [Internal, parent = outer]
+        // 3. CALL inner_capped() [Internal, parent = outer]
+        // 4. SELECT 1 [Internal, parent = inner]
+        // 5. SELECT 2 [Internal, parent = inner]
+        // (SELECT 3 and SELECT 4 inside inner_capped are dropped by inner_capped's cap of 2,
+        //  preserving 1 remaining budget for outer_with_capped)
+        // 6. SELECT 200 [Internal, parent = outer]
+        harness.simple_query("SET otel.trace_nested_statements = 5")?;
+        harness.simple_query("CALL outer_with_capped()")?;
+
+        let all_spans = harness.collect_spans(time::Duration::from_secs(1));
+        verify_that!(all_spans, len(eq(6)))?;
+
+        let outer = all_spans
+            .iter()
+            .find(|s| s.name == "CALL" && s.kind == SpanKind::Server as i32)
+            .or_fail()?;
+        let inner_call = all_spans
+            .iter()
+            .find(|s| s.name == "CALL" && s.kind == SpanKind::Internal as i32)
+            .or_fail()?;
+        verify_that!(inner_call.parent_span_id, eq(&outer.span_id))?;
+
+        let outer_selects: Vec<&Span> = all_spans
+            .iter()
+            .filter(|s| s.name == "SELECT" && s.parent_span_id == outer.span_id)
+            .collect();
+        verify_that!(outer_selects, len(eq(2)))?;
+
+        let inner_selects: Vec<&Span> = all_spans
+            .iter()
+            .filter(|s| s.name == "SELECT" && s.parent_span_id == inner_call.span_id)
+            .collect();
+        verify_that!(inner_selects, len(eq(2)))?;
+
+        Ok(())
+    }
+
+    #[pgrx::pg_test]
     fn trigger_execution_detects_trigger_attribute() -> Result<()> {
         let mut harness = TracingHarness::new()?;
 
@@ -448,7 +527,7 @@ mod tests {
             verify_that!(
                 spans,
                 elements_are![matches_pattern!(Span {
-                    name: eq("ALTER"),
+                    name: eq("ALTER PROCEDURE"),
                     kind: eq(&(SpanKind::Server as i32)),
                     status: some(eq(&SpanStatus::error(""))),
                     attributes: contains(eq(&KeyValue::new_string(

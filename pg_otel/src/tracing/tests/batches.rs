@@ -80,7 +80,7 @@ mod tests {
                     ..
                 }),
                 matches_pattern!(Span {
-                    name: eq("SELECT"),
+                    name: eq("postgresql"),
                     kind: eq(&(SpanKind::Server as i32)),
                     status: some(eq(&SpanStatus::error(""))),
                     trace_id: eq(&xact_span.trace_id),
